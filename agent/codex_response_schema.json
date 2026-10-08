@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "reply": {
+      "type": "string",
+      "description": "直接发给店主的简短中文回复。"
+    },
+    "needs_information": {
+      "type": "boolean",
+      "description": "是否缺少执行所需的关键事实。"
+    },
+    "queries": {
+      "type": "array",
+      "description": "需要外层只读查询代理读取的经营数据。已有查询结果时应为空。",
+      "items": {
+        "type": "object",
+        "properties": {
+          "dataset": {
+            "type": "string",
+            "enum": ["overview", "orders", "order_items", "pending_costs", "interventions", "sku", "inventory", "replenishments", "income", "expenses", "profit", "status"]
+          },
+          "start_date": { "type": ["string", "null"] },
+          "end_date": { "type": ["string", "null"] },
+          "order_no": { "type": ["string", "null"] },
+          "code": { "type": ["string", "null"] },
+          "search": { "type": ["string", "null"] },
+          "limit": { "type": ["number", "null"] }
+        },
+        "required": ["dataset", "start_date", "end_date", "order_no", "code", "search", "limit"],
+        "additionalProperties": false
+      }
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "AddIntervention",
+              "RemoveIntervention",
+              "RestoreInventory",
+              "ConfirmSelfDelivery",
+              "SetExternalDeliveryFee",
+              "SetOrderDeliveryFee",
+              "SetOrderActuals",
+              "OfflineSale",
+              "AddOrderGift",
+              "Replenishment",
+              "CashExpense",
+              "OperatingExpense",
+              "OwnerWithdrawal",
+              "OwnerLabor",
+              "MarketRent",
+              "BeginningCash",
+              "ActualReceipt",
+              "AssetAmortization",
+              "SetSkuExpiry",
+              "SetSkuBatchDate",
+              "SetSkuCost",
+              "ChangeSkuCode",
+              "SetRefundDisposition",
+              "RefreshLedger",
+              "SendDailySummary",
+              "SyncPlatformData"
+            ]
+          },
+          "arguments": {
+            "type": "object",
+            "properties": {
+              "date": { "type": ["string", "null"] },
+              "order_no": { "type": ["string", "null"] },
+              "daily_order_no": { "type": ["string", "null"] },
+              "person": { "type": ["string", "null"] },
+              "items": { "type": ["string", "null"] },
+              "goods_code": { "type": ["string", "null"] },
+              "transition_code": { "type": ["string", "null"] },
+              "new_goods_code": { "type": ["string", "null"] },
+              "retire_existing_new_code": { "type": ["boolean", "null"] },
+              "expiry_date": { "type": ["string", "null"] },
+              "clear_expiry": { "type": ["boolean", "null"] },
+              "production_date": { "type": ["string", "null"] },
+              "shelf_life_value": { "type": ["number", "null"] },
+              "shelf_life_unit": { "type": ["string", "null"] },
+              "quantity": { "type": ["number", "null"] },
+              "purchase_amount": { "type": ["number", "null"] },
+              "payment_amount": { "type": ["number", "null"] },
+              "payment_date": { "type": ["string", "null"] },
+              "amount": { "type": ["number", "null"] },
+              "delivery_fee": { "type": ["number", "null"] },
+              "receipt_status": { "type": ["string", "null"] },
+              "platform": { "type": ["string", "null"] },
+              "note": { "type": ["string", "null"] },
+              "mode": { "type": ["string", "null"] }
+            },
+            "required": [
+              "date",
+              "order_no",
+              "daily_order_no",
+              "person",
+              "items",
+              "goods_code",
+              "transition_code",
+              "new_goods_code",
+              "retire_existing_new_code",
+              "expiry_date",
+              "clear_expiry",
+              "production_date",
+              "shelf_life_value",
+              "shelf_life_unit",
+              "quantity",
+              "purchase_amount",
+              "payment_amount",
+              "payment_date",
+              "amount",
+              "delivery_fee",
+              "receipt_status",
+              "platform",
+              "note",
+              "mode"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": ["action", "arguments"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["reply", "needs_information", "queries", "actions"],
+  "additionalProperties": false
+}

@@ -1,0 +1,189 @@
+﻿$ErrorActionPreference = 'Stop'
+$projectRoot = Split-Path $PSScriptRoot -Parent
+$agentRoot = Join-Path $projectRoot 'agent'
+$bridgePath = Join-Path $agentRoot 'lark_event_bridge.ps1'
+$watchdogPath = Join-Path $agentRoot 'ensure_lark_event_bridge.ps1'
+$wrapperPath = Join-Path $agentRoot 'lark_cli_noexit.ps1'
+$hiddenWatchdogPath = Join-Path $agentRoot 'run_hidden_watchdog.vbs'
+$petstarCliPath = Join-Path $agentRoot 'petstar_cli.py'
+$financeEventPath = Join-Path $agentRoot 'record_finance_event.ps1'
+$stateRoot = Join-Path $agentRoot 'state'
+$runtimePowerShellFiles = @()
+$runtimePowerShellFiles += @(Get-ChildItem -LiteralPath $agentRoot -Filter '*.ps1' -File)
+$runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\sync_meituan_orders.ps1')
+$runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\sync_meituan_inventory.ps1')
+$runtimePowerShellFiles += @(Get-ChildItem -LiteralPath (Join-Path $projectRoot 'work') -Filter 'test_*.ps1' -File)
+
+$parseFailures = [Collections.Generic.List[string]]::new()
+foreach ($file in $runtimePowerShellFiles) {
+    $errors = $null
+    [Management.Automation.Language.Parser]::ParseFile($file.FullName,[ref]$null,[ref]$errors) | Out-Null
+    foreach ($parseError in @($errors)) { $parseFailures.Add("$($file.Name): $($parseError.Message)") }
+    $bytes = [IO.File]::ReadAllBytes($file.FullName)
+    $text = [IO.File]::ReadAllText($file.FullName,[Text.Encoding]::UTF8)
+    $hasBom = $bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191
+    if ($text -match '[^\x00-\x7F]' -and -not $hasBom) { $parseFailures.Add("$($file.Name): non-ASCII Windows PowerShell entry must have UTF-8 BOM") }
+}
+if ($parseFailures.Count -gt 0) { throw "Runtime PowerShell parse failures: $($parseFailures -join '; ')" }
+
+$bridge = [IO.File]::ReadAllText($bridgePath,[Text.Encoding]::UTF8)
+$watchdog = [IO.File]::ReadAllText($watchdogPath,[Text.Encoding]::UTF8)
+$wrapper = [IO.File]::ReadAllText($wrapperPath,[Text.Encoding]::UTF8)
+$hiddenWatchdog = [IO.File]::ReadAllText($hiddenWatchdogPath,[Text.Encoding]::UTF8)
+$petstarCli = [IO.File]::ReadAllText($petstarCliPath,[Text.Encoding]::UTF8)
+$financeEvent = [IO.File]::ReadAllText($financeEventPath,[Text.Encoding]::UTF8)
+$skuSync = [IO.File]::ReadAllText((Join-Path $agentRoot 'sync_new_skus.ps1'),[Text.Encoding]::UTF8)
+$financeTransaction = [IO.File]::ReadAllText((Join-Path $agentRoot 'finance_transaction.ps1'),[Text.Encoding]::UTF8)
+$scheduledSync = [IO.File]::ReadAllText((Join-Path $agentRoot 'run_sync_and_notify.ps1'),[Text.Encoding]::UTF8)
+$costRebuild = [IO.File]::ReadAllText((Join-Path $agentRoot 'rebuild_cost_snapshots.ps1'),[Text.Encoding]::UTF8)
+$ledgerSync = [IO.File]::ReadAllText((Join-Path $agentRoot 'sync_daily_ledger.ps1'),[Text.Encoding]::UTF8)
+$codexBridge = [IO.File]::ReadAllText((Join-Path $agentRoot 'codex_chat_bridge.py'),[Text.Encoding]::UTF8)
+$businessQuery = [IO.File]::ReadAllText((Join-Path $agentRoot 'query_business_data.ps1'),[Text.Encoding]::UTF8)
+$runtimePaths = [IO.File]::ReadAllText((Join-Path $agentRoot 'runtime_paths.ps1'),[Text.Encoding]::UTF8)
+$orderExtractor = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\meituan_order_extract.mjs'),[Text.Encoding]::UTF8)
+$orderSync = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\sync_meituan_orders.ps1'),[Text.Encoding]::UTF8)
+$refundAdjustments = [IO.File]::ReadAllText((Join-Path $agentRoot 'refund_adjustments.ps1'),[Text.Encoding]::UTF8)
+$orderActualOverrides = [IO.File]::ReadAllText((Join-Path $agentRoot 'order_actual_overrides.ps1'),[Text.Encoding]::UTF8)
+$inventoryExporter = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\meituan_inventory_export.mjs'),[Text.Encoding]::UTF8)
+$inventorySync = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\sync_meituan_inventory.ps1'),[Text.Encoding]::UTF8)
+$interventionRecord = [IO.File]::ReadAllText((Join-Path $agentRoot 'intervention_record.ps1'),[Text.Encoding]::UTF8)
+    $promotionSync = [IO.File]::ReadAllText((Join-Path $agentRoot 'sync_promotion_expense.ps1'),[Text.Encoding]::UTF8)
+    $promotionExtractor = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\meituan_promotion_extract.mjs'),[Text.Encoding]::UTF8)
+    $integrityAudit = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\audit_finance_integrity.ps1'),[Text.Encoding]::UTF8)
+
+$contracts = [ordered]@{
+    infinite_event_stream = ($bridge -match 'event consume.+--timeout 0.+--quiet' -and $bridge -notmatch '--timeout 10m')
+    durable_ack_outbox = ($bridge -match 'pending_acknowledgements\.json' -and $bridge -match 'function Flush-PendingAcknowledgements')
+    confirmation_atomic_transaction = ($bridge -match 'New-FinanceTransaction' -and $bridge -match '飞书确认' -and $bridge -match 'Invoke-FinanceTransactionRollback' -and $bridge -match '本条消息产生的改动已全部回滚')
+    state_before_success_ack = ($bridge.IndexOf('Complete-PendingConfirmation ([string]$pending.change_id)') -lt $bridge.IndexOf("Send-Acknowledgement `$AuthorizedOpenId `$successReply"))
+    shared_pending_mutex = ($bridge -match 'Local\\PetstarLarkPendingConfirmations')
+    retryable_failures = ($bridge.Contains("Add-HandledMessageRecord `$messageId 'failed_retryable'"))
+    watchdog_replay = ($watchdog -match 'function Start-ReplayWorker' -and $watchdog -match "-Mode','Replay")
+    watchdog_repairs_orphan_consumers = ($watchdog -match 'function Repair-OrphanEventConsumers' -and $watchdog -match 'consumer_pids')
+    replenishment_remote_idempotency = ($financeEvent -match "eventBatchId" -and $financeEvent -match "T\$\{rowNumber\}:T\$\{rowNumber\}" -and $financeEvent -match 'existingBatchIndex')
+    replenishment_duplicate_sku_guard = ($financeEvent -match 'Get-SkuCodeCandidates' -and $financeEvent -match '已停止补货写入，避免新增重复档案')
+    sku_sync_prewrite_duplicate_guard = ($skuSync -match 'duplicateNewKw' -and $skuSync -match '已在写入前停止')
+    recovery_cooldown = ($watchdog -match 'Test-NightRecoveryCooldown' -and $watchdog -match 'night_recovery_attempt\.json')
+    noexit_cli_wrapper = ($wrapper -notmatch '(?m)^\s*exit\s+' -and $wrapper -match 'node')
+    powershell_file_entry_preserves_script_root = ($petstarCli -match '"-File"' -and $petstarCli -notmatch 'ScriptBlock|EncodedCommand')
+    hidden_watchdog_launcher = ($hiddenWatchdog -match 'shell\.Run\(command, 0, True\)' -and $hiddenWatchdog -match 'WScript\.Quit exitCode')
+    one_global_mutation_mutex = ($financeTransaction -match 'Local\\PetstarFinanceMutationV2')
+    durable_before_images = ($financeTransaction -match 'Register-FinanceRangeBeforeImage' -and $financeTransaction -match 'status = ''rollback_pending''')
+    processed_event_after_commit = ($financeEvent -match 'Register-FinanceProcessedEvent' -and $financeEvent -notmatch 'Register-FinanceProcessedEvent[^\r\n]+\r?\n\s*\[ordered\].+Add-Content')
+    cost_and_ledger_join_transaction = ($costRebuild -match 'Join-FinanceTransaction' -and $ledgerSync -match 'Join-FinanceTransaction')
+    scheduled_sync_runs_integrity_audit = ($scheduledSync -match "Invoke-WithRetry 'integrity_audit' \{ Invoke-FinanceIntegrityAudit \}")
+    scheduled_sync_commits_before_notification = ($scheduledSync.LastIndexOf("`n    Complete-SyncFinanceTransaction") -gt 0 -and $scheduledSync.LastIndexOf("`n    Complete-SyncFinanceTransaction") -lt $scheduledSync.LastIndexOf('Send-FeishuMessage $message'))
+    committed_data_not_reported_as_sync_failure = ($scheduledSync -match '账目状态：已校验并提交，无需重复录入')
+    codex_has_read_only_business_query = ($codexBridge -match 'run_business_queries' -and $codexBridge -match '不能说“看不到表格”')
+    business_query_has_no_write_command = ($businessQuery -match '\+cells-get' -and $businessQuery -notmatch '\+cells-set|\+cells-clear|record_finance_event|sync_meituan')
+    pending_cost_actions_use_stable_sku_id = ($businessQuery.Contains('"sku_id:$productId"') -and $financeEvent.Contains("StartsWith('sku_id:')"))
+    dry_run_skips_idempotency_journal_scan = ($financeEvent -match 'if \(-not \$DryRun -and \$EventId -and \(Test-ProcessedEvent \$EventId\)\)')
+    unsupported_dry_run_stops_before_write = ($financeEvent -match 'nativeDryRunActions' -and $financeEvent -match '已在任何写入前停止')
+    committed_event_recovery_is_direct_lookup = ($financeTransaction -match 'Get-FinanceTransactionPath \$StateRoot \("event-\$EventId"\)' -and $financeTransaction -notmatch "function Test-FinanceCommittedEvent[\s\S]{0,900}Get-ChildItem")
+    finalized_transactions_drop_cell_payloads = ($financeTransaction -match 'ConvertTo-CompactedFinanceTransactionJournal' -and $financeTransaction -match "property\.Name -in @\('entries'" -and $financeTransaction -match "entry_manifest")
+    failed_journal_writes_clean_temp_files = ($financeTransaction -match 'function Write-FinanceJournalAtomically' -and $financeTransaction -match 'finally[\s\S]{0,300}Remove-Item -LiteralPath \$temp')
+    rollback_is_chunked_and_retried = ($financeTransaction -match 'Get-FinanceRollbackChunks' -and $financeTransaction -match 'attempt -le 3')
+    rollback_operations_remain_json_array = ($financeTransaction -match 'ConvertTo-Json -InputObject \$operations')
+    rollback_explicitly_clears_new_tail_rows = ($financeTransaction -match '\+cells-batch-clear' -and $financeTransaction -match '先显式清空内容')
+    rollback_restores_numeric_storage_type = ($financeTransaction -match 'Writing those strings back during rollback' -and $financeTransaction -match '\[double\]::TryParse' -and $financeTransaction -match '\$numberFormat -notin @\(''General'',''@''\)')
+    singleton_pending_cost_is_array_safe = ($ledgerSync -match '@\(\$missingCodes\)\.Count')
+    duplicate_before_images_are_skipped = ($financeTransaction -match 'alreadyCaptured' -and $financeTransaction -match 'if \(\$alreadyCaptured\) \{ return \}')
+    preflight_checks_state_drive = ($scheduledSync -match 'stateDriveRoot' -and $scheduledSync -match 'AvailableFreeSpace -lt 1GB')
+    pending_repair_skips_full_committed_journals = ($financeTransaction -match 'Get-FinanceTransactionStatusFast' -and $financeTransaction.Contains("if (`$status -notin @('active','rollback_pending')) { continue }"))
+    order_cards_expand_before_extraction = ($orderExtractor -match 'await expandOrderCards\(targetId\)[\s\S]{0,120}extractPageExpression')
+    order_page_reloads_once_before_failure = ($orderExtractor -match 'function waitForOrderPageReady' -and $orderExtractor -match '/navigate\?target=' -and $orderExtractor -match 'not ready after one safe reload')
+    meituan_login_is_detected_without_slow_retry = ($orderExtractor -match 'function waitForOrderReadyOrAuth' -and $orderExtractor -match 'MEITUAN_AUTH_REQUIRED' -and $orderExtractor -match 'login_gw' -and $scheduledSync -match '\$nonRetryable[\s\S]{0,500}MEITUAN_AUTH_REQUIRED')
+    meituan_login_alert_is_persistent_and_self_resolving = ($scheduledSync -match "return 'meituan-auth'" -and $scheduledSync -match 'active-meituan-auth\.json|active-\$safeCategory\.json' -and $scheduledSync -match "Resolve-FailureNotification 'meituan-auth'" -and $scheduledSync -match 'authenticated_order_read_succeeded')
+    order_card_completeness_uses_quantity_sum = ($orderExtractor -match "reduce\(\(total, row\)" -and $orderExtractor -match 'expectedItemCount')
+    empty_order_days_are_valid = ($orderExtractor -match 'if \(/共\\\\s\*0\\\\s\*单/\.test\(bodyText\)\) return true')
+    empty_order_days_do_not_use_array_property_enumeration = ($orderSync -match '\$extractedOrderNos = @\(\$extract\.orders \| ForEach-Object' -and $orderSync -notmatch '\$extract\.orders\.orderNo')
+    inventory_export_waits_for_loaded_fields = ($inventoryExporter -match 'required inventory export fields to finish loading' -and $inventoryExporter -match '!/正在加载/' -and $inventoryExporter -match 'required\.every')
+    inventory_failure_returns_structured_detail = ($inventorySync -match 'Console\]::Out\.WriteLine' -and $inventorySync -match 'ok=\$false;error=\$reason' -and $scheduledSync -match 'parsedError\.error')
+    business_warnings_do_not_mark_runtime_degraded = ($scheduledSync -match 'degraded = \[bool\]\$operationalDegraded' -and $scheduledSync -match 'sync_degraded' -and $scheduledSync -match '已完成·需核对')
+    incomplete_orders_validate_quantity_sum = ($orderSync -match 'Measure-Object -Property quantity -Sum' -and $orderSync -match 'expectedItemCount')
+    incomplete_orders_fail_before_sheet_read = ($orderSync.IndexOf('$incompleteOrders') -lt $orderSync.IndexOf("Get-SheetRows '订单汇总'"))
+    system_powershell_resolver_avoids_pshome = ($runtimePaths -match 'System32\\WindowsPowerShell\\v1\.0\\powershell\.exe' -and $runtimePaths -notmatch '\$PSHOME')
+    production_scripts_do_not_assume_pshome_powershell = (-not (($runtimePowerShellFiles | Where-Object { $_.Name -notlike 'test_*' } | ForEach-Object { [IO.File]::ReadAllText($_.FullName,[Text.Encoding]::UTF8) }) -match '\$PSHOME'))
+    child_script_failure_preserves_detail = ($scheduledSync -match '2>&1' -and $scheduledSync -match '子脚本未返回错误详情' -and $orderSync -match 'throw \$originalError' -and $orderSync -notmatch '(?m)^\s*trap\s*\{')
+    codex_query_uses_system_powershell = ($codexBridge -match 'WINDOWS_POWERSHELL' -and $codexBridge -notmatch 'command = \[\s*"powershell\.exe"')
+    natural_language_enums_are_normalized_before_cli = ($bridge -match 'function Convert-PetstarReceiptStatus' -and $bridge -match "'当天到账'.+return '已到账'" -and $bridge -match 'function Convert-PetstarPlatform' -and $bridge -match "'京东外卖'.+return '京东到家'")
+    withdrawn_interventions_are_auditable_and_excluded = ($financeEvent -match 'audit_tombstone' -and $financeEvent -match 'Get-InterventionTombstoneOrderNo' -and $interventionRecord -match 'Test-ActiveInterventionOrderNo' -and $businessQuery -match 'Test-ActiveInterventionOrderNo' -and $ledgerSync -match 'Test-ActiveInterventionOrderNo' -and $costRebuild -match 'Test-ActiveInterventionOrderNo' -and $orderSync -match 'Test-ActiveInterventionOrderNo')
+    intervention_withdrawal_single_row_readback = ($financeEvent -match 'function Get-SingleSheetRow' -and $financeEvent -match "Get-SingleSheetRow '干预订单'")
+    promotion_capture_supports_safe_next_day_recovery = ($promotionSync -match 'Today\.AddDays\(-1\)' -and $promotionSync -notmatch 'Now\.Hour -lt 3' -and $promotionExtractor -match 'yesterday.*settled spend' -and $promotionExtractor -match '/ad/v3/flow/r/history')
+    promotion_capture_uses_network_response_bridge = ($promotionExtractor -match '/capture\?url=' -and $promotionExtractor -match '/ad/v4/homepage/account/info')
+    promotion_capture_uses_authenticated_merchant_route = ($promotionExtractor -match 'isAuthenticatedPromotionPortalUrl' -and $promotionExtractor -match 'shangoue\.meituan\.com')
+    promotion_failure_notification_is_consolidated = ($promotionSync -match "notification='deferred_to_night_sync'" -and $promotionSync -notmatch 'Send-FailureNotification')
+    repeated_failure_notification_is_idempotent = ($scheduledSync -match 'Get-FailureNotificationCategory' -and $scheduledSync -match 'failure_notifications' -and $scheduledSync -match 'notification_suppressed' -and $scheduledSync -notmatch 'petstar-failed-.+HHmm')
+    oversized_sheet_reads_are_split = ($scheduledSync -match 'data\.has_more' -and $scheduledSync -match '\$leftRange' -and $scheduledSync -match '\$rightRange' -and $scheduledSync -match '飞书单行读取仍不完整')
+    summary_failure_cannot_rollback_valid_ledger = ($scheduledSync.LastIndexOf("`n    Complete-SyncFinanceTransaction") -gt $scheduledSync.LastIndexOf("Invoke-WithRetry 'integrity_audit'") -and $scheduledSync.LastIndexOf("`n    Complete-SyncFinanceTransaction") -lt $scheduledSync.LastIndexOf("Invoke-WithRetry 'summary_readback' { Build-Snapshot }"))
+    completed_refunds_are_keyed_by_record_id = ($orderExtractor -match 'recordId' -and $refundAdjustments -match 'meituan:\$\(\$order\.orderNo\):\$\(\$refund\.recordId\)')
+    refund_income_preserves_cents = ($orderSync.Contains('[math]::Max([double]0.0, [double][math]::Round'))
+    returned_inventory_reverses_only_returned_cost = ($costRebuild -match 'returned_restocked' -and $costRebuild -match 'effective_quantity')
+    optional_sheet_cells_and_order_fields_are_safe = ($orderSync -match "PSObject\.Properties\['value'\]" -and $ledgerSync -match "PSObject\.Properties\['is_offline'\]")
+    actual_fulfillment_override_is_durable = ($orderActualOverrides -match 'order_actual_overrides\.json' -and $orderSync -match 'Get-OrderActualOverrides' -and $financeEvent -match "'SetOrderActuals'")
+    codex_schema_exposes_order_actuals = (([IO.File]::ReadAllText((Join-Path $agentRoot 'codex_response_schema.json'),[Text.Encoding]::UTF8) | ConvertFrom-Json).properties.actions.items.properties.action.enum -contains 'SetOrderActuals')
+    order_refund_cannot_be_recorded_as_actual_receipt = ($financeEvent -match 'ActualReceipt 只用于平台资金实际到账' -and $codexBridge -match '绝不能使用 ActualReceipt')
+    actual_fulfillment_override_is_atomic = ($financeEvent -match 'orderActualOverrideStateBackup' -and $financeEvent -match 'Invoke-OrderSyncForDate' -and $financeEvent -match '店主已手工恢复')
+    actual_fulfillment_override_does_not_write_platform_inventory = ($codexBridge -match 'SetOrderActuals' -and $codexBridge -match '该动作不修改平台库存' -and $financeEvent -notmatch "SetOrderActuals[\s\S]{0,7000}(?:sync_meituan_inventory|meituan_inventory_export)")
+    table_put_styles_use_stdin = ($ledgerSync -match '--sheets\s+\$sheetsFileArgument\s+--styles\s+-' -and $ledgerSync -match 'daily_ledger_sheets_' -and $ledgerSync -match 'finally[\s\S]{0,180}Remove-Item -LiteralPath \$requestPath')
+    table_put_resolves_physical_state_path = ($ledgerSync -match '\$stateDirectory\.LinkType' -and $ledgerSync -match '\$stateDirectory\.Target' -and $ledgerSync -match 'Push-Location -LiteralPath \$requestRoot')
+    table_put_preserves_native_exit_code = ($ledgerSync -match '\[pscustomobject\]@\{raw=\$raw;exit_code=\$exitCode\}' -and $ledgerSync -match '\[int\]\$response\.exit_code')
+    dropdown_json_uses_stdin_and_relative_file = ($ledgerSync -match 'function Invoke-DropdownSetJson' -and $ledgerSync -match '--options\s+-\s+--colors\s+\$colorsFileArgument' -and $ledgerSync -match 'daily_ledger_dropdown_colors_')
+    runtime_has_no_inline_composite_dropdown_json = ($ledgerSync -notmatch '--options\s+\$options(?!\w)' -and $ledgerSync -notmatch '--colors\s+\$colors(?!\w)')
+    expense_dropdown_repairs_partial_month_setup = ($ledgerSync -match 'Reapply this idempotently' -and $ledgerSync -match 'Invoke-DropdownSetJson \$expenseName')
+    ledger_date_formats_are_reapplied = ($ledgerSync -match 'function Set-DateDisplayFormat' -and $ledgerSync.Contains("Set-DateDisplayFormat `$incomeName 'C2:C1001'") -and $ledgerSync.Contains("Set-DateDisplayFormat `$expenseName 'A2:A1001'"))
+    ledger_sheet_reads_preserve_single_row_shape = ($ledgerSync -match '\[pscustomobject\]@\{rows=\[object\[\]\]@\(' -and $ledgerSync -match '\$checkIncome = \(Get-SheetRows[^\r\n]+\)\.rows' -and $ledgerSync -match '\$checkExpense = \(Get-SheetRows[^\r\n]+\)\.rows')
+    confirmed_event_sheet_reads_are_retried = ($financeEvent -match 'function Invoke-LarkReadJson' -and $financeEvent -match 'MaxAttempts = 4' -and $financeEvent -match '读取飞书失败：\$SheetName')
+    ledger_source_reads_are_retried = ($ledgerSync -match 'function Invoke-LarkReadJson' -and $ledgerSync -match 'MaxAttempts = 4' -and $ledgerSync -match '读取飞书失败：\$SheetName')
+    integrity_audit_discovers_month_sheets = ($integrityAudit -match 'Get-LedgerMonth' -and $integrityAudit -match '\+workbook-info' -and $integrityAudit -match '\$incomeSheets' -and $integrityAudit -match '\$expenseSheets' -and $integrityAudit -notmatch "Get-Rows \$ledgerToken '8月收入'")
+    integrity_audit_preserves_failure_detail = ($scheduledSync -match '自然单缺失' -and $scheduledSync -match '经营账目一致性审计未通过：\$detail')
+    invalid_cli_arguments_do_not_retry = ($scheduledSync -match '\$nonRetryable[\s\S]{0,500}invalid JSON\|invalid_argument')
+    codex_uses_persistent_app_server_with_fallback = ($codexBridge -match 'class CodexAppRuntime' -and $codexBridge -match 'app-server.+--stdio' -and $codexBridge -match 'return output\(process_message')
+    business_queries_are_parallel_and_bounded = ($codexBridge -match 'ThreadPoolExecutor' -and $codexBridge -match 'max_workers=min\(3')
+    query_cache_is_short_and_bypassed_for_writes = ($codexBridge -match 'QUERY_CACHE_SECONDS = 30' -and $codexBridge -match 'use_cache=\(mode == "normal"\)' -and $bridge -match 'Clear-PetstarCodexQueryCache')
+    message_latency_has_stage_telemetry = ($codexBridge -match 'codex_performance\.ndjson' -and $codexBridge -match 'model_seconds' -and $codexBridge -match 'query_seconds' -and $bridge -match 'message timing')
+    order_local_ledger_rebuild_is_month_scoped = ($ledgerSync -match '\[string\]\$MonthFilter' -and $ledgerSync -match 'selected_months' -and $financeEvent -match 'monthLocalActions')
+    cost_basis_changes_keep_full_ledger_rebuild = ($financeEvent.Contains('Invoke-DailyLedgerSync $ledgerTargetMonth') -and $financeEvent -match "'Replenishment','ChangeSkuCode','SetSkuCost'")
+    scheduled_sync_yields_to_confirmed_writes = ($bridge -match 'interactive_priority\.json' -and $scheduledSync -match '人工确认写账优先，定时同步已让路')
+    codex_mutation_preview_reuses_first_parse = ($bridge -match 'function New-ConfirmationDraftFromCodexResult' -and $bridge -match 'Reuse them[\s\S]{0,240}New-ConfirmationDraftFromCodexResult')
+}
+$failedContracts = @($contracts.GetEnumerator() | Where-Object { -not $_.Value } | ForEach-Object { $_.Key })
+if ($failedContracts.Count -gt 0) { throw "Missing reliability contracts: $($failedContracts -join ', ')" }
+
+$refundCentResult = [math]::Max([double]0.0, [double][math]::Round(([double]46.22 - [double]23.98), [int]2))
+if ([math]::Abs($refundCentResult - 22.24) -gt 0.000001) { throw "Refund cent-preservation check failed: $refundCentResult" }
+
+foreach ($stateName in @('pending_confirmations.json','pending_acknowledgements.json')) {
+    $path = Join-Path $stateRoot $stateName
+    if (-not (Test-Path -LiteralPath $path)) { continue }
+    try { $null = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json }
+    catch { throw "Runtime state is not valid JSON: $stateName" }
+}
+
+. (Join-Path $agentRoot 'runtime_paths.ps1')
+$python = Get-PetstarPython
+if (-not (Test-Path -LiteralPath $python)) { throw 'Project Python runtime was not found' }
+& $python -m py_compile (Join-Path $agentRoot 'codex_chat_bridge.py') (Join-Path $agentRoot 'petstar_cli.py')
+if ($LASTEXITCODE -ne 0) { throw 'Python entry-point compile check failed' }
+$nodeFiles = @(
+    (Join-Path $projectRoot 'work\meituan_order_extract.mjs'),
+    (Join-Path $projectRoot 'work\meituan_inventory_export.mjs'),
+    (Join-Path $projectRoot 'work\meituan_promotion_extract.mjs')
+)
+foreach ($nodeFile in $nodeFiles) {
+    & node --check $nodeFile
+    if ($LASTEXITCODE -ne 0) { throw "Node entry-point syntax check failed: $nodeFile" }
+}
+
+$resolvedWindowsPowerShell = Get-PetstarWindowsPowerShell
+if (-not (Test-Path -LiteralPath $resolvedWindowsPowerShell -PathType Leaf)) { throw 'Windows PowerShell resolver returned a missing file' }
+if ((Split-Path $resolvedWindowsPowerShell -Leaf) -ne 'powershell.exe') { throw 'Windows PowerShell resolver returned the wrong executable' }
+
+[ordered]@{
+    ok = $true
+    powershell_files_parsed = $runtimePowerShellFiles.Count
+    python_entries_compiled = 2
+    node_entries_checked = $nodeFiles.Count
+    contracts = $contracts
+    external_writes = 0
+} | ConvertTo-Json -Depth 5

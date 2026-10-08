@@ -1,0 +1,40 @@
+# Runtime state and local backups
+agent/state/
+agent/state.pre_migration_*/
+outputs/
+%SystemDrive%/
+
+# Python and test caches
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local CLI/runtime caches
+work/.npm-cache/
+work/.lark-cli-runtime/
+
+# Machine-specific workbook bindings and authorization artifacts
+work/simple_finance_meta.json
+work/daily_ledger_meta.json
+work/pets_finance_sheets.json
+work/lark_device_flow.json
+work/feishu-auth-qr.png
+
+# Generated audits, snapshots and browser diagnostics
+work/_tmp_*
+work/tmp_*
+work/cost_audit.json
+work/initial_natural_orders.json
+work/intervention_orders.json
+work/recover_lark_bridge.py
+work/*diagnostic*.png
+work/*debug*.png
+work/*.log
+*.partial
+*.tmp
+
+# Editor and operating-system noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
