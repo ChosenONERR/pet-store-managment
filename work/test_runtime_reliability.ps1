@@ -45,6 +45,7 @@ $orderSync = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\sync_meituan_o
 $refundAdjustments = [IO.File]::ReadAllText((Join-Path $agentRoot 'refund_adjustments.ps1'),[Text.Encoding]::UTF8)
 $orderActualOverrides = [IO.File]::ReadAllText((Join-Path $agentRoot 'order_actual_overrides.ps1'),[Text.Encoding]::UTF8)
 $inventoryExporter = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\meituan_inventory_export.mjs'),[Text.Encoding]::UTF8)
+$meituanBrowserContext = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\meituan_browser_context.mjs'),[Text.Encoding]::UTF8)
 $inventorySync = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\sync_meituan_inventory.ps1'),[Text.Encoding]::UTF8)
 $interventionRecord = [IO.File]::ReadAllText((Join-Path $agentRoot 'intervention_record.ps1'),[Text.Encoding]::UTF8)
     $promotionSync = [IO.File]::ReadAllText((Join-Path $agentRoot 'sync_promotion_expense.ps1'),[Text.Encoding]::UTF8)
@@ -85,6 +86,8 @@ $contracts = [ordered]@{
     rollback_is_chunked_and_retried = ($financeTransaction -match 'Get-FinanceRollbackChunks' -and $financeTransaction -match 'attempt -le 3')
     rollback_operations_remain_json_array = ($financeTransaction -match 'ConvertTo-Json -InputObject \$operations')
     rollback_explicitly_clears_new_tail_rows = ($financeTransaction -match '\+cells-batch-clear' -and $financeTransaction -match '先显式清空内容')
+    order_sync_clears_stale_tail_rows = ($orderSync -match 'existingItemsLastRow' -and $orderSync -match 'Clear-CellRange.+订单商品' -and $orderSync -match 'existingSummaryLastRow')
+    integrity_audit_checks_order_item_quantity = ($integrityAudit -match 'order_item_quantity_mismatches' -and $integrityAudit -match 'itemQuantityByOrder')
     rollback_restores_numeric_storage_type = ($financeTransaction -match 'Writing those strings back during rollback' -and $financeTransaction -match '\[double\]::TryParse' -and $financeTransaction -match '\$numberFormat -notin @\(''General'',''@''\)')
     singleton_pending_cost_is_array_safe = ($ledgerSync -match '@\(\$missingCodes\)\.Count')
     duplicate_before_images_are_skipped = ($financeTransaction -match 'alreadyCaptured' -and $financeTransaction -match 'if \(\$alreadyCaptured\) \{ return \}')
@@ -110,7 +113,7 @@ $contracts = [ordered]@{
     withdrawn_interventions_are_auditable_and_excluded = ($financeEvent -match 'audit_tombstone' -and $financeEvent -match 'Get-InterventionTombstoneOrderNo' -and $interventionRecord -match 'Test-ActiveInterventionOrderNo' -and $businessQuery -match 'Test-ActiveInterventionOrderNo' -and $ledgerSync -match 'Test-ActiveInterventionOrderNo' -and $costRebuild -match 'Test-ActiveInterventionOrderNo' -and $orderSync -match 'Test-ActiveInterventionOrderNo')
     intervention_withdrawal_single_row_readback = ($financeEvent -match 'function Get-SingleSheetRow' -and $financeEvent -match "Get-SingleSheetRow '干预订单'")
     promotion_capture_supports_safe_next_day_recovery = ($promotionSync -match 'Today\.AddDays\(-1\)' -and $promotionSync -notmatch 'Now\.Hour -lt 3' -and $promotionExtractor -match 'yesterday.*settled spend' -and $promotionExtractor -match '/ad/v3/flow/r/history')
-    promotion_capture_uses_network_response_bridge = ($promotionExtractor -match '/capture\?url=' -and $promotionExtractor -match '/ad/v4/homepage/account/info')
+    promotion_capture_uses_network_response_bridge = ($promotionExtractor -match 'captureJsonResource' -and $promotionExtractor -match 'Target\.attachToTarget' -and $promotionExtractor -match 'Network\.getResponseBody' -and $promotionExtractor -match '/ad/v4/homepage/account/info')
     promotion_capture_uses_authenticated_merchant_route = ($promotionExtractor -match 'isAuthenticatedPromotionPortalUrl' -and $promotionExtractor -match 'shangoue\.meituan\.com')
     promotion_failure_notification_is_consolidated = ($promotionSync -match "notification='deferred_to_night_sync'" -and $promotionSync -notmatch 'Send-FailureNotification')
     repeated_failure_notification_is_idempotent = ($scheduledSync -match 'Get-FailureNotificationCategory' -and $scheduledSync -match 'failure_notifications' -and $scheduledSync -match 'notification_suppressed' -and $scheduledSync -notmatch 'petstar-failed-.+HHmm')
@@ -139,6 +142,9 @@ $contracts = [ordered]@{
     integrity_audit_preserves_failure_detail = ($scheduledSync -match '自然单缺失' -and $scheduledSync -match '经营账目一致性审计未通过：\$detail')
     invalid_cli_arguments_do_not_retry = ($scheduledSync -match '\$nonRetryable[\s\S]{0,500}invalid JSON\|invalid_argument')
     codex_uses_persistent_app_server_with_fallback = ($codexBridge -match 'class CodexAppRuntime' -and $codexBridge -match 'app-server.+--stdio' -and $codexBridge -match 'return output\(process_message')
+    codex_persistent_runtime_follows_account_switches = ($codexBridge -match 'get_auth_fingerprint' -and $codexBridge -match 'ensure_current_auth' -and $codexBridge -match 'auth_reloaded')
+    meituan_automation_binds_verified_store_context = ($meituanBrowserContext -match '宠速星宠物用品店' -and $meituanBrowserContext -match 'authenticatedStore' -and $orderExtractor -match 'openPetstarMerchantTab' -and $inventoryExporter -match 'openPetstarMerchantTab' -and $promotionExtractor -match 'openPetstarMerchantTab')
+    meituan_automation_uses_only_bound_chrome_profile = ($meituanBrowserContext -match 'loadBinding' -and $meituanBrowserContext -match 'profile_directory' -and $meituanBrowserContext -match 'resolveBoundContext' -and $meituanBrowserContext -match 'boundPages' -and $meituanBrowserContext -match 'MEITUAN_AUTH_REQUIRED')
     business_queries_are_parallel_and_bounded = ($codexBridge -match 'ThreadPoolExecutor' -and $codexBridge -match 'max_workers=min\(3')
     query_cache_is_short_and_bypassed_for_writes = ($codexBridge -match 'QUERY_CACHE_SECONDS = 30' -and $codexBridge -match 'use_cache=\(mode == "normal"\)' -and $bridge -match 'Clear-PetstarCodexQueryCache')
     message_latency_has_stage_telemetry = ($codexBridge -match 'codex_performance\.ndjson' -and $codexBridge -match 'model_seconds' -and $codexBridge -match 'query_seconds' -and $bridge -match 'message timing')
@@ -169,6 +175,7 @@ $nodeFiles = @(
     (Join-Path $projectRoot 'work\meituan_order_extract.mjs'),
     (Join-Path $projectRoot 'work\meituan_inventory_export.mjs'),
     (Join-Path $projectRoot 'work\meituan_promotion_extract.mjs')
+    (Join-Path $projectRoot 'work\meituan_browser_context.mjs')
 )
 foreach ($nodeFile in $nodeFiles) {
     & node --check $nodeFile

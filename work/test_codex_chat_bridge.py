@@ -64,6 +64,20 @@ with tempfile.TemporaryDirectory(prefix="petstar-codex-test-") as temp_dir:
 runtime = bridge.check_runtime()
 assert runtime["query_tool_exists"], "经营数据只读查询工具未就绪"
 
+original_auth_fingerprint = bridge.get_auth_fingerprint
+auth_values = iter(["account-b"])
+bridge.get_auth_fingerprint = lambda: next(auth_values)
+runtime_probe = object.__new__(bridge.CodexAppRuntime)
+runtime_probe.auth_fingerprint = "account-a"
+runtime_restarts: list[bool] = []
+runtime_probe._start = lambda: (runtime_restarts.append(True), setattr(runtime_probe, "auth_fingerprint", "account-b"))
+try:
+    assert runtime_probe.ensure_current_auth(), "切换 Codex 账号后没有刷新常驻 app-server"
+    assert len(runtime_restarts) == 1
+    assert bridge.is_authentication_error(RuntimeError("access token refresh failed"))
+finally:
+    bridge.get_auth_fingerprint = original_auth_fingerprint
+
 original_run = bridge.subprocess.run
 captured_command: list[str] = []
 

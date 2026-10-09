@@ -99,6 +99,14 @@ function Set-CellMatrix([string]$SheetName, [string]$Range, $Rows) {
     $null = Invoke-LarkJson { $payload | lark-cli sheets +cells-set --as user --spreadsheet-token $spreadsheetToken --sheet-name $SheetName --range $Range --cells - --format json } "写入飞书失败：$SheetName $Range"
 }
 
+function Clear-CellRange([string]$SheetName, [string]$Range) {
+    Register-FinanceRangeBeforeImage $script:financeTransaction 'source' $spreadsheetToken $SheetName $Range 'lark-cli'
+    $ranges = ConvertTo-Json -InputObject @("$SheetName!$Range") -Compress
+    $null = Invoke-LarkJson {
+        $ranges | lark-cli sheets +cells-batch-clear --as user --spreadsheet-token $spreadsheetToken --ranges - --scope content --yes --format json
+    } "清除飞书旧尾行失败：$SheetName $Range"
+}
+
 function New-ValueCell($Value) {
     if ($null -eq $Value -or "$Value" -eq '') { return @{ value = '' } }
     return @{ value = $Value }
@@ -245,9 +253,12 @@ function Format-InterventionContents($Items) {
 
 $existingSummaryRows = Get-SheetRows '订单汇总' 'A2:Q2001'
 $summaryById = [ordered]@{}
-foreach ($row in $existingSummaryRows) {
+$existingSummaryLastRow = 1
+for ($rowIndex = 0; $rowIndex -lt $existingSummaryRows.Count; $rowIndex++) {
+    $row = $existingSummaryRows[$rowIndex]
     $orderNo = Get-CellValue $row 2
     if (-not $orderNo) { continue }
+    $existingSummaryLastRow = $rowIndex + 2
     $summaryById[$orderNo] = [pscustomobject]@{
         OrderDate = Get-CellValue $row 0
         Platform = Get-CellValue $row 1
@@ -365,14 +376,24 @@ Set-CellMatrix '订单汇总' "A2:D$summaryLastRow" $summaryAD
 Set-CellMatrix '订单汇总' "F2:J$summaryLastRow" $summaryFJ
 Set-CellMatrix '订单汇总' "M2:P$summaryLastRow" $summaryMP
 Set-CellMatrix '订单汇总' "Q2:Q$summaryLastRow" $summaryQ
+if ($existingSummaryLastRow -gt $summaryLastRow) {
+    $tailStart = $summaryLastRow + 1
+    Clear-CellRange '订单汇总' "A${tailStart}:D$existingSummaryLastRow"
+    Clear-CellRange '订单汇总' "F${tailStart}:J$existingSummaryLastRow"
+    Clear-CellRange '订单汇总' "M${tailStart}:Q$existingSummaryLastRow"
+}
 
 $extractedIds = [Collections.Generic.HashSet[string]]::new([string[]]$extractedOrderNos)
 $existingItemRows = Get-SheetRows '订单商品' 'A2:Q4001'
 $itemRecords = @()
 $existingSequence = @{}
-foreach ($row in $existingItemRows) {
+$existingItemsLastRow = 1
+for ($rowIndex = 0; $rowIndex -lt $existingItemRows.Count; $rowIndex++) {
+    $row = $existingItemRows[$rowIndex]
     $orderNo = Get-CellValue $row 2
-    if (-not $orderNo -or $extractedIds.Contains($orderNo)) { continue }
+    if (-not $orderNo) { continue }
+    $existingItemsLastRow = $rowIndex + 2
+    if ($extractedIds.Contains($orderNo)) { continue }
     if (-not $existingSequence.ContainsKey($orderNo)) { $existingSequence[$orderNo] = 0 }
     $existingSequence[$orderNo]++
     $itemRecords += [pscustomobject]@{
@@ -419,6 +440,13 @@ Set-CellMatrix '订单商品' "A2:D$itemsLastRow" $itemsAD
 Set-CellMatrix '订单商品' "F2:J$itemsLastRow" $itemsFJ
 Set-CellMatrix '订单商品' "O2:O$itemsLastRow" $itemsO
 Set-CellMatrix '订单商品' "Q2:Q$itemsLastRow" $itemsQ
+if ($existingItemsLastRow -gt $itemsLastRow) {
+    $tailStart = $itemsLastRow + 1
+    Clear-CellRange '订单商品' "A${tailStart}:D$existingItemsLastRow"
+    Clear-CellRange '订单商品' "F${tailStart}:J$existingItemsLastRow"
+    Clear-CellRange '订单商品' "O${tailStart}:O$existingItemsLastRow"
+    Clear-CellRange '订单商品' "Q${tailStart}:Q$existingItemsLastRow"
+}
 
 $existingInterventionRows = Get-SheetRows '干预订单' 'A2:M1001'
 $interventionRecords = [ordered]@{}

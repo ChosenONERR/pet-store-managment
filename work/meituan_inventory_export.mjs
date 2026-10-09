@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { openPetstarMerchantTab, releasePetstarMerchantTab } from './meituan_browser_context.mjs';
 
 const PROXY = 'http://localhost:3456';
 const PRODUCT_URL = 'https://shangoue.meituan.com/#/reuse/sc/product/page/list/product/list';
@@ -368,7 +369,7 @@ async function ensureRequiredExportFields(targetId) {
 }
 
 async function runAttempt(attempt, globalStartedAt) {
-  const opened = await proxy(`/new?url=${encodeURIComponent(PRODUCT_URL)}`);
+  const opened = await openPetstarMerchantTab(PRODUCT_URL);
   const targetId = opened.targetId;
   if (!targetId) throw new Error('Could not create a background Chrome tab');
   let stage = 'page-open';
@@ -439,7 +440,7 @@ async function runAttempt(attempt, globalStartedAt) {
     error.diagnostics = diagnostics;
     throw error;
   } finally {
-    await proxy(`/close?target=${encodeURIComponent(targetId)}`).catch(() => {});
+    await releasePetstarMerchantTab(opened);
   }
 }
 

@@ -1,3 +1,5 @@
+import { openPetstarMerchantTab, releasePetstarMerchantTab } from './meituan_browser_context.mjs';
+
 const PROXY = 'http://localhost:3456';
 const ORDER_URL = 'https://shangoue.meituan.com/#/page/orderbusiness#/order/history';
 // Chrome/CDP can pause briefly while Meituan renders a large order page.
@@ -474,7 +476,7 @@ async function main() {
   const health = await proxy('/health');
   if (!health) throw new Error('CDP proxy is unavailable');
 
-  const opened = await proxy(`/new?url=${encodeURIComponent(ORDER_URL)}`);
+  const opened = await openPetstarMerchantTab(ORDER_URL);
   const targetId = opened.targetId;
   if (!targetId) throw new Error('Could not create a background Chrome tab');
 
@@ -547,7 +549,7 @@ async function main() {
       orders: deduped,
     }));
   } finally {
-    await proxy(`/close?target=${encodeURIComponent(targetId)}`).catch(() => {});
+    await releasePetstarMerchantTab(opened);
   }
 }
 

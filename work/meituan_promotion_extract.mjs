@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { openPetstarMerchantTab, releasePetstarMerchantTab } from './meituan_browser_context.mjs';
 
 const PROXY = 'http://localhost:3456';
 const MERCHANT_URL = 'https://shangoue.meituan.com/';
@@ -103,12 +104,8 @@ function withPromotionPage(portalUrl, page) {
   return `${String(portalUrl).slice(0, innerHashIndex)}${page}`;
 }
 
-async function getAuthenticatedPromotionPortalUrl() {
-  let targets = await proxy('/targets');
-  const existing = targets.find((item) => item.type === 'page' && isAuthenticatedPromotionPortalUrl(item.url));
-  if (existing) return existing.url;
-
-  const opened = await proxy(`/new?url=${encodeURIComponent(MERCHANT_URL)}`);
+async function openAuthenticatedPromotionPortal() {
+  const opened = await openPetstarMerchantTab(MERCHANT_URL);
   const targetId = opened.targetId;
   if (!targetId) throw new Error('Could not create Meituan merchant tab');
   try {
@@ -121,14 +118,15 @@ async function getAuthenticatedPromotionPortalUrl() {
     })()`);
     if (!clicked) throw new Error('Could not open Meituan promotion portal');
     await waitForPromotionRoute(targetId, RESOURCE_TIMEOUT_MS);
-    targets = await proxy('/targets');
+    const targets = await proxy('/targets');
     const promoted = targets.find((item) => item.targetId === targetId);
     if (!promoted || !isAuthenticatedPromotionPortalUrl(promoted.url)) {
       throw new Error('Meituan promotion portal did not provide an authenticated route');
     }
-    return promoted.url;
-  } finally {
-    await proxy(`/close?target=${encodeURIComponent(targetId)}`).catch(() => {});
+    return { ...opened, url: promoted.url };
+  } catch (error) {
+    await releasePetstarMerchantTab(opened);
+    throw error;
   }
 }
 
@@ -193,34 +191,53 @@ class CdpBrowser {
   }
 }
 
-async function captureJsonResource(pageUrl, pathFragment, timeoutMs = RESOURCE_TIMEOUT_MS) {
+async function captureJsonResource(targetId, pageUrl, pathFragment, timeoutMs = RESOURCE_TIMEOUT_MS) {
   debug(`capture start ${pathFragment}`);
-  const captured = await proxy(`/capture?url=${encodeURIComponent(pageUrl)}&fragment=${encodeURIComponent(pathFragment)}&timeout=${timeoutMs}`, {
-    signal: AbortSignal.timeout(timeoutMs + 15000),
-  });
-  const body = captured.base64Encoded
-    ? Buffer.from(captured.body || '', 'base64').toString('utf8')
-    : String(captured.body || '');
+  const browser = new CdpBrowser(getChromeWebSocketUrl());
+  await browser.connect();
+  let sessionId = null;
+  let removeListener = null;
   try {
+    const attached = await browser.send('Target.attachToTarget', { targetId, flatten: true });
+    sessionId = attached.sessionId;
+    if (!sessionId) throw new Error('Could not attach to Petstar merchant tab');
+    await browser.send('Network.enable', {}, sessionId);
+    await browser.send('Page.enable', {}, sessionId);
+    let matched = null;
+    let resolveCompleted;
+    const completed = new Promise((resolve) => { resolveCompleted = resolve; });
+    removeListener = browser.onEvent((message) => {
+      if (message.sessionId !== sessionId) return;
+      if (message.method === 'Network.responseReceived' && message.params?.response?.url?.includes(pathFragment)) {
+        matched = { requestId: message.params.requestId, status: message.params.response.status };
+      }
+      if (message.method === 'Network.loadingFinished' && matched?.requestId === message.params?.requestId) {
+        resolveCompleted();
+      }
+    });
+    await browser.send('Page.navigate', { url: pageUrl }, sessionId, timeoutMs);
+    await Promise.race([
+      completed,
+      new Promise((_, reject) => setTimeout(() => reject(new Error(`Timed out waiting for network resource: ${pathFragment}`)), timeoutMs)),
+    ]);
+    if (!matched) throw new Error(`Network resource not found: ${pathFragment}`);
+    if (matched.status < 200 || matched.status >= 300) {
+      throw new Error(`Network resource failed (${matched.status}): ${pathFragment}`);
+    }
+    const response = await browser.send('Network.getResponseBody', { requestId: matched.requestId }, sessionId);
+    const body = response.base64Encoded
+      ? Buffer.from(response.body || '', 'base64').toString('utf8')
+      : String(response.body || '');
     debug(`capture complete ${pathFragment}`);
     return JSON.parse(body);
-  } catch {
-    throw new Error(`Promotion API did not return JSON: ${pathFragment}`);
+  } catch (error) {
+    if (error instanceof SyntaxError) throw new Error(`Promotion API did not return JSON: ${pathFragment}`);
+    throw error;
+  } finally {
+    removeListener?.();
+    if (sessionId) await browser.send('Target.detachFromTarget', { sessionId }).catch(() => {});
+    browser.close();
   }
-}
-
-async function getJsonFromResource(targetId, pathFragment) {
-  const payload = await evaluate(targetId, `(async () => {
-    const url = performance.getEntriesByType('resource').map((entry) => entry.name)
-      .reverse().find((name) => name.includes(${JSON.stringify(pathFragment)}));
-    if (!url) throw new Error('Resource not found: ${pathFragment}');
-    const response = await fetch(url, { credentials: 'include' });
-    const text = await response.text();
-    return { ok: response.ok, status: response.status, text };
-  })()`);
-  if (!payload?.ok) throw new Error(`Promotion API failed (${payload?.status || 'unknown'}): ${pathFragment}`);
-  try { return JSON.parse(payload.text); }
-  catch { throw new Error(`Promotion API did not return JSON: ${pathFragment}`); }
 }
 
 function walk(value, visitor, path = '') {
@@ -292,10 +309,10 @@ async function main() {
   const args = parseArgs(process.argv);
   const dateMode = assertDate(args.date);
   await proxy('/health');
-  const promotionPortalUrl = await getAuthenticatedPromotionPortalUrl();
+  const promotionPortal = await openAuthenticatedPromotionPortal();
   try {
-    const historyUrl = withPromotionPage(promotionPortalUrl, '#/account?scrollConsume=true');
-    const historyResponse = await captureJsonResource(historyUrl, '/ad/v3/flow/r/history');
+    const historyUrl = withPromotionPage(promotionPortal.url, '#/account?scrollConsume=true');
+    const historyResponse = await captureJsonResource(promotionPortal.targetId, historyUrl, '/ad/v3/flow/r/history');
     const historySpend = findHistorySpend(historyResponse, args.date, 0);
     if (dateMode.isRecovery && historySpend.provisional) {
       throw new Error(`Promotion history row for ${args.date} is not settled yet`);
@@ -303,8 +320,8 @@ async function main() {
 
     let accountTotal = historySpend.amount;
     if (!dateMode.isRecovery) {
-      const homepageUrl = withPromotionPage(promotionPortalUrl, '#/index');
-      const homepage = await captureJsonResource(homepageUrl, '/ad/v4/homepage/account/info');
+      const homepageUrl = withPromotionPage(promotionPortal.url, '#/index');
+      const homepage = await captureJsonResource(promotionPortal.targetId, homepageUrl, '/ad/v4/homepage/account/info');
       accountTotal = findHomepageTotal(homepage);
     }
     if (!dateMode.isRecovery && Math.abs(accountTotal - historySpend.amount) > 0.01) {
@@ -324,7 +341,9 @@ async function main() {
         ? ['promotion_history_table']
         : ['homepage_account_total', 'promotion_history_table'],
     }), resolve));
-  } finally { /* Temporary tabs are closed by the network-capture bridge. */ }
+  } finally {
+    await releasePetstarMerchantTab(promotionPortal);
+  }
 }
 
 main().catch((error) => {

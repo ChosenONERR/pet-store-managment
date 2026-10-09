@@ -47,6 +47,7 @@ function Get-LedgerMonth([string]$SheetName) {
 }
 
 $sourceRows = (Get-Rows $sourceToken '订单汇总' 'A2:Q2001').rows
+$orderItemRows = (Get-Rows $sourceToken '订单商品' 'A2:Q4001').rows
 $interventionRows = (Get-Rows $sourceToken '干预订单' 'A2:M1001').rows
 $infoRaw = lark-cli sheets +workbook-info --as user --spreadsheet-token $ledgerToken --format json | Out-String
 if ($LASTEXITCODE -ne 0) { throw '读取每日经营简账结构失败' }
@@ -72,6 +73,24 @@ foreach ($row in $sourceRows) {
     if (-not $orderNo) { continue }
     if ($sourceByOrder.ContainsKey($orderNo)) { $duplicateSourceOrders += $orderNo; continue }
     $sourceByOrder[$orderNo] = $row
+}
+$itemQuantityByOrder = @{}
+foreach ($row in $orderItemRows) {
+    $orderNo = Get-CellValue $row 2
+    if (-not $orderNo) { continue }
+    $quantity = To-Number (Get-CellValue $row 8)
+    if ($null -eq $quantity) { $quantity = 0.0 }
+    if (-not $itemQuantityByOrder.ContainsKey($orderNo)) { $itemQuantityByOrder[$orderNo] = 0.0 }
+    $itemQuantityByOrder[$orderNo] = [double]$itemQuantityByOrder[$orderNo] + $quantity
+}
+$orderItemQuantityMismatches = @()
+foreach ($orderNo in $sourceByOrder.Keys) {
+    $summaryQuantity = To-Number (Get-CellValue $sourceByOrder[$orderNo] 12)
+    if ($null -eq $summaryQuantity) { $summaryQuantity = 0.0 }
+    $itemQuantity = if ($itemQuantityByOrder.ContainsKey($orderNo)) { [double]$itemQuantityByOrder[$orderNo] } else { 0.0 }
+    if ([math]::Abs($summaryQuantity - $itemQuantity) -gt 0.000001) {
+        $orderItemQuantityMismatches += "$orderNo|summary=$summaryQuantity|items=$itemQuantity"
+    }
 }
 $interventionSet = @{}
 foreach ($row in $interventionRows) {
@@ -154,7 +173,7 @@ foreach ($orderNo in $interventionSet.Keys) {
 }
 
 [ordered]@{
-    ok = ($duplicateSourceOrders.Count -eq 0 -and $duplicateIncomeOrders.Count -eq 0 -and $incomeSourceMismatch.Count -eq 0 -and $interventionLeak.Count -eq 0 -and $arithmeticErrors.Count -eq 0 -and $sortErrors.Count -eq 0 -and $missingNaturalOrders.Count -eq 0 -and $expensePairErrors.Count -eq 0)
+    ok = ($duplicateSourceOrders.Count -eq 0 -and $duplicateIncomeOrders.Count -eq 0 -and $incomeSourceMismatch.Count -eq 0 -and $interventionLeak.Count -eq 0 -and $arithmeticErrors.Count -eq 0 -and $sortErrors.Count -eq 0 -and $missingNaturalOrders.Count -eq 0 -and $expensePairErrors.Count -eq 0 -and $orderItemQuantityMismatches.Count -eq 0)
     source_orders = $sourceByOrder.Count
     income_orders = $incomeByOrder.Count
     intervention_orders = $interventionSet.Count
@@ -169,4 +188,5 @@ foreach ($orderNo in $interventionSet.Keys) {
     income_sort_errors = $sortErrors
     missing_natural_orders = $missingNaturalOrders
     intervention_expense_pair_errors = $expensePairErrors
+    order_item_quantity_mismatches = $orderItemQuantityMismatches
 } | ConvertTo-Json -Depth 8

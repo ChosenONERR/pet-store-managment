@@ -45,7 +45,7 @@ QUERY_SECONDS = 60
 MAX_QUERY_ROUNDS = 8
 MAX_TOTAL_QUERIES = 30
 QUERY_CACHE_SECONDS = 30
-RUNTIME_VERSION = "2026-10-08.2"
+RUNTIME_VERSION = "2026-10-09.1"
 RUNTIME_PIPE = rf"\\.\pipe\petstar_codex_runtime_{hashlib.sha256(str(PROJECT_ROOT).encode('utf-8')).hexdigest()[:16]}"
 RUNTIME_AUTHKEY = hashlib.sha256((str(PROJECT_ROOT) + "|petstar-codex-runtime-v1").encode("utf-8")).digest()
 QUERY_DATASETS = {
@@ -73,6 +73,36 @@ SECRET_PATTERNS = (
 _QUERY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _QUERY_CACHE_LOCK = threading.Lock()
 _APP_SERVER_RUNTIME: "CodexAppRuntime | None" = None
+
+
+def get_auth_fingerprint() -> str:
+    """Return a non-secret generation marker for the active Codex credentials."""
+    codex_home = pathlib.Path(os.environ.get("CODEX_HOME") or (pathlib.Path.home() / ".codex"))
+    auth_path = codex_home / "auth.json"
+    try:
+        payload = auth_path.read_bytes()
+        stat = auth_path.stat()
+        return hashlib.sha256(
+            payload + f"|{stat.st_mtime_ns}|{stat.st_size}".encode("ascii")
+        ).hexdigest()
+    except OSError:
+        return "missing"
+
+
+def is_authentication_error(error: BaseException) -> bool:
+    text = str(error).lower()
+    return any(
+        marker in text
+        for marker in (
+            "access token",
+            "refresh token",
+            "logged out",
+            "signed in with another account",
+            "authentication",
+            "unauthorized",
+            "not logged in",
+        )
+    )
 
 ACTION_GUIDE = """
 可返回的动作（只填店主明确提供或能无歧义推导的参数）：
@@ -445,6 +475,7 @@ class CodexAppRuntime:
         self.next_id = 0
         self.lock = threading.Lock()
         self.schema = load_json(SCHEMA_PATH, {})
+        self.auth_fingerprint = ""
         self._start()
 
     def _start(self) -> None:
@@ -474,6 +505,14 @@ class CodexAppRuntime:
         if "result" not in response:
             raise RuntimeError("Codex app-server 初始化失败")
         self._notify("initialized", {})
+        self.auth_fingerprint = get_auth_fingerprint()
+
+    def ensure_current_auth(self) -> bool:
+        current = get_auth_fingerprint()
+        if current == self.auth_fingerprint:
+            return False
+        self._start()
+        return True
 
     def _read_stdout(self) -> None:
         assert self.process is not None and self.process.stdout is not None
@@ -531,58 +570,71 @@ class CodexAppRuntime:
 
     def invoke(self, guided_prompt: str, thread_id: str = "") -> tuple[dict[str, Any], str]:
         with self.lock:
-            if self.process is None or self.process.poll() is not None:
+            self.ensure_current_auth()
+            try:
+                return self._invoke_locked(guided_prompt, thread_id)
+            except RuntimeError as exc:
+                if not is_authentication_error(exc):
+                    raise
+                # Account switching rotates the desktop/CLI OAuth grant. A
+                # running app-server cannot adopt that grant in place, so start
+                # it once with the latest protected credential file and retry.
                 self._start()
-            if not thread_id:
-                started = self._request(
-                    "thread/start",
-                    {
-                        "cwd": str(PROJECT_ROOT),
-                        "ephemeral": True,
-                        "approvalPolicy": "never",
-                        "sandbox": "read-only",
-                    },
-                    45,
-                )
-                thread_id = str(started.get("result", {}).get("thread", {}).get("id") or "")
-                if not thread_id:
-                    raise RuntimeError("Codex app-server 没有返回会话标识")
-            response = self._request(
-                "turn/start",
+                return self._invoke_locked(guided_prompt, thread_id)
+
+    def _invoke_locked(self, guided_prompt: str, thread_id: str = "") -> tuple[dict[str, Any], str]:
+        if self.process is None or self.process.poll() is not None:
+            self._start()
+        if not thread_id:
+            started = self._request(
+                "thread/start",
                 {
-                    "threadId": thread_id,
-                    "input": [{"type": "text", "text": guided_prompt}],
                     "cwd": str(PROJECT_ROOT),
+                    "ephemeral": True,
                     "approvalPolicy": "never",
-                    "sandboxPolicy": {"type": "readOnly"},
-                    "outputSchema": self.schema,
+                    "sandbox": "read-only",
                 },
                 45,
             )
-            turn_id = str(response.get("result", {}).get("turn", {}).get("id") or "")
-            final_text = ""
-            deadline = time.monotonic() + MAX_SECONDS
-            while True:
-                message = self._next_message(deadline)
-                params = message.get("params") or {}
-                if str(params.get("threadId") or "") != thread_id:
-                    continue
-                if message.get("method") == "item/completed":
-                    item = params.get("item") or {}
-                    if item.get("type") == "agentMessage" and (not turn_id or str(params.get("turnId") or "") == turn_id):
-                        final_text = str(item.get("text") or "")
-                if message.get("method") == "turn/completed" and (not turn_id or str(params.get("turn", {}).get("id") or "") == turn_id):
-                    turn = params.get("turn") or {}
-                    if turn.get("status") != "completed":
-                        raise RuntimeError(redact_error(json.dumps(turn.get("error") or turn, ensure_ascii=False)))
-                    break
-            if not final_text:
-                raise RuntimeError("Codex app-server 没有生成最终回复")
-            try:
-                parsed = json.loads(final_text)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError("Codex 返回结果不是有效 JSON") from exc
-            return normalize_result(parsed), thread_id
+            thread_id = str(started.get("result", {}).get("thread", {}).get("id") or "")
+            if not thread_id:
+                raise RuntimeError("Codex app-server 没有返回会话标识")
+        response = self._request(
+            "turn/start",
+            {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": guided_prompt}],
+                "cwd": str(PROJECT_ROOT),
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "readOnly"},
+                "outputSchema": self.schema,
+            },
+            45,
+        )
+        turn_id = str(response.get("result", {}).get("turn", {}).get("id") or "")
+        final_text = ""
+        deadline = time.monotonic() + MAX_SECONDS
+        while True:
+            message = self._next_message(deadline)
+            params = message.get("params") or {}
+            if str(params.get("threadId") or "") != thread_id:
+                continue
+            if message.get("method") == "item/completed":
+                item = params.get("item") or {}
+                if item.get("type") == "agentMessage" and (not turn_id or str(params.get("turnId") or "") == turn_id):
+                    final_text = str(item.get("text") or "")
+            if message.get("method") == "turn/completed" and (not turn_id or str(params.get("turn", {}).get("id") or "") == turn_id):
+                turn = params.get("turn") or {}
+                if turn.get("status") != "completed":
+                    raise RuntimeError(redact_error(json.dumps(turn.get("error") or turn, ensure_ascii=False)))
+                break
+        if not final_text:
+            raise RuntimeError("Codex app-server 没有生成最终回复")
+        try:
+            parsed = json.loads(final_text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Codex 返回结果不是有效 JSON") from exc
+        return normalize_result(parsed), thread_id
 
     def close(self) -> None:
         process = self.process
@@ -951,7 +1003,8 @@ def run_runtime_server() -> int:
                 request = connection.recv()
                 operation = str(request.get("op") or "") if isinstance(request, dict) else ""
                 if operation == "ping":
-                    response = {"ok": True, "runtime": "app_server", "version": RUNTIME_VERSION, "pid": os.getpid(), "query_cache_entries": len(_QUERY_CACHE)}
+                    auth_reloaded = _APP_SERVER_RUNTIME.ensure_current_auth()
+                    response = {"ok": True, "runtime": "app_server", "version": RUNTIME_VERSION, "pid": os.getpid(), "query_cache_entries": len(_QUERY_CACHE), "auth_reloaded": auth_reloaded}
                 elif operation == "invalidate_cache":
                     response = {"ok": True, "cleared": clear_query_cache()}
                 elif operation == "shutdown":
