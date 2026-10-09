@@ -173,20 +173,37 @@ $syncSerial = Convert-ToExcelSerial ([datetime]::Now.ToString('yyyy-MM-dd')) ([d
 
 # SKU成本主表只维护当前 KW 与当前 CSX 过渡码；旧 KW 不作为历史别名。
 $skuCodeCandidates = @{}
-$skuRows = Get-SheetRows 'SKU成本主表' 'A2:B3000'
+$skuRowsWithHeader = @(Get-SheetRows 'SKU成本主表' 'A1:Q3000')
+$skuHeaderRow = if ($skuRowsWithHeader.Count -gt 0) { $skuRowsWithHeader[0] } else { $null }
+if ((Get-CellValue $skuHeaderRow 0) -ne '当前KW' -or (Get-CellValue $skuHeaderRow 16) -ne '商品ID（美团SKU ID）') {
+    throw 'SKU成本主表结构不符合订单同步约定：A列应为[当前KW]，Q列应为[商品ID（美团SKU ID）]'
+}
+$skuRows = @($skuRowsWithHeader | Select-Object -Skip 1)
+$skuProductIdCandidates = @{}
 foreach ($row in $skuRows) {
     $kw = Get-CellValue $row 0
     if (-not $kw -or $kw -notmatch '(?i)^kw\d+$') { continue }
     $kw = $kw.ToLowerInvariant()
-    foreach ($code in @($kw) + @([regex]::Split([string](Get-CellValue $row 1), '[/,，、;；\s]+') | Where-Object { $_ -match '^(?i)csx\d+$' } | ForEach-Object { $_.ToLowerInvariant() })) {
+    $productId = Get-CellValue $row 16
+    $rowCodes = @($kw) + @([regex]::Split([string](Get-CellValue $row 1), '[/,，、;；\s]+') | Where-Object { $_ -match '^(?i)csx\d+$' } | ForEach-Object { $_.ToLowerInvariant() })
+    foreach ($code in $rowCodes) {
         if (-not $skuCodeCandidates.ContainsKey($code)) { $skuCodeCandidates[$code] = @() }
         $skuCodeCandidates[$code] += $kw
+        if ($productId) {
+            if (-not $skuProductIdCandidates.ContainsKey($code)) { $skuProductIdCandidates[$code] = @() }
+            $skuProductIdCandidates[$code] += [string]$productId
+        }
     }
 }
 $skuCodeToKw = @{}
 foreach ($code in $skuCodeCandidates.Keys) {
     $unique = @($skuCodeCandidates[$code] | Select-Object -Unique)
     if ($unique.Count -eq 1) { $skuCodeToKw[$code] = $unique[0] }
+}
+$skuCodeToProductId = @{}
+foreach ($code in $skuProductIdCandidates.Keys) {
+    $unique = @($skuProductIdCandidates[$code] | Where-Object { $_ } | Select-Object -Unique)
+    if ($unique.Count -eq 1) { $skuCodeToProductId[$code] = $unique[0] }
 }
 
 function Normalize-ProductText([string]$Value) {
@@ -209,20 +226,40 @@ foreach ($row in (Get-SheetRows '库存快照' 'B2:O2000')) {
 function Resolve-ProductId([string]$GoodsCode,[string]$Name,[string]$Spec) {
     if (-not $GoodsCode) { return $null }
     $code = $GoodsCode.Trim().ToLowerInvariant()
-    $candidates = @($inventoryCandidates[$code])
-    if ($candidates.Count -eq 0) { return $null }
+    # Windows PowerShell 5.1 会把 @($hashtable['missing']) 视为一个包含 $null 的元素，
+    # 因而不能仅依赖 Count 判断是否找到候选项，否则读取 $null.title 会中断整批同步。
+    $candidates = @()
+    if ($inventoryCandidates.ContainsKey($code)) {
+        $candidates = @($inventoryCandidates[$code] | Where-Object { $null -ne $_ })
+    }
+    if ($candidates.Count -eq 0) {
+        # 新商品可能已进入 SKU 主表，但尚未出现在下一次库存快照中。只有商品 ID 唯一时才兜底，
+        # 无法唯一确认则留空等待后续核对，绝不因单个 SKU 阻断其他订单。
+        if ($skuCodeToProductId.ContainsKey($code)) { return [string]$skuCodeToProductId[$code] }
+        return $null
+    }
     $title = Normalize-ProductText $Name; $specKey = Normalize-ProductText $Spec
     if ($candidates.Count -eq 1) {
         $candidate = $candidates[0]
-        if ($title -and $candidate.title -and $candidate.title -ne $title) { return $null }
-        if ($specKey -and $candidate.spec -and $candidate.spec -ne $specKey) { return $null }
-        return [string]$candidate.product_id
+        $candidateTitle = if ($candidate.PSObject.Properties['title']) { [string]$candidate.title } else { '' }
+        $candidateSpec = if ($candidate.PSObject.Properties['spec']) { [string]$candidate.spec } else { '' }
+        $candidateProductId = if ($candidate.PSObject.Properties['product_id']) { [string]$candidate.product_id } else { '' }
+        if (-not $candidateProductId) { return $null }
+        if ($title -and $candidateTitle -and $candidateTitle -ne $title) { return $null }
+        if ($specKey -and $candidateSpec -and $candidateSpec -ne $specKey) { return $null }
+        return $candidateProductId
     }
-    $matches = @($candidates | Where-Object { (!$title -or $_.title -eq $title) -and (!$specKey -or $_.spec -eq $specKey) })
-    if ($matches.Count -eq 1) { return [string]$matches[0].product_id }
+    $matches = @($candidates | Where-Object {
+        $candidateTitle = if ($_.PSObject.Properties['title']) { [string]$_.title } else { '' }
+        $candidateSpec = if ($_.PSObject.Properties['spec']) { [string]$_.spec } else { '' }
+        (!$title -or $candidateTitle -eq $title) -and (!$specKey -or $candidateSpec -eq $specKey)
+    })
+    if ($matches.Count -eq 1 -and $matches[0].PSObject.Properties['product_id']) { return [string]$matches[0].product_id }
     if ($title) {
-        $matches = @($candidates | Where-Object { $_.title -eq $title })
-        if ($matches.Count -eq 1) { return [string]$matches[0].product_id }
+        $matches = @($candidates | Where-Object {
+            $_.PSObject.Properties['title'] -and [string]$_.title -eq $title
+        })
+        if ($matches.Count -eq 1 -and $matches[0].PSObject.Properties['product_id']) { return [string]$matches[0].product_id }
     }
     return $null
 }
