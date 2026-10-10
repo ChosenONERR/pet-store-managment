@@ -245,7 +245,8 @@ function New-FinanceTransaction(
     [string]$TransactionId,
     [switch]$AcquireLock,
     [hashtable]$WorkbookTokens,
-    [string]$LarkCli
+    [string]$LarkCli,
+    [int]$LockTimeoutSeconds = 600
 ) {
     if (-not $TransactionId) { $TransactionId = 'TX-' + [datetime]::Now.ToString('yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8).ToUpperInvariant() }
     $context = [pscustomobject]@{
@@ -258,7 +259,8 @@ function New-FinanceTransaction(
     if ($AcquireLock) {
         $mutex = [Threading.Mutex]::new($false, 'Local\PetstarFinanceMutationV2')
         $taken = $false
-        try { $taken = $mutex.WaitOne([timespan]::FromMinutes(10)) }
+        $effectiveLockTimeoutSeconds = [math]::Max(0, $LockTimeoutSeconds)
+        try { $taken = $mutex.WaitOne([timespan]::FromSeconds($effectiveLockTimeoutSeconds)) }
         catch [Threading.AbandonedMutexException] { $taken = $true }
         if (-not $taken) { $mutex.Dispose(); throw '另一个经营数据事务仍在执行，本次未写入' }
         $context.owns_lock = $true

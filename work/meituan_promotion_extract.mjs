@@ -1,5 +1,3 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import { openPetstarMerchantTab, releasePetstarMerchantTab } from './meituan_browser_context.mjs';
 
 const PROXY = 'http://localhost:3456';
@@ -130,113 +128,23 @@ async function openAuthenticatedPromotionPortal() {
   }
 }
 
-function getChromeWebSocketUrl() {
-  const portFile = path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'User Data', 'DevToolsActivePort');
-  const [port, webSocketPath] = fs.readFileSync(portFile, 'utf8').trim().split(/\r?\n/);
-  if (!/^\d+$/.test(port || '') || !webSocketPath?.startsWith('/')) {
-    throw new Error('Chrome DevToolsActivePort is invalid');
-  }
-  return `ws://127.0.0.1:${port}${webSocketPath}`;
-}
-
-class CdpBrowser {
-  constructor(url) {
-    this.url = url;
-    this.nextId = 0;
-    this.pending = new Map();
-    this.listeners = new Set();
-  }
-
-  async connect() {
-    this.socket = new WebSocket(this.url);
-    await new Promise((resolve, reject) => {
-      this.socket.addEventListener('open', resolve, { once: true });
-      this.socket.addEventListener('error', () => reject(new Error('Could not connect to Chrome DevTools')), { once: true });
-    });
-    this.socket.addEventListener('message', (event) => {
-      const message = JSON.parse(String(event.data));
-      if (message.id && this.pending.has(message.id)) {
-        const pending = this.pending.get(message.id);
-        clearTimeout(pending.timer);
-        this.pending.delete(message.id);
-        if (message.error) pending.reject(new Error(message.error.message || 'CDP command failed'));
-        else pending.resolve(message.result || {});
-        return;
-      }
-      for (const listener of this.listeners) listener(message);
-    });
-  }
-
-  send(method, params = {}, sessionId = null, timeoutMs = 30000) {
-    return new Promise((resolve, reject) => {
-      const id = ++this.nextId;
-      const command = { id, method, params };
-      if (sessionId) command.sessionId = sessionId;
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`CDP command timed out: ${method}`));
-      }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
-      this.socket.send(JSON.stringify(command));
-    });
-  }
-
-  onEvent(listener) {
-    this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
-  }
-
-  close() {
-    if (this.socket?.readyState === WebSocket.OPEN) this.socket.close();
-  }
-}
-
 async function captureJsonResource(targetId, pageUrl, pathFragment, timeoutMs = RESOURCE_TIMEOUT_MS) {
   debug(`capture start ${pathFragment}`);
-  const browser = new CdpBrowser(getChromeWebSocketUrl());
-  await browser.connect();
-  let sessionId = null;
-  let removeListener = null;
   try {
-    const attached = await browser.send('Target.attachToTarget', { targetId, flatten: true });
-    sessionId = attached.sessionId;
-    if (!sessionId) throw new Error('Could not attach to Petstar merchant tab');
-    await browser.send('Network.enable', {}, sessionId);
-    await browser.send('Page.enable', {}, sessionId);
-    let matched = null;
-    let resolveCompleted;
-    const completed = new Promise((resolve) => { resolveCompleted = resolve; });
-    removeListener = browser.onEvent((message) => {
-      if (message.sessionId !== sessionId) return;
-      if (message.method === 'Network.responseReceived' && message.params?.response?.url?.includes(pathFragment)) {
-        matched = { requestId: message.params.requestId, status: message.params.response.status };
-      }
-      if (message.method === 'Network.loadingFinished' && matched?.requestId === message.params?.requestId) {
-        resolveCompleted();
-      }
-    });
-    await browser.send('Page.navigate', { url: pageUrl }, sessionId, timeoutMs);
-    await Promise.race([
-      completed,
-      new Promise((_, reject) => setTimeout(() => reject(new Error(`Timed out waiting for network resource: ${pathFragment}`)), timeoutMs)),
-    ]);
-    if (!matched) throw new Error(`Network resource not found: ${pathFragment}`);
-    if (matched.status < 200 || matched.status >= 300) {
-      throw new Error(`Network resource failed (${matched.status}): ${pathFragment}`);
-    }
-    const response = await browser.send('Network.getResponseBody', { requestId: matched.requestId }, sessionId);
-    const body = response.base64Encoded
-      ? Buffer.from(response.body || '', 'base64').toString('utf8')
-      : String(response.body || '');
+    // The shared CDP proxy owns the single browser WebSocket. Reuse its capture
+    // endpoint instead of opening a competing DevTools connection.
+    const captured = await proxy(
+      `/capture?url=${encodeURIComponent(pageUrl)}&fragment=${encodeURIComponent(pathFragment)}&timeout=${timeoutMs}`,
+      { signal: AbortSignal.timeout(timeoutMs + 10000) },
+    );
+    const body = captured.base64Encoded
+      ? Buffer.from(captured.body || '', 'base64').toString('utf8')
+      : String(captured.body || '');
     debug(`capture complete ${pathFragment}`);
     return JSON.parse(body);
   } catch (error) {
     if (error instanceof SyntaxError) throw new Error(`Promotion API did not return JSON: ${pathFragment}`);
     throw error;
-  } finally {
-    removeListener?.();
-    if (sessionId) await browser.send('Target.detachFromTarget', { sessionId }).catch(() => {});
-    browser.close();
   }
 }
 

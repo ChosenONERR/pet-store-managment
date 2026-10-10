@@ -94,7 +94,7 @@ function Get-BridgeProcesses {
     return @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" | Where-Object {
         $_.CommandLine -and
         $_.CommandLine.IndexOf($bridgePath, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
-        $_.CommandLine -notmatch '(?i)-Mode\s+(Replay|Inspect|Initialize|FlushAcks)'
+        $_.CommandLine -notmatch '(?i)-Mode\s+(Replay|Inspect|Initialize|FlushAcks|RetryPending)'
     })
 }
 

@@ -1,9 +1,10 @@
 ﻿param(
     [string]$ProjectRoot,
-    [ValidateSet('Live', 'Initialize', 'Inspect', 'Replay', 'FlushAcks')]
+    [ValidateSet('Live', 'Initialize', 'Inspect', 'Replay', 'FlushAcks', 'RetryPending')]
     [string]$Mode = 'Live',
     [int]$ReplayHours = 24,
-    [string]$ChatName = '宠速星经营管家'
+    [string]$ChatName = '宠速星经营管家',
+    [string]$RetryChangeId = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -70,6 +71,17 @@ function Clear-InteractivePriority([string]$ChangeId) {
     } catch {
         Write-BridgeLog "interactive priority cleanup failed change_id=$ChangeId"
     }
+}
+
+function Start-PendingConfirmationRetryWorker([string]$ChangeId) {
+    $arguments = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $PSCommandPath),
+        '-ProjectRoot', ('"{0}"' -f $ProjectRoot), '-Mode', 'RetryPending',
+        '-RetryChangeId', $ChangeId, '-ChatName', ('"{0}"' -f $ChatName)
+    )
+    $process = Start-Process -FilePath $powershellExe -ArgumentList $arguments -WorkingDirectory $ProjectRoot -WindowStyle Hidden -PassThru
+    Write-BridgeLog "pending confirmation retry worker launched change_id=$ChangeId pid=$($process.Id)"
+    return $process.Id
 }
 
 function Get-MessageHash([string]$MessageId) {
@@ -139,7 +151,11 @@ function New-AcknowledgementIdempotencyKey([string]$Purpose, [string]$MessageId)
 }
 
 function Send-AcknowledgementNow([string]$OpenId, [string]$Text, [string]$IdempotencyKey) {
-    $raw = & $larkCli im +messages-send --as bot --user-id $OpenId --text $Text --idempotency-key $idempotencyKey --format json 2>&1 | Out-String
+    # Windows PowerShell 5.1 may split native arguments when a value contains
+    # literal JSON quotes. Curly quotes keep the user-visible meaning while
+    # guaranteeing that the whole acknowledgement remains one --text value.
+    $transportText = $Text.Replace('"', '“')
+    $raw = & $larkCli im +messages-send --as bot --user-id $OpenId --text $transportText --idempotency-key $idempotencyKey --format json 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "确认消息发送失败：$($raw.Trim())" }
     $result = $raw | ConvertFrom-Json
     if (-not $result.ok) { throw "确认消息发送失败：$($result.error.message)" }
@@ -1388,13 +1404,13 @@ function Get-PendingRequestSummary($Pending) {
     return $summary
 }
 
-function Invoke-StoredConfirmationOperations($Pending, $ExecuteEvent) {
+function Invoke-StoredConfirmationOperations($Pending, $ExecuteEvent, [int]$LockTimeoutSeconds = 2700) {
     $executedOperations = [Collections.Generic.List[object]]::new()
     $storedOperations = @($Pending.operations)
     $tokens = Get-FinanceWorkbookTokens
     if (-not $tokens.ContainsKey('source') -or -not $tokens.ContainsKey('ledger')) { throw '经营事务缺少工作簿映射，未开始写入' }
     $transactionId = "confirm-$($Pending.change_id)-$([datetime]::Now.ToString('yyyyMMddHHmmss'))"
-    $transaction = New-FinanceTransaction $stateRoot "飞书确认 $($Pending.change_id)" $transactionId -AcquireLock -WorkbookTokens $tokens -LarkCli $larkCli
+    $transaction = New-FinanceTransaction $stateRoot "飞书确认 $($Pending.change_id)" $transactionId -AcquireLock -WorkbookTokens $tokens -LarkCli $larkCli -LockTimeoutSeconds $LockTimeoutSeconds
     $closed = $false
     try {
         for ($index = 0; $index -lt $storedOperations.Count; $index++) {
@@ -1460,7 +1476,9 @@ function Invoke-ConfirmationFlow($Event, [string]$AuthorizedOpenId, [string]$Mes
         try {
             Set-InteractivePriority ([string]$pending.change_id)
             # 用户确认的是已经展示过的明确预览。这里直接执行已保存动作，禁止再次调用 Codex 重解释原话。
-            $executedOperations = @(Invoke-StoredConfirmationOperations $pending $executeEvent)
+            # Keep the live message consumer responsive. If a scheduled write is
+            # active, hand this durable confirmation to the hidden retry worker.
+            $executedOperations = @(Invoke-StoredConfirmationOperations $pending $executeEvent 5)
             if ($executedOperations.Count -ne @($pending.operations).Count) {
                 throw "计划执行 $(@($pending.operations).Count) 项，实际仅返回 $($executedOperations.Count) 项结果"
             }
@@ -1474,6 +1492,13 @@ function Invoke-ConfirmationFlow($Event, [string]$AuthorizedOpenId, [string]$Mes
             return [pscustomobject]@{handled=$true;result=$true}
         } catch {
             $failureReason = [string]$_.Exception.Message
+            if ($failureReason -eq '另一个经营数据事务仍在执行，本次未写入') {
+                $null = Start-PendingConfirmationRetryWorker ([string]$pending.change_id)
+                $queuedReply = "⏳ 已进入自动排队｜$($pending.change_id)`n当前同步结束后会自动执行，无需再次确认。"
+                $null = Send-Acknowledgement $AuthorizedOpenId $queuedReply ([string]$Event.message_id) 'confirmation-queued'
+                Write-BridgeLog "pending confirmation queued change_id=$($pending.change_id)"
+                return [pscustomobject]@{handled=$true;result=$true}
+            }
             $requestSummary = Get-PendingRequestSummary $pending
             $failureReply = @(
                 "❌ 待确认项 $($pending.change_id) 未执行成功"
@@ -1527,6 +1552,66 @@ function Invoke-ConfirmationFlow($Event, [string]$AuthorizedOpenId, [string]$Mes
     }
 
     return [pscustomobject]@{handled=$false;result=$false}
+}
+
+function Invoke-PendingConfirmationRetry([string]$AuthorizedOpenId, [string]$ChangeId) {
+    $retryMutex = [Threading.Mutex]::new($false, 'Local\PetstarPendingConfirmationRetry')
+    $retryLockTaken = $false
+    try {
+        try { $retryLockTaken = $retryMutex.WaitOne(0) }
+        catch [Threading.AbandonedMutexException] { $retryLockTaken = $true }
+        if (-not $retryLockTaken) { return [ordered]@{ok=$true;skipped='worker_running';change_id=$ChangeId} }
+
+        $pending = Read-PendingConfirmation
+        if (-not $pending) { return [ordered]@{ok=$true;skipped='no_pending_confirmation';change_id=$ChangeId} }
+        if ($ChangeId -and [string]$pending.change_id -ne $ChangeId) {
+            return [ordered]@{ok=$true;skipped='pending_item_changed';change_id=$ChangeId;active_change_id=[string]$pending.change_id}
+        }
+
+        $executeEvent = [pscustomobject]@{
+            content = [string]$pending.effective_message
+            create_time = [string]$pending.original_create_time
+            message_id = "confirmed-retry-$($pending.change_id)"
+            sender_id = $AuthorizedOpenId
+            sender_type = 'user'
+            chat_type = 'p2p'
+            message_type = 'text'
+        }
+        $oldConfirmedExecution = [bool]$script:confirmedExecution
+        $script:confirmedExecution = $true
+        try {
+            Set-InteractivePriority ([string]$pending.change_id)
+            $executedOperations = @(Invoke-StoredConfirmationOperations $pending $executeEvent 2700)
+            if ($executedOperations.Count -ne @($pending.operations).Count) {
+                throw "计划执行 $(@($pending.operations).Count) 项，实际仅返回 $($executedOperations.Count) 项结果"
+            }
+            $successReply = Format-CodexExecutionReply $executedOperations
+            $next = Complete-PendingConfirmation ([string]$pending.change_id)
+            Clear-PetstarCodexQueryCache
+            if ($next) { $successReply += "`n`n下一项待确认：`n" + [string]$next.preview }
+            $null = Send-Acknowledgement $AuthorizedOpenId $successReply ([string]$executeEvent.message_id) 'confirmed-retry'
+            Write-BridgeLog "pending confirmation retry executed change_id=$($pending.change_id)"
+            return [ordered]@{ok=$true;change_id=[string]$pending.change_id;operation_count=$executedOperations.Count}
+        } catch {
+            $reason = [string]$_.Exception.Message
+            $requestSummary = Get-PendingRequestSummary $pending
+            $failureReply = @(
+                "❌ 排队执行仍未成功｜$($pending.change_id)"
+                "原请求：$requestSummary"
+                "原因：$reason"
+                '记账状态：没有保留半成品；该项仍在待确认队列。'
+            ) -join "`n"
+            $null = Send-Acknowledgement $AuthorizedOpenId $failureReply ([string]$executeEvent.message_id) 'confirmation-retry-error'
+            Write-BridgeLog "pending confirmation retry failed change_id=$($pending.change_id) error=$reason"
+            return [ordered]@{ok=$false;change_id=[string]$pending.change_id;error=$reason}
+        } finally {
+            Clear-InteractivePriority ([string]$pending.change_id)
+            $script:confirmedExecution = $oldConfirmedExecution
+        }
+    } finally {
+        if ($retryLockTaken) { try { $retryMutex.ReleaseMutex() } catch {} }
+        $retryMutex.Dispose()
+    }
 }
 
 function Process-Event([string]$Line, [string]$AuthorizedOpenId, [switch]$BypassConfirmation) {
@@ -1899,6 +1984,13 @@ function Invoke-RecentMessageReplay([string]$AuthorizedOpenId) {
 
 $script:handledMessageHashes = Get-HandledMessageHashes
 $authorizedOpenId = Get-CurrentUserOpenId
+
+if ($Mode -eq 'RetryPending') {
+    $result = Invoke-PendingConfirmationRetry $authorizedOpenId $RetryChangeId
+    [ordered]@{ok=[bool]$result.ok;mode=$Mode;result=$result} | ConvertTo-Json -Depth 8
+    if (-not $result.ok) { exit 1 }
+    exit 0
+}
 
 if ($Mode -eq 'FlushAcks') {
     try {

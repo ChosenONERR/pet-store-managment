@@ -54,7 +54,10 @@ if ($Mode -ne 'manual' -and (Test-Path -LiteralPath $interactivePriorityPath)) {
         $priorityState = Get-Content -LiteralPath $interactivePriorityPath -Raw -Encoding UTF8 | ConvertFrom-Json
         $priorityStartedAt = [datetimeoffset]::MinValue
         if ([datetimeoffset]::TryParse([string]$priorityState.started_at,[ref]$priorityStartedAt)) {
-            $priorityIsActive = ([datetimeoffset]::Now - $priorityStartedAt).TotalMinutes -lt 30
+            # A queued confirmation may wait behind one full rebuild and then run
+            # its own atomic recalculation. Keep later scheduled jobs out of the
+            # way for the whole bounded retry window.
+            $priorityIsActive = ([datetimeoffset]::Now - $priorityStartedAt).TotalMinutes -lt 90
         }
     } catch {}
     if ($priorityIsActive) {
@@ -1284,7 +1287,6 @@ try {
     $stage = Invoke-WithRetry 'preflight' { Test-SyncPreflight } 5
     $preflightResult = $stage.value
     $promotionCapture = Get-PromotionCaptureState
-    Start-SyncFinanceTransaction
     if (-not $SkipSync) {
         $dependencyCheck = Invoke-WithRetry 'chrome_cdp' {
             $global:LASTEXITCODE = 0
@@ -1294,6 +1296,10 @@ try {
             }
             return ($output -join '; ')
         } 3
+        # Browser availability is read-only. Never take the global finance lock
+        # until Chrome is usable; otherwise an unavailable browser blocks owner-
+        # confirmed writes even though this run cannot mutate valid data.
+        Start-SyncFinanceTransaction
         if (-not $SkipOrders) {
             $stage = Invoke-WithRetry 'order_sync' { Invoke-JsonPowerShellScript $orderScript @{ StartDate = $dateText; EndDate = $dateText } } 3
             $orderResult = $stage.value
@@ -1321,6 +1327,8 @@ try {
                 throw
             }
         }
+    } else {
+        Start-SyncFinanceTransaction
     }
 
     if ($Mode -eq 'night') {

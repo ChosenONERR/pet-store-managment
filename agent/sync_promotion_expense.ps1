@@ -57,7 +57,12 @@ try {
             $extraction = Invoke-JsonProcess 'node' @($extractor, '--date', $dateText) '美团推广费读取失败'
             break
         } catch {
-            $errors.Add($_.Exception.Message)
+            $attemptError = [string]$_.Exception.Message
+            $errors.Add($attemptError)
+            # A missing/stale DevTools endpoint does not improve by reopening the
+            # promotion page three times. Stop immediately and let the scheduled
+            # recovery try again after Chrome becomes reachable.
+            if ($attemptError -match 'Could not connect to Chrome DevTools|Chrome DevToolsActivePort is invalid|CDP command timed out: Target\.attachToTarget|WebSocket 未连接|CDP proxy request failed') { break }
             if ($attempt -lt 3) { Start-Sleep -Seconds (2 * $attempt) }
         }
     }
