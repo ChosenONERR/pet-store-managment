@@ -84,6 +84,10 @@ function New-OverwriteCell($Value) {
     if ($null -eq $Value -or [string]$Value -eq '') { return @{value=''} }
     return @{value=$Value}
 }
+function New-UnitCostCell($Value) {
+    if ($null -eq $Value -or [string]$Value -eq '') { return @{value='';cell_styles=@{number_format='#,##0.####'}} }
+    return @{value=$Value;cell_styles=@{number_format='#,##0.####'}}
+}
 function New-FormulaCell([string]$Formula) { return @{formula=$Formula} }
 function Get-SheetRows([string]$SheetName, [string]$Range) {
     $raw = & $larkCli sheets +cells-get --as user --spreadsheet-token $token --sheet-name $SheetName --range $Range --include 'value,formula' --max-chars 3000000 --format json | Out-String
@@ -113,16 +117,6 @@ function Assert-FormulaRange([string]$SheetName, [string]$Range) {
     if ($result.data.status -ne 'success') { throw "公式存在错误：$SheetName $Range" }
 }
 
-$referenceCostRows = Get-SheetRows '商品成本' 'A2:E2000'
-$referenceCostByCode = @{}
-foreach ($row in $referenceCostRows) {
-    $code = ([string](Get-CellValue $row 0)).Trim().ToLowerInvariant()
-    $unitCost = Convert-ToNullableNumber (Get-CellValue $row 3)
-    $status = [string](Get-CellValue $row 4)
-    if (-not $code -or $null -eq $unitCost -or $status -in @('待人工核对','缺少成本')) { continue }
-    $referenceCostByCode[$code] = [double]$unitCost
-}
-
 $masterRows = Get-SheetRows 'SKU成本主表' 'A2:Z3000'
 $states = @{}
 $aliasCandidates = @{}
@@ -135,7 +129,9 @@ for ($i=0; $i -lt $masterRows.Count; $i++) {
     $titleKey = Normalize-ProductTitle (Get-CellValue $row $skuSchema.PlatformTitle.Index)
     $csxAliases = @([regex]::Split([string](Get-CellValue $row $skuSchema.TransitionCode.Index), '[/,，、;；\s]+') | Where-Object { $_ -match '^(?i)csx\d+$' } | ForEach-Object { $_.Trim().ToLowerInvariant() } | Select-Object -Unique)
     if (-not $kw -and -not $productId -and -not $titleKey -and $csxAliases.Count -eq 0) { continue }
-    $fallbackCostCandidates = @($csxAliases | Where-Object { $referenceCostByCode.ContainsKey($_) } | ForEach-Object { [double]$referenceCostByCode[$_] } | Sort-Object -Unique)
+    $costStatus = [string](Get-CellValue $row $skuSchema.CostStatus.Index)
+    $rawBaselineCost = Convert-ToNullableNumber (Get-CellValue $row $skuSchema.BaselineUnitCost.Index)
+    $confirmedBaselineCost = if ($null -ne $rawBaselineCost) { [double]$rawBaselineCost } else { $null }
     $baselineDate = Convert-ToDate (Get-CellValue $row $skuSchema.InitializationDate.Index)
     if ($null -eq $baselineDate) { $baselineDate = [datetime]'2026-08-24' }
     $state = [pscustomobject]@{
@@ -144,13 +140,12 @@ for ($i=0; $i -lt $masterRows.Count; $i++) {
         current_kw=$kw
         master_row=2+$i
         opening_qty=$(if ($null -eq (Convert-ToNullableNumber (Get-CellValue $row $skuSchema.InitialInventory.Index))) {0.0}else{[double](Convert-ToNullableNumber (Get-CellValue $row $skuSchema.InitialInventory.Index))})
-        baseline_cost=Convert-ToNullableNumber (Get-CellValue $row $skuSchema.BaselineUnitCost.Index)
+        baseline_cost=$confirmedBaselineCost
         qty=$(if ($null -eq (Convert-ToNullableNumber (Get-CellValue $row $skuSchema.InitialInventory.Index))) {0.0}else{[double](Convert-ToNullableNumber (Get-CellValue $row $skuSchema.InitialInventory.Index))})
-        avg=Convert-ToNullableNumber (Get-CellValue $row $skuSchema.BaselineUnitCost.Index)
+        avg=$confirmedBaselineCost
         units_per_pack=$(if ($null -eq (Convert-ToNullableNumber (Get-CellValue $row $skuSchema.UnitsPerPack.Index))) {1.0}else{[double](Convert-ToNullableNumber (Get-CellValue $row $skuSchema.UnitsPerPack.Index))})
         baseline_date=$baselineDate.Date
-        status=Get-CellValue $row $skuSchema.CostStatus.Index
-        fallback_cost=$(if ($fallbackCostCandidates.Count -eq 1) { [double]$fallbackCostCandidates[0] } else { $null })
+        status=$costStatus
         title_key=$titleKey
     }
     $states[$canonical] = $state
@@ -334,7 +329,6 @@ foreach ($purchase in $replenishments) {
         $events += [pscustomobject]@{date=$purchase.date;sort=1;row=$purchase.row;kind='purchase';canonical=$purchase.canonical;payload=$purchase}
     }
 }
-$referenceFallbackCosted = 0
 foreach ($item in $itemOutputs) {
     if (-not $item.canonical) { continue }
     $state = $states[$item.canonical]
@@ -392,19 +386,14 @@ foreach ($event in $events) {
     }
 }
 
-# 补齐未进入移动平均事件流的历史赠品，优先使用主表基准成本，其次使用唯一参考成本。
+# 补齐未进入移动平均事件流的历史赠品，只允许使用 SKU 成本主表中已确认的基准成本。
+# 旧“商品成本”表只作为人工核对参考，不能绕过待确认状态参与利润计算。
 foreach ($gift in $giftEvents) {
     if ($null -ne $gift.gift_cost -and $gift.cost_status -ne '成本待核对') { continue }
     $fallbackCost = $null
     if ($gift.canonical -and $states.ContainsKey($gift.canonical)) {
         $giftState = $states[$gift.canonical]
-        if ($null -ne $giftState.baseline_cost) {
-            $fallbackCost = [double]$giftState.baseline_cost
-        } elseif ($null -ne $giftState.fallback_cost) {
-            $fallbackCost = [double]$giftState.fallback_cost
-        }
-    } elseif ($referenceCostByCode.ContainsKey($gift.raw_code)) {
-        $fallbackCost = [double]$referenceCostByCode[$gift.raw_code]
+        if ($null -ne $giftState.baseline_cost) { $fallbackCost = [double]$giftState.baseline_cost }
     }
     if ($null -eq $fallbackCost) { continue }
     $gift.unit_cost = $fallbackCost
@@ -422,7 +411,7 @@ foreach ($gift in $normalizedGiftCostRows) {
         $cleanNote = if ($cleanNoteParts.Count -gt 0) { $cleanNoteParts -join '；' } else { '成本已按SKU成本主表重新计算' }
     }
     $giftUpdate = @(); $giftUpdate += ,@(
-        (New-OverwriteCell $(if($null-eq$gift.unit_cost){$null}else{[double]$gift.unit_cost})),(New-OverwriteCell ([double]$gift.gift_cost)),
+        (New-UnitCostCell $(if($null-eq$gift.unit_cost){$null}else{[double]$gift.unit_cost})),(New-OverwriteCell ([double]$gift.gift_cost)),
         (New-OverwriteCell '已计成本'),(New-OverwriteCell $cleanNote)
     )
     Set-CellMatrix '赠品记录' "G$($gift.row):J$($gift.row)" $giftUpdate
@@ -473,20 +462,7 @@ foreach ($item in $itemOutputs) {
         }
     }
     if ($null -eq $item.unit_cost) {
-        $fallbackCost = if ($referenceCostByCode.ContainsKey($item.raw_code)) {
-            [double]$referenceCostByCode[$item.raw_code]
-        } elseif ($item.canonical -and $null -ne $states[$item.canonical].fallback_cost) {
-            [double]$states[$item.canonical].fallback_cost
-        } else {
-            $null
-        }
-        if ($null -ne $fallbackCost) {
-            $item.unit_cost = $fallbackCost
-            $item.item_cost = $fallbackCost * [double]$item.effective_quantity
-            $effectiveSalesAmount = if ([double]$item.quantity -le 0) { 0.0 } else { [double]$item.sales_amount * ([double]$item.effective_quantity / [double]$item.quantity) }
-            $item.margin = $effectiveSalesAmount - [double]$item.item_cost
-            $referenceFallbackCosted++
-        } elseif ($null -ne $item.previous_unit_cost -and $null -ne $item.previous_item_cost) {
+        if (-not $item.canonical -and $null -ne $item.previous_unit_cost -and $null -ne $item.previous_item_cost) {
             # 无法确定稳定商品身份时，冻结既有订单快照，绝不因当前 KW 被复用而改写历史成本。
             $item.unit_cost = [double]$item.previous_unit_cost
             $item.item_cost = [double]$item.previous_item_cost
@@ -503,7 +479,7 @@ $lastItemRow = if ($itemOutputs.Count -gt 0) { [int](($itemOutputs | Measure-Obj
 for ($sheetRow=2; $sheetRow -le $lastItemRow; $sheetRow++) {
     if ($itemByRow.ContainsKey($sheetRow)) {
         $item = $itemByRow[$sheetRow]
-        $itemCostMatrix += ,@((New-OverwriteCell $item.unit_cost),(New-OverwriteCell $item.item_cost),(New-OverwriteCell $item.margin))
+        $itemCostMatrix += ,@((New-UnitCostCell $item.unit_cost),(New-OverwriteCell $item.item_cost),(New-OverwriteCell $item.margin))
     } else {
         $itemCostMatrix += ,@((New-OverwriteCell $null),(New-OverwriteCell $null),(New-OverwriteCell $null))
     }
@@ -523,7 +499,7 @@ for ($i=0; $i -le $lastMasterIndex; $i++) {
     $canonical = if ($productId) { "sku:$productId" } else { "legacy:$($i+2)" }
     if ($states.ContainsKey($canonical)) {
         $state = $states[$canonical]
-        $masterUpdate += ,@((New-OverwriteCell $state.avg),(New-OverwriteCell $state.qty),(New-OverwriteCell (Convert-ToExcelSerial ([datetime]::Now)))
+        $masterUpdate += ,@((New-UnitCostCell $state.avg),(New-OverwriteCell $state.qty),(New-OverwriteCell (Convert-ToExcelSerial ([datetime]::Now)))
         )
     } else {
         $masterUpdate += ,@(
@@ -578,7 +554,7 @@ $finalResult = [ordered]@{
     item_rows=$itemOutputs.Count
     natural_costed=@($itemOutputs | Where-Object { -not $_.intervention -and -not $_.cancelled -and $null -ne $_.item_cost }).Count
     natural_pending_cost=@($itemOutputs | Where-Object { -not $_.intervention -and -not $_.cancelled -and $null -eq $_.item_cost }).Count
-    reference_fallback_costed=$referenceFallbackCosted
+    reference_fallback_costed=0
     trial_zero_cost=@($itemOutputs | Where-Object { -not $_.intervention -and -not $_.cancelled -and $_.trial_zero_cost -and $_.item_cost -eq 0 }).Count
     intervention_zero_cost=@($itemOutputs | Where-Object { $_.intervention -and $_.item_cost -eq 0 }).Count
     replenishment_rows=$replenishments.Count

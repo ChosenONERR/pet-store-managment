@@ -137,6 +137,10 @@ function Get-StableEventKey([string]$Value, [int]$Length = 20) {
     }
 }
 function New-ValueCell($Value) { if ($null -eq $Value -or [string]$Value -eq '') { return @{} }; return @{value=$Value} }
+function New-UnitCostCell($Value) {
+    if ($null -eq $Value -or [string]$Value -eq '') { return @{} }
+    return @{value=$Value;cell_styles=@{number_format='#,##0.####'}}
+}
 function Get-CellValue($Row, [int]$Index) {
     if ($null -eq $Row -or $Index -ge @($Row).Count) { return $null }
     $cell = @($Row)[$Index]
@@ -1573,6 +1577,7 @@ switch ($Action) {
         $oldMovingCost = if ($oldMovingCostText -eq $null -or $oldMovingCostText -eq '') { $null } else { Convert-ToNumber $oldMovingCostText }
         $newCost = [math]::Round([double]$Amount,4)
         $oldStatus = Get-CellValue $target.cells $skuSchema.CostStatus.Index
+        $newStatus = if ([string]$oldStatus -match '当前KW冲突') { '当前KW冲突待核对（成本已确认）' } else { '用户确认' }
         $oldNote = Get-CellValue $target.cells $skuSchema.Note.Index
         $newNoteEntry = "店主通过飞书确认销售单位成本为 $($newCost.ToString('0.####',[Globalization.CultureInfo]::InvariantCulture)) 元（$($Date.ToString('yyyy-MM-dd'))）"
         $oldNoteParts = @([regex]::Split([string]$oldNote, '[；;]') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -1582,7 +1587,7 @@ switch ($Action) {
             [ordered]@{ok=$true;dry_run=$true;action=$Action;result=[ordered]@{
                 sheet='SKU成本主表';row=$rowNumber;range="$($skuSchema.BaselineUnitCost.Column)${rowNumber},$($skuSchema.CostStatus.Column)${rowNumber},$($skuSchema.ConversionBasis.Column)${rowNumber}:$($skuSchema.Note.Column)${rowNumber}"
                 goods_code=$displayCode;sku_reference=$normalizedCode;product_id=$productId;title=$title;old_baseline_cost=$oldBaselineCost;old_moving_average_cost=$oldMovingCost
-                new_unit_cost=$newCost;old_status=$oldStatus;new_status='用户确认';affected_tables=@('SKU成本主表','订单商品','订单汇总','对应月份收入','驾驶舱')
+                new_unit_cost=$newCost;old_status=$oldStatus;new_status=$newStatus;affected_tables=@('SKU成本主表','订单商品','订单汇总','对应月份收入','驾驶舱')
             };message='预演成功，未写入飞书'} | ConvertTo-Json -Depth 10
             Complete-CurrentFinanceTransaction
             exit 0
@@ -1592,8 +1597,8 @@ switch ($Action) {
         $backupPath = Join-Path $stateRoot ("sku_cost_change_backup_{0}_{1}.json" -f $displayCode,[datetime]::Now.ToString('yyyyMMdd_HHmmss'))
         [ordered]@{source="SKU成本主表!A${rowNumber}:Z${rowNumber}";captured_at=[datetime]::Now.ToString('o');cells=@($target.cells)} | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $backupPath -Encoding UTF8
 
-        $eMatrix = @(); $eMatrix += ,@((New-ValueCell $newCost))
-        $jMatrix = @(); $jMatrix += ,@((New-ValueCell '用户确认'))
+        $eMatrix = @(); $eMatrix += ,@((New-UnitCostCell $newCost))
+        $jMatrix = @(); $jMatrix += ,@((New-ValueCell $newStatus))
         $mnMatrix = @(); $mnMatrix += ,@((New-ValueCell '店主确认的销售单位成本'),(New-ValueCell $newNote))
         Set-AtomicCellOperations @(
             @{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.BaselineUnitCost.Column)${rowNumber}:$($skuSchema.BaselineUnitCost.Column)${rowNumber}";cells=$eMatrix}},
@@ -1603,16 +1608,16 @@ switch ($Action) {
 
         # 飞书写入成功后，紧接着的大范围成本重算偶尔会让第一次回读命中旧 revision。
         # 先等待关键字段可见，再重算；重算完成后再次回读，避免“数据其实已写入但回复失败”。
-        $writeReadback = Get-SkuCostReadback $rowNumber $newCost '用户确认'
-        if ([math]::Abs([double]$writeReadback.baseline_cost - $newCost) -gt 0.0001 -or [string]$writeReadback.status -ne '用户确认') {
+        $writeReadback = Get-SkuCostReadback $rowNumber $newCost $newStatus
+        if ([math]::Abs([double]$writeReadback.baseline_cost - $newCost) -gt 0.0001 -or [string]$writeReadback.status -ne $newStatus) {
             throw "SKU成本写入后回读不一致：$displayCode（实际成本=$($writeReadback.baseline_cost)，状态=$($writeReadback.status)，重试=$($writeReadback.attempt)次）"
         }
         $costResult = Invoke-CostSnapshotRebuild
-        $finalReadback = Get-SkuCostReadback $rowNumber $newCost '用户确认'
+        $finalReadback = Get-SkuCostReadback $rowNumber $newCost $newStatus
         $actualBaseline = [double]$finalReadback.baseline_cost
         $actualMoving = [double]$finalReadback.moving_average_cost
         $actualStatus = [string]$finalReadback.status
-        if ([math]::Abs($actualBaseline - $newCost) -gt 0.0001 -or $actualStatus -ne '用户确认') {
+        if ([math]::Abs($actualBaseline - $newCost) -gt 0.0001 -or $actualStatus -ne $newStatus) {
             throw "SKU成本重算后回读不一致：$displayCode（实际成本=$actualBaseline，状态=$actualStatus，重试=$($finalReadback.attempt)次）"
         }
         $reference = "$displayCode $newCost"

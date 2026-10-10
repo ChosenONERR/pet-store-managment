@@ -150,6 +150,9 @@ $contracts = [ordered]@{
     message_latency_has_stage_telemetry = ($codexBridge -match 'codex_performance\.ndjson' -and $codexBridge -match 'model_seconds' -and $codexBridge -match 'query_seconds' -and $bridge -match 'message timing')
     order_local_ledger_rebuild_is_month_scoped = ($ledgerSync -match '\[string\]\$MonthFilter' -and $ledgerSync -match 'selected_months' -and $financeEvent -match 'monthLocalActions')
     cost_basis_changes_keep_full_ledger_rebuild = ($financeEvent.Contains('Invoke-DailyLedgerSync $ledgerTargetMonth') -and $financeEvent -match "'Replenishment','ChangeSkuCode','SetSkuCost'")
+    missing_sku_cost_never_uses_reference_fallback = ($costRebuild -notmatch "Get-SheetRows '商品成本'" -and $costRebuild -notmatch 'referenceCostByCode' -and $costRebuild -match 'if \(-not \$item\.canonical -and \$null -ne \$item\.previous_unit_cost')
+    cost_confirmation_preserves_kw_conflict_warning = ($financeEvent -match "oldStatus -match '当前KW冲突'" -and $financeEvent -match '当前KW冲突待核对（成本已确认）')
+    unit_cost_precision_is_preserved = ($financeEvent -match 'function New-UnitCostCell' -and $financeEvent -match "number_format='#,##0\.####'" -and $costRebuild -match 'New-UnitCostCell \$item\.unit_cost' -and $costRebuild -match 'New-UnitCostCell \$state\.avg')
     scheduled_sync_yields_to_confirmed_writes = ($bridge -match 'interactive_priority\.json' -and $scheduledSync -match '人工确认写账优先，定时同步已让路')
     codex_mutation_preview_reuses_first_parse = ($bridge -match 'function New-ConfirmationDraftFromCodexResult' -and $bridge -match 'Reuse them[\s\S]{0,240}New-ConfirmationDraftFromCodexResult')
 }
