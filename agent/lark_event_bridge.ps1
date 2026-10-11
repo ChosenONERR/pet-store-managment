@@ -14,6 +14,7 @@ $env:LARK_CLI_NO_PROXY = '1'
 if (-not $ProjectRoot) { $ProjectRoot = Split-Path $PSScriptRoot -Parent }
 $ProjectRoot = (Resolve-Path -LiteralPath $ProjectRoot).Path
 $petstarCli = Join-Path $ProjectRoot 'agent\petstar_cli.py'
+$financeEventScript = Join-Path $ProjectRoot 'agent\record_finance_event.ps1'
 $codexBridge = Join-Path $ProjectRoot 'agent\codex_chat_bridge.py'
 $ledgerScript = Join-Path $ProjectRoot 'agent\sync_daily_ledger.ps1'
 $costSnapshotScript = Join-Path $ProjectRoot 'agent\rebuild_cost_snapshots.ps1'
@@ -459,10 +460,7 @@ function Invoke-CodexAndReply($Event, [string]$AuthorizedOpenId, [string]$Messag
     }
 
     $executedOperations = [Collections.Generic.List[object]]::new()
-    for ($index = 0; $index -lt $actions.Count; $index++) {
-        $operation = Invoke-CodexAction $actions[$index] $Event $index $codexMode
-        if ($null -ne $operation) { $executedOperations.Add($operation) }
-    }
+    foreach ($operation in @(Invoke-CodexActionsInOrder $actions $Event $codexMode)) { $executedOperations.Add($operation) }
 
     if ($script:previewMode) {
         # 只为真正的数据修改生成确认预览。RefreshLedger 等维护动作无需确认，
@@ -552,6 +550,62 @@ function Invoke-PetstarEvent([string[]]$Arguments) {
         throw "经营事件执行失败：$detail"
     }
     return $result
+}
+
+function Test-BatchCompatibleSkuOperation($Operation) {
+    $action = [string]$Operation.action
+    if ($action -eq 'Replenishment') { return $true }
+    if ($action -ne 'SetSkuCost') { return $false }
+    return -not (Get-CodexActionValue $Operation.arguments 'order_no')
+}
+
+function Invoke-PetstarBatchSkuMaintenance($StoredOperations, $Event, [int]$StartIndex, [switch]$Preview) {
+    $operationList = @($StoredOperations)
+    if ($operationList.Count -lt 2) { throw '批量 SKU 维护至少需要两项兼容操作' }
+    $payloadOperations = [Collections.Generic.List[object]]::new()
+    $normalizedArguments = [Collections.Generic.List[object]]::new()
+    for ($offset = 0; $offset -lt $operationList.Count; $offset++) {
+        $stored = $operationList[$offset]
+        $arguments = [ordered]@{}
+        foreach ($property in @($stored.arguments.PSObject.Properties)) { $arguments[$property.Name] = $property.Value }
+        if ([string]$stored.action -eq 'Replenishment' -and -not $arguments['date']) {
+            $arguments['date'] = (Resolve-MessageDate ([string]$Event.content) ([string]$Event.create_time)).ToString('yyyy-MM-dd')
+        }
+        if (-not $arguments['note']) { $arguments['note'] = '本机 Codex 通过飞书自然语言解析' }
+        $arguments['event_id'] = "codex-$($Event.message_id)-$($StartIndex+$offset)-$([string]$stored.action)"
+        $payloadOperations.Add([ordered]@{action=[string]$stored.action;arguments=$arguments})
+        $normalizedArguments.Add([pscustomobject]$arguments)
+    }
+    $requestPath = Join-Path $stateRoot ("batch_sku_maintenance_{0}.json" -f [guid]::NewGuid().ToString('N'))
+    $batchEventId = "codex-$($Event.message_id)-batch-sku-$StartIndex-$($operationList.Count)"
+    try {
+        [IO.File]::WriteAllText($requestPath,(ConvertTo-Json -InputObject $payloadOperations.ToArray() -Depth 20 -Compress),[Text.UTF8Encoding]::new($false))
+        $commandArguments = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$financeEventScript,'-Action','BatchSkuMaintenance','-OperationsPath',$requestPath,'-EventId',$batchEventId,'-ProjectRoot',$ProjectRoot)
+        if ($Preview) { $commandArguments += '-DryRun' }
+        $outputLines = @(& $powershellExe @commandArguments 2>&1 | ForEach-Object { [string]$_ })
+        $exitCode = $LASTEXITCODE
+        $result = Convert-CommandOutputToJson $outputLines
+        if ($exitCode -ne 0 -or $null -eq $result -or -not $result.ok) {
+            $detail = Get-CommandFailureDetail $result $outputLines
+            throw "批量经营事件执行失败：$detail"
+        }
+        $executed = [Collections.Generic.List[object]]::new()
+        if ([bool]$result.duplicate) {
+            foreach ($stored in $operationList) {
+                $executed.Add([pscustomobject]@{action=[string]$stored.action;arguments=$stored.arguments;result=$null;formula_verification='success';duplicate=$true})
+            }
+            return $executed.ToArray()
+        }
+        $details = @($result.result.operations)
+        if ($details.Count -ne $operationList.Count) { throw "批量经营事件结果不完整：计划 $($operationList.Count) 项，实际 $($details.Count) 项" }
+        for ($offset = 0; $offset -lt $operationList.Count; $offset++) {
+            $stored = $operationList[$offset]
+            $executed.Add([pscustomobject]@{action=[string]$stored.action;arguments=$normalizedArguments[$offset];result=$details[$offset];formula_verification=$result.formula_verification;duplicate=$false})
+        }
+        return $executed.ToArray()
+    } finally {
+        if (Test-Path -LiteralPath $requestPath) { Remove-Item -LiteralPath $requestPath -Force }
+    }
 }
 
 function Invoke-DailyLedgerSync([datetime]$ThroughDate) {
@@ -673,6 +727,34 @@ function Invoke-CodexAction($CodexAction, $Event, [int]$Index, [string]$Mode) {
     }
 }
 
+function Invoke-CodexActionsInOrder($Actions, $Event, [string]$Mode) {
+    $actionList = @($Actions)
+    $operations = [Collections.Generic.List[object]]::new()
+    $index = 0
+    while ($index -lt $actionList.Count) {
+        if ($Mode -eq 'preview' -and (Test-BatchCompatibleSkuOperation $actionList[$index])) {
+            $compatibleRun = [Collections.Generic.List[object]]::new()
+            $scanIndex = $index
+            while ($scanIndex -lt $actionList.Count -and (Test-BatchCompatibleSkuOperation $actionList[$scanIndex])) {
+                $compatibleRun.Add($actionList[$scanIndex])
+                $scanIndex++
+            }
+            if ($compatibleRun.Count -ge 2) {
+                foreach ($batchOperation in @(Invoke-PetstarBatchSkuMaintenance $compatibleRun.ToArray() $Event $index -Preview)) {
+                    $script:previewOperations.Add($batchOperation)
+                    $operations.Add($batchOperation)
+                }
+                $index = $scanIndex
+                continue
+            }
+        }
+        $operation = Invoke-CodexAction $actionList[$index] $Event $index $Mode
+        if ($null -ne $operation) { $operations.Add($operation) }
+        $index++
+    }
+    return $operations.ToArray()
+}
+
 function Format-CodexExecutionReply($Operations) {
     $lines = [Collections.Generic.List[string]]::new()
     $mutations = @($Operations | Where-Object { [string]$_.action -notin @('RefreshLedger','SendDailySummary','SyncPlatformData') })
@@ -702,6 +784,8 @@ function Format-CodexExecutionReply($Operations) {
             }
             'Replenishment' {
                 $lines.Add("补货记录第$($details.row)行：$($details.goods_code)｜$($details.package_quantity) 个采购包装")
+                $afterCostText = if ($null -eq $details.after_average_cost -or [string]$details.after_average_cost -eq '') { '待核对' } else { "¥$([math]::Round([double]$details.after_average_cost,4))" }
+                $lines.Add("SKU成本主表当前移动平均成本：$afterCostText；未重算历史订单或经营简账。")
                 if ($details.sku_status -eq 'created_pending_profile') { $lines.Add('已建立待平台同步的SKU档案。') }
                 if ($details.sku_status -eq 'attached_kw_by_csx') { $lines.Add("已按 CSX 匹配原档案并绑定当前 KW：$($details.goods_code)。") }
             }
@@ -709,7 +793,8 @@ function Format-CodexExecutionReply($Operations) {
             'SetSkuExpiry' { $lines.Add("$($details.goods_code)：最早到期 $($details.earliest_expiry)") }
             'SetSkuCost' {
                 $oldCostText = if ($null -eq $details.old_baseline_cost -or [string]$details.old_baseline_cost -eq '') { '未填写' } else { "¥$($details.old_baseline_cost)" }
-                $lines.Add("SKU成本主表第$($details.row)行：$($details.goods_code) 销售单位成本 $oldCostText → ¥$($details.new_unit_cost)；移动平均成本现为 ¥$($details.new_moving_average_cost)")
+                $historyText = if ($details.historical_order_no) { "；已按明确要求更新订单 $($details.historical_order_no) 并刷新所属月份" } else { '；未修改历史订单或经营简账' }
+                $lines.Add("SKU成本主表第$($details.row)行：$($details.goods_code) 销售单位成本 $oldCostText → ¥$($details.new_unit_cost)；当前成本现为 ¥$($details.new_moving_average_cost)$historyText")
             }
             'SetRefundDisposition' {
                 $dispositionText = switch ([string]$details.new_disposition) { 'returned_restocked' {'已退回并恢复库存，已撤销货物成本'} 'refund_no_return' {'未退货，已保留货物成本'} 'returned_damaged' {'退回报损，已保留货物成本'} default {[string]$details.new_disposition} }
@@ -1145,10 +1230,11 @@ function Format-ConfirmationPreview([string]$ChangeId, $Operations, [string]$Fal
             'Replenishment' {
                 $lines.Add("补货：$($details.goods_code)｜日期：$($args.date)｜$($details.package_quantity)个采购包装｜采购 ¥$($details.purchase_amount)")
                 if ($details.production_date) { $lines.Add("批次：生产 $($details.production_date)｜到期 $($details.expiry_date)") }
+                $afterCostText = if ($null -eq $details.after_average_cost -or [string]$details.after_average_cost -eq '') { '仍待核对' } else { "¥$([math]::Round([double]$details.after_average_cost,4))" }
+                $lines.Add("SKU当前移动平均成本：$afterCostText；不会重算历史订单、收入、利润或经营简账。")
                 if ($details.sku_status -eq 'will_create_pending_profile') { $lines.Add('SKU主表尚无该货号；确认后会先建立待平台同步档案。') }
                 if ($details.sku_status -eq 'will_attach_kw_by_csx') { $lines.Add("已通过 $($details.transition_code) 唯一找到 SKU主表第$($details.sku_master_row)行；确认后绑定当前KW为 $($details.goods_code)。") }
                 $null = $impacts.Add('补货记录及SKU成本主表')
-                $null = $impacts.Add('库存批次及现金流')
             }
             'SetSkuBatchDate' {
                 $lines.Add("批次：$($details.goods_code)｜生产 $($details.production_date)｜保质期 $($details.shelf_life)｜到期 $($details.expiry_date)")
@@ -1163,7 +1249,10 @@ function Format-ConfirmationPreview([string]$ChangeId, $Operations, [string]$Fal
                 $oldCostText = if ($null -eq $details.old_baseline_cost -or [string]$details.old_baseline_cost -eq '') { '未填写' } else { "¥$($details.old_baseline_cost)" }
                 $lines.Add("修改：SKU成本主表第$($details.row)行｜$($details.goods_code)$titleText")
                 $lines.Add("成本：$oldCostText → ¥$($details.new_unit_cost)（每个销售单位）")
-                $lines.Add("位置：$($details.range)；当前移动平均成本将按补货记录重新计算。")
+                $lines.Add("位置：$($details.range)；只更新SKU成本主表，不会自动重算历史订单。")
+                if ($details.historical_order_no) {
+                    $lines.Add("明确联动历史订单：$($details.historical_order_no)；只修改该订单中此SKU的成本，并刷新该订单所属月份。")
+                }
                 foreach ($sheet in @($details.affected_tables)) { if ($sheet) { $null = $impacts.Add([string]$sheet) } }
             }
             'SetRefundDisposition' {
@@ -1367,9 +1456,7 @@ function New-ConfirmationDraftFromCodexResult($Event, [string]$EffectiveMessage,
     $script:previewOperations = [Collections.Generic.List[object]]::new()
     try {
         $actions = @($CodexResult.actions | Where-Object { [string]$_.action -notin @('RefreshLedger','SendDailySummary','SyncPlatformData') })
-        for ($index = 0; $index -lt $actions.Count; $index++) {
-            $null = Invoke-CodexAction $actions[$index] $Event $index 'preview'
-        }
+        $null = Invoke-CodexActionsInOrder $actions $Event 'preview'
         $operations = @($script:previewOperations)
         $needsInformation = [bool]$CodexResult.needs_information -or $operations.Count -eq 0
         $fallback = Format-NonExecutableCodexReply ([string]$CodexResult.reply)
@@ -1413,8 +1500,25 @@ function Invoke-StoredConfirmationOperations($Pending, $ExecuteEvent, [int]$Lock
     $transaction = New-FinanceTransaction $stateRoot "飞书确认 $($Pending.change_id)" $transactionId -AcquireLock -WorkbookTokens $tokens -LarkCli $larkCli -LockTimeoutSeconds $LockTimeoutSeconds
     $closed = $false
     try {
-        for ($index = 0; $index -lt $storedOperations.Count; $index++) {
+        $index = 0
+        while ($index -lt $storedOperations.Count) {
             $storedOperation = $storedOperations[$index]
+            if (Test-BatchCompatibleSkuOperation $storedOperation) {
+                $compatibleRun = [Collections.Generic.List[object]]::new()
+                $scanIndex = $index
+                while ($scanIndex -lt $storedOperations.Count -and (Test-BatchCompatibleSkuOperation $storedOperations[$scanIndex])) {
+                    $compatibleRun.Add($storedOperations[$scanIndex])
+                    $scanIndex++
+                }
+                if ($compatibleRun.Count -ge 2) {
+                    foreach ($batchResult in @(Invoke-PetstarBatchSkuMaintenance $compatibleRun.ToArray() $ExecuteEvent $index)) {
+                        if ($null -eq $batchResult) { throw "批量 SKU 动作从第 $index 项开始没有返回完整结果" }
+                        $executedOperations.Add($batchResult)
+                    }
+                    $index = $scanIndex
+                    continue
+                }
+            }
             $storedAction = [pscustomobject]@{
                 action = [string]$storedOperation.action
                 arguments = $storedOperation.arguments
@@ -1422,6 +1526,7 @@ function Invoke-StoredConfirmationOperations($Pending, $ExecuteEvent, [int]$Lock
             $executedOperation = Invoke-CodexAction $storedAction $ExecuteEvent $index 'execute'
             if ($null -eq $executedOperation) { throw "动作 $($storedAction.action) 没有返回执行结果" }
             $executedOperations.Add($executedOperation)
+            $index++
         }
         Complete-FinanceTransaction $transaction
         Close-FinanceTransaction $transaction

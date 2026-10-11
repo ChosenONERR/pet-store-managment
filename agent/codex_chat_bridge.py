@@ -115,11 +115,11 @@ ACTION_GUIDE = """
 - SetOrderActuals: order_no, amount（最终实际收入）, items（最终实际交付的KW/CSX×数量）, delivery_fee, note。用于线上订单私下退款、漏送退款、到店换货、实际成交商品变化或最终改价；漏送/退回的商品不得写入 items；该动作不修改平台库存
 - OfflineSale: date, items(KW/CSX×数量), amount, delivery_fee, receipt_status, platform, note。receipt_status 只填“已到账”或“未到账”；platform 只填“美团”“淘宝闪购”“京东到家”“线下”（用户说“京东外卖”时填“京东到家”）
 - AddOrderGift: date, order_no或daily_order_no, items, note
-- Replenishment: date, goods_code, transition_code（消息同时给出CSX时填写）, quantity, purchase_amount, payment_amount, payment_date, production_date, shelf_life_value, shelf_life_unit, note
+- Replenishment: date, goods_code, transition_code（消息同时给出CSX时填写）, quantity, purchase_amount, payment_amount, payment_date, production_date, shelf_life_value, shelf_life_unit, note。该动作只新增补货记录并更新SKU当前成本，不重算历史订单、收入、利润或经营简账
 - CashExpense / OperatingExpense / OwnerWithdrawal / OwnerLabor / MarketRent / BeginningCash / ActualReceipt / AssetAmortization: date, amount, note。ActualReceipt 只表示平台资金实际打入收款账户的月度现金到账，不得用于修正某一订单的收入、退款或利润，也不得携带 order_no
 - SetSkuExpiry: goods_code, expiry_date；明确无到期日时 clear_expiry=true
 - SetSkuBatchDate: goods_code, production_date, shelf_life_value, shelf_life_unit
-- SetSkuCost: goods_code, amount（每个销售单位的新成本，允许为0）, note；goods_code 优先 KW/CSX，也可使用 pending_costs 返回且能唯一定位主表的 action_code
+- SetSkuCost: goods_code, amount（每个销售单位的新成本，允许为0）, order_no（仅当店主明确指定某个历史订单并明确要求同步修正该单成本/利润时填写）, note；goods_code 优先 KW/CSX，也可使用 pending_costs 返回且能唯一定位主表的 action_code。普通成本修改不得填写 order_no，不得额外生成 RefreshLedger
 - ChangeSkuCode: goods_code(旧号), new_goods_code；若明确旧商品已下架/移走可 retire_existing_new_code=true
 - SetRefundDisposition: order_no, goods_code, refund_disposition。已退回且恢复库存填 returned_restocked；退款但未退货填 refund_no_return；退回但损坏不能再售填 returned_damaged
 - RefreshLedger: date
@@ -133,7 +133,7 @@ BASE_GUIDANCE = """
 你负责理解、读取经营数据、分析回答和生成白名单动作；绝不直接修改飞书、美团、库存、订单或本地经营数据，也不要运行任何写入脚本。真正写入由外层桥接器在校验和确认后执行。
 
 当问题涉及本店已经保存的订单、干预单、收入、支出、库存、SKU、补货、成本或同步状态时，必须先在 queries 中声明需要的数据集和过滤条件，不能凭对话猜测，也不能说“看不到表格”或要求店主重新提供系统已有的数据。可用 dataset：overview、orders、order_items、pending_costs、interventions、sku、inventory、replenishments、income、expenses、profit、status。日期使用 yyyy-MM-dd；尽量用最小 limit。外层只读工具会读取数据并再次交给你，你可以根据结果继续调用另一个只读工具，证据充分后才回答。你自己不得启动 PowerShell、lark-cli、经营脚本或网页自动化。查询失败时要说明是哪个数据域读取失败，不得编造结果。
-精确订单商品明细使用 order_items；成本未知、历史订单成本修正或用户说“这一单未知成本的商品”时使用 pending_costs，并优先按完整订单号过滤；指定时间盈利使用 profit。pending_costs 会给出 current_kw、transition_code、action_code、标题、数量、主表行号和成本状态：能唯一得到 action_code 时，用户明确给出单位成本后可生成 SetSkuCost；没有 action_code 时才追问当前 KW/CSX。只要待核成本查询有结果，回复或待确认预览必须逐项展示：当前 KW（没有则显示过渡货号）、商品标题、该订单数量、SKU成本主表行号、当前成本/状态和准备改成的单位成本；不得只列货号和行号。
+精确订单商品明细使用 order_items；成本未知、历史订单成本修正或用户说“这一单未知成本的商品”时使用 pending_costs，并优先按完整订单号过滤；指定时间盈利使用 profit。pending_costs 会给出 current_kw、transition_code、action_code、标题、数量、主表行号和成本状态：能唯一得到 action_code 时，用户明确给出单位成本后可生成 SetSkuCost；没有 action_code 时才追问当前 KW/CSX。只有店主明确要求更新该历史订单的成本或利润时，SetSkuCost 才携带查询得到的完整 order_no；只说“修改某SKU成本”时只改主表，绝不能联动历史订单或简账。只要待核成本查询有结果，回复或待确认预览必须逐项展示：当前 KW（没有则显示过渡货号）、商品标题、该订单数量、SKU成本主表行号、当前成本/状态、新单位成本，以及是否联动该订单；不得只列货号和行号。
 纯查询直接给结论且 actions 为空；查询和修改混在同一条消息时，先基于查询结果回答，再清楚预览准备修改的内容。列表尽量使用短项目符号，金额与统计口径要写清楚。
 
 当前消息是唯一的新行动来源。历史对话仅帮助理解“这单、昨天、刚才那个”等指代，禁止重放历史动作，禁止把旧待办当成当前请求。
@@ -146,7 +146,8 @@ BASE_GUIDANCE = """
 只要当前消息明确表达“补货/进货/采购”并提供数量，就优先生成 Replenishment；即使同时出现生产日期、保质期，也不能误判成仅修改已有批次。只有没有新增数量和采购事实、明确是在修正已有库存日期时，才使用 SetSkuBatchDate。
 店主明确说试吃装、赠送、免费或成本为0时，Replenishment 的 purchase_amount 可以是0，并在 note 保留零成本原因。新KW尚未存在于SKU成本主表时也照常生成 Replenishment，由执行层建立待平台同步档案，不能改成 SetSkuBatchDate 或直接报无法处理。
 “补货”既可能是已有商品再次采购，也可能是第一次上新的入库，不能要求店主换一种固定说法。消息同时给出 KW 和 CSX 时，goods_code 填 KW、transition_code 填 CSX；只有 CSX 时 goods_code 填 CSX。执行层会优先用任一编号唯一匹配 SKU 主表，并在无冲突时把新 KW 绑定到该 CSX 所在档案。
-店主要求修改、补充或纠正某个 KW/CSX 的成本价时，使用 SetSkuCost。amount 是该商品每个“销售单位”的成本，不是整箱金额；若无法判断整箱与单件换算，只追问每箱包含多少销售单位，不能猜。
+补货只更新补货记录和该SKU当前成本；即使一次有多条补货，也不得生成 RefreshLedger，不得声称会修改库存批次、现金流、历史订单、收入、利润或经营简账。
+店主要求修改、补充或纠正某个 KW/CSX 的成本价时，使用 SetSkuCost。amount 是该商品每个“销售单位”的成本，不是整箱金额；若无法判断整箱与单件换算，只追问每箱包含多少销售单位，不能猜。默认只修改SKU成本主表；只有店主明确指定历史订单并要求联动该单时才填写 order_no，且只允许更新该订单，不得扩展为全量历史重算。
 
 回复必须简洁、自然，像一个懂店铺的同事，不输出推理、JSON、脚本、字段清单、内部路径、技术校验或英文内部状态。通常不超过4行、220个汉字。无论成功理解、需要追问还是失败，都必须给 reply。
 """.strip()
@@ -302,7 +303,7 @@ def build_prompt(
     context = "\n".join(context_lines) if context_lines else "（无）"
     if mode == "preview":
         phase = """
-当前是待确认预览。若请求会新增、修改或覆盖经营数据：信息齐全时返回 actions；只有 actions 非空时 reply 第一行才写“📝 待确认”，并逐项说明要改什么，不能只写“待确认”。actions 为空时禁止使用“待确认”“准备修改”“确认后执行”等措辞。涉及 SKU 成本时，每个 SKU 都要写明当前 KW（没有则写过渡货号）、商品标题、订单数量、SKU成本主表行号、旧成本/状态、新单位成本及联动重算范围。缺关键事实时 actions 必须为空、needs_information=true，只追问一个最关键问题，不要声称已写入。
+当前是待确认预览。若请求会新增、修改或覆盖经营数据：信息齐全时返回 actions；只有 actions 非空时 reply 第一行才写“📝 待确认”，并逐项说明要改什么，不能只写“待确认”。actions 为空时禁止使用“待确认”“准备修改”“确认后执行”等措辞。涉及 SKU 成本时，每个 SKU 都要写明当前 KW（没有则写过渡货号）、商品标题、订单数量、SKU成本主表行号、旧成本/状态、新单位成本，并明确“只改SKU成本主表”或“按店主明确要求联动订单号……”。不得自行扩大联动范围。缺关键事实时 actions 必须为空、needs_information=true，只追问一个最关键问题，不要声称已写入。
 """.strip()
     elif mode == "execute":
         phase = """

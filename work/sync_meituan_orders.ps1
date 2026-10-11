@@ -68,6 +68,42 @@ function Get-CellNumber($Row, [int]$Index) {
     return $null
 }
 
+function Get-OrderItemSnapshotKey([string]$OrderNo, [string]$ProductId, [string]$GoodsCode, [string]$Name, [string]$Spec) {
+    $stableProductId = ([string]$ProductId).Trim().ToLowerInvariant()
+    if ($stableProductId) { return "$OrderNo|sku:$stableProductId" }
+    $normalizedCode = ([string]$GoodsCode).Trim().ToLowerInvariant()
+    $normalizedName = [regex]::Replace(([string]$Name).Trim().ToLowerInvariant(), '\s+', '')
+    $normalizedSpec = [regex]::Replace(([string]$Spec).Trim().ToLowerInvariant(), '\s+', '')
+    return "$OrderNo|legacy:$normalizedCode|$normalizedName|$normalizedSpec"
+}
+
+function Get-OrderItemFallbackKey([string]$OrderNo, [string]$GoodsCode, [string]$Name, [string]$Spec) {
+    $normalizedCode = ([string]$GoodsCode).Trim().ToLowerInvariant()
+    $normalizedName = [regex]::Replace(([string]$Name).Trim().ToLowerInvariant(), '\s+', '')
+    $normalizedSpec = [regex]::Replace(([string]$Spec).Trim().ToLowerInvariant(), '\s+', '')
+    return "$OrderNo|fallback:$normalizedCode|$normalizedName|$normalizedSpec"
+}
+
+function Add-CostSnapshotToQueue($Queues, [string]$Key, $Snapshot) {
+    if (-not $Queues.ContainsKey($Key)) { $Queues[$Key] = [Collections.Queue]::new() }
+    $Queues[$Key].Enqueue($Snapshot)
+}
+
+function Take-CostSnapshotFromQueue($Queues, [string[]]$Keys) {
+    foreach ($key in $Keys) {
+        if (-not $key -or -not $Queues.ContainsKey($key)) { continue }
+        $queue = $Queues[$key]
+        while ($queue.Count -gt 0) {
+            $candidate = $queue.Dequeue()
+            if (-not $candidate.Consumed) {
+                $candidate.Consumed = $true
+                return $candidate
+            }
+        }
+    }
+    return $null
+}
+
 function Invoke-LarkJson([scriptblock]$Command, [string]$Label, [int]$MaxAttempts = 3) {
     $errors = [Collections.Generic.List[string]]::new()
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
@@ -115,6 +151,98 @@ function New-ValueCell($Value) {
 function New-NumberCell($Value) {
     if ($null -eq $Value -or "$Value" -eq '') { return @{ value = 0 } }
     return @{ value = $Value }
+}
+
+function New-NullableNumberCell($Value) {
+    if ($null -eq $Value -or "$Value" -eq '') { return @{ value = '' } }
+    return @{ value = $Value }
+}
+
+function Convert-ToComparableText($Value) {
+    if ($null -eq $Value) { return '' }
+    return [string]$Value
+}
+
+function Convert-ToComparableNumber($Value, [bool]$NullAsZero = $true) {
+    if ($null -eq $Value -or [string]$Value -eq '') {
+        if ($NullAsZero) { return '0' }
+        return ''
+    }
+    $number = 0.0
+    if (-not [double]::TryParse([string]$Value, [Globalization.NumberStyles]::Any, [Globalization.CultureInfo]::InvariantCulture, [ref]$number)) {
+        throw "无法比较非数值单元格：$Value"
+    }
+    return $number.ToString('R', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Convert-ToComparableDate($Value) {
+    if ($null -eq $Value -or [string]$Value -eq '') { return '' }
+    $serial = Convert-DateDisplayToSerial $Value
+    return Convert-ToComparableNumber $serial $false
+}
+
+function Get-RecordsFingerprint($Records) {
+    $lines = @($Records | ForEach-Object { ConvertTo-Json -InputObject $_ -Depth 6 -Compress } | Sort-Object)
+    $payload = $lines -join "`n"
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($payload))) -replace '-', '').ToLowerInvariant()
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function New-SummaryBusinessRecord($Record) {
+    return [ordered]@{
+        order_date = Convert-ToComparableDate $Record.OrderDate
+        platform = Convert-ToComparableText $Record.Platform
+        order_no = Convert-ToComparableText $Record.OrderNo
+        status = Convert-ToComparableText $Record.Status
+        product_sales = Convert-ToComparableNumber $Record.ProductSales
+        customer_pay = Convert-ToComparableNumber $Record.CustomerPay
+        expected_income = Convert-ToComparableNumber $Record.ExpectedIncome
+        platform_fees = Convert-ToComparableNumber $Record.PlatformFees
+        delivery_fee = Convert-ToComparableNumber $Record.DeliveryFee
+        item_count = Convert-ToComparableNumber $Record.ItemCount
+        source = Convert-ToComparableText $Record.Source
+        note = Convert-ToComparableText $Record.Note
+        daily_order_no = Convert-ToComparableText $Record.DailyOrderNo
+    }
+}
+
+function New-ItemBusinessRecord($Record) {
+    return [ordered]@{
+        order_date = Convert-ToComparableDate $Record.OrderDate
+        platform = Convert-ToComparableText $Record.Platform
+        order_no = Convert-ToComparableText $Record.OrderNo
+        status = Convert-ToComparableText $Record.Status
+        goods_code = Convert-ToComparableText $Record.GoodsCode
+        name = Convert-ToComparableText $Record.Name
+        spec = Convert-ToComparableText $Record.Spec
+        quantity = Convert-ToComparableNumber $Record.Quantity
+        unit_price = Convert-ToComparableNumber $Record.UnitPrice
+        unit_cost = Convert-ToComparableNumber $Record.UnitCost $false
+        item_cost = Convert-ToComparableNumber $Record.ItemCost $false
+        margin = Convert-ToComparableNumber $Record.Margin $false
+        product_id = Convert-ToComparableText $Record.ProductId
+    }
+}
+
+function New-InterventionBusinessRecord($Record) {
+    return [ordered]@{
+        date_time = Convert-ToComparableDate $Record.DateTime
+        daily_order_no = Convert-ToComparableText $Record.DailyOrderNo
+        person = Convert-ToComparableText $Record.Person
+        order_no = Convert-ToComparableText $Record.OrderNo
+        amount = Convert-ToComparableNumber $Record.Amount
+        delivery_type = Convert-ToComparableText $Record.DeliveryType
+        platform_fee = Convert-ToComparableNumber $Record.PlatformFee
+        delivery_fee = Convert-ToComparableNumber $Record.DeliveryFee
+        restore_state = Convert-ToComparableText $Record.RestoreState
+        reviewed = Convert-ToComparableText $Record.Reviewed
+        contents = Convert-ToComparableText $Record.Contents
+        note = Convert-ToComparableText $Record.Note
+    }
 }
 
 function Convert-DateDisplayToSerial($Value) {
@@ -290,13 +418,14 @@ function Format-InterventionContents($Items) {
 
 $existingSummaryRows = Get-SheetRows '订单汇总' 'A2:Q2001'
 $summaryById = [ordered]@{}
+$existingSummaryBusinessRecords = [Collections.Generic.List[object]]::new()
 $existingSummaryLastRow = 1
 for ($rowIndex = 0; $rowIndex -lt $existingSummaryRows.Count; $rowIndex++) {
     $row = $existingSummaryRows[$rowIndex]
     $orderNo = Get-CellValue $row 2
     if (-not $orderNo) { continue }
     $existingSummaryLastRow = $rowIndex + 2
-    $summaryById[$orderNo] = [pscustomobject]@{
+    $existingSummaryRecord = [pscustomobject]@{
         OrderDate = Get-CellValue $row 0
         Platform = Get-CellValue $row 1
         OrderNo = $orderNo
@@ -313,6 +442,8 @@ for ($rowIndex = 0; $rowIndex -lt $existingSummaryRows.Count; $rowIndex++) {
         DailyOrderNo = Get-CellValue $row 16
         SortKey = "$(Get-CellValue $row 0)|$orderNo"
     }
+    $summaryById[$orderNo] = $existingSummaryRecord
+    $existingSummaryBusinessRecords.Add((New-SummaryBusinessRecord $existingSummaryRecord))
 }
 
 # 退款信息来自美团订单卡片里的独立售后区。先以售后记录号持久化，后续每次同步都按绝对值重建，
@@ -399,6 +530,7 @@ foreach ($order in @($extract.orders)) {
 
 $summaryRecords = @($summaryById.Values | Sort-Object SortKey)
 if ($summaryRecords.Count -gt 2000) { throw '订单汇总超过2000行容量' }
+$desiredSummaryBusinessRecords = @($summaryRecords | ForEach-Object { New-SummaryBusinessRecord $_ })
 $summaryAD = @(); $summaryFJ = @(); $summaryMP = @(); $summaryQ = @()
 foreach ($record in $summaryRecords) {
     $dateValue = Convert-DateDisplayToSerial $record.OrderDate
@@ -409,36 +541,46 @@ foreach ($record in $summaryRecords) {
     $summaryQ += ,@((New-ValueCell $record.DailyOrderNo))
 }
 $summaryLastRow = $summaryRecords.Count + 1
-Set-CellMatrix '订单汇总' "A2:D$summaryLastRow" $summaryAD
-Set-CellMatrix '订单汇总' "F2:J$summaryLastRow" $summaryFJ
-Set-CellMatrix '订单汇总' "M2:P$summaryLastRow" $summaryMP
-Set-CellMatrix '订单汇总' "Q2:Q$summaryLastRow" $summaryQ
-if ($existingSummaryLastRow -gt $summaryLastRow) {
-    $tailStart = $summaryLastRow + 1
-    Clear-CellRange '订单汇总' "A${tailStart}:D$existingSummaryLastRow"
-    Clear-CellRange '订单汇总' "F${tailStart}:J$existingSummaryLastRow"
-    Clear-CellRange '订单汇总' "M${tailStart}:Q$existingSummaryLastRow"
-}
 
 $extractedIds = [Collections.Generic.HashSet[string]]::new([string[]]$extractedOrderNos)
 $existingItemRows = Get-SheetRows '订单商品' 'A2:Q4001'
 $itemRecords = @()
+$existingItemBusinessRecords = [Collections.Generic.List[object]]::new()
 $existingSequence = @{}
+$existingCostSnapshots = @{}
 $existingItemsLastRow = 1
 for ($rowIndex = 0; $rowIndex -lt $existingItemRows.Count; $rowIndex++) {
     $row = $existingItemRows[$rowIndex]
     $orderNo = Get-CellValue $row 2
     if (-not $orderNo) { continue }
     $existingItemsLastRow = $rowIndex + 2
+    $snapshotKey = Get-OrderItemSnapshotKey $orderNo (Get-CellValue $row 16) (Get-CellValue $row 5) (Get-CellValue $row 6) (Get-CellValue $row 7)
+    $fallbackSnapshotKey = Get-OrderItemFallbackKey $orderNo (Get-CellValue $row 5) (Get-CellValue $row 6) (Get-CellValue $row 7)
+    $costSnapshot = [pscustomobject]@{
+        UnitCost = Get-CellNumber $row 11
+        ItemCost = Get-CellNumber $row 12
+        Margin = Get-CellNumber $row 13
+        Consumed = $false
+    }
+    Add-CostSnapshotToQueue $existingCostSnapshots $snapshotKey $costSnapshot
+    if ($fallbackSnapshotKey -ne $snapshotKey) { Add-CostSnapshotToQueue $existingCostSnapshots $fallbackSnapshotKey $costSnapshot }
+    $existingItemBusinessRecords.Add((New-ItemBusinessRecord ([pscustomobject]@{
+        OrderDate=Get-CellValue $row 0;Platform=Get-CellValue $row 1;OrderNo=$orderNo;Status=Get-CellValue $row 3
+        GoodsCode=Get-CellValue $row 5;Name=Get-CellValue $row 6;Spec=Get-CellValue $row 7;Quantity=Get-CellNumber $row 8
+        UnitPrice=Get-CellNumber $row 9;UnitCost=Get-CellNumber $row 11;ItemCost=Get-CellNumber $row 12;Margin=Get-CellNumber $row 13
+        ProductId=Get-CellValue $row 16
+    })))
     if ($extractedIds.Contains($orderNo)) { continue }
     if (-not $existingSequence.ContainsKey($orderNo)) { $existingSequence[$orderNo] = 0 }
     $existingSequence[$orderNo]++
     $itemRecords += [pscustomobject]@{
         OrderDate = Get-CellValue $row 0; Platform = Get-CellValue $row 1; OrderNo = $orderNo; Status = Get-CellValue $row 3
         GoodsCode = Get-CellValue $row 5; Name = Get-CellValue $row 6; Spec = Get-CellValue $row 7; Quantity = Get-CellNumber $row 8
-        UnitPrice = Get-CellNumber $row 9; SyncTime = Get-CellValue $row 14; ProductId = Get-CellValue $row 16; SortKey = "$(Get-CellValue $row 0)|$orderNo|$($existingSequence[$orderNo])"
+        UnitPrice = Get-CellNumber $row 9; UnitCost = Get-CellNumber $row 11; ItemCost = Get-CellNumber $row 12; Margin = Get-CellNumber $row 13
+        SyncTime = Get-CellValue $row 14; ProductId = Get-CellValue $row 16; SortKey = "$(Get-CellValue $row 0)|$orderNo|$($existingSequence[$orderNo])"
     }
 }
+$newItemOrderNumbers = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($order in @($extract.orders)) {
     $actualOverride = if ($orderActualByOrderNo.ContainsKey([string]$order.orderNo)) { $orderActualByOrderNo[[string]$order.orderNo] } else { $null }
     $effectiveItems = if ($null -ne $actualOverride) { @($actualOverride.items) } else { @($order.items) }
@@ -447,6 +589,15 @@ foreach ($order in @($extract.orders)) {
     foreach ($entry in $refundAccounting.returned_quantity_by_code.GetEnumerator()) { $remainingReturned[[string]$entry.Key] = [double]$entry.Value }
     foreach ($item in $effectiveItems) {
         $normalizedCode = $(if ($null -ne $actualOverride) { ([string]$item.goods_code).Trim().ToLowerInvariant() } else { ([string]$item.goodsCode).Trim().ToLowerInvariant() })
+        $itemName = $(if ($null -ne $actualOverride) { [string]$item.title } else { [string]$item.name })
+        $itemSpec = [string]$item.spec
+        $itemProductId = $(if ($null -ne $actualOverride) { [string]$item.product_id } else { Resolve-ProductId ([string]$item.goodsCode) ([string]$item.name) ([string]$item.spec) })
+        $snapshotKey = Get-OrderItemSnapshotKey ([string]$order.orderNo) $itemProductId $normalizedCode $itemName $itemSpec
+        $fallbackSnapshotKey = Get-OrderItemFallbackKey ([string]$order.orderNo) $normalizedCode $itemName $itemSpec
+        $priorSnapshot = Take-CostSnapshotFromQueue $existingCostSnapshots @($snapshotKey,$fallbackSnapshotKey)
+        if ($null -eq $priorSnapshot) {
+            $null = $newItemOrderNumbers.Add([string]$order.orderNo)
+        }
         $itemStatus = if ($null -ne $actualOverride) { '已完成（实际履约已调整）' } else { [string]$order.status }
         if ($null -eq $actualOverride -and $remainingReturned.ContainsKey($normalizedCode) -and [double]$remainingReturned[$normalizedCode] -gt 0) {
             $returnedQuantity = [math]::Min([double]$item.quantity, [double]$remainingReturned[$normalizedCode])
@@ -457,46 +608,44 @@ foreach ($order in @($extract.orders)) {
         }
         $itemRecords += [pscustomobject]@{
             OrderDate = [string]$order.orderDate; Platform = '美团'; OrderNo = [string]$order.orderNo; Status = $itemStatus
-            GoodsCode = $(if ($null -ne $actualOverride) { [string]$item.goods_code } else { [string]$item.goodsCode }); Name = $(if ($null -ne $actualOverride) { [string]$item.title } else { [string]$item.name }); Spec = [string]$item.spec; Quantity = $item.quantity
-            UnitPrice = $(if ($null -ne $actualOverride) { [double]$item.unit_price } else { $item.unitPrice }); SyncTime = $syncTime; ProductId = $(if ($null -ne $actualOverride) { [string]$item.product_id } else { Resolve-ProductId ([string]$item.goodsCode) ([string]$item.name) ([string]$item.spec) }); SortKey = "$($order.orderDate) $($order.orderTime)|$($order.orderNo)|$(if ($null -ne $actualOverride) {$item.line_index} else {$item.lineIndex})"
+            GoodsCode = $(if ($null -ne $actualOverride) { [string]$item.goods_code } else { [string]$item.goodsCode }); Name = $itemName; Spec = $itemSpec; Quantity = $item.quantity
+            UnitPrice = $(if ($null -ne $actualOverride) { [double]$item.unit_price } else { $item.unitPrice })
+            UnitCost = $(if ($null -ne $priorSnapshot) { $priorSnapshot.UnitCost } else { $null })
+            ItemCost = $(if ($null -ne $priorSnapshot) { $priorSnapshot.ItemCost } else { $null })
+            Margin = $(if ($null -ne $priorSnapshot) { $priorSnapshot.Margin } else { $null })
+            SyncTime = $syncTime; ProductId = $itemProductId; SortKey = "$($order.orderDate) $($order.orderTime)|$($order.orderNo)|$(if ($null -ne $actualOverride) {$item.line_index} else {$item.lineIndex})"
         }
     }
 }
 $itemRecords = @($itemRecords | Sort-Object SortKey)
 if ($itemRecords.Count -gt 4000) { throw '订单商品超过4000行容量' }
-$itemsAD = @(); $itemsFJ = @(); $itemsO = @(); $itemsQ = @()
+$desiredItemBusinessRecords = @($itemRecords | ForEach-Object { New-ItemBusinessRecord $_ })
+$itemsAD = @(); $itemsFJ = @(); $itemsLN = @(); $itemsO = @(); $itemsQ = @()
 foreach ($item in $itemRecords) {
     $itemsAD += ,@((New-ValueCell (Convert-DateDisplayToSerial $item.OrderDate)),(New-ValueCell $item.Platform),(New-ValueCell $item.OrderNo),(New-ValueCell $item.Status))
     $itemsFJ += ,@((New-ValueCell $item.GoodsCode),(New-ValueCell $item.Name),(New-ValueCell $item.Spec),(New-NumberCell $item.Quantity),(New-NumberCell $item.UnitPrice))
+    $itemsLN += ,@((New-NullableNumberCell $item.UnitCost),(New-NullableNumberCell $item.ItemCost),(New-NullableNumberCell $item.Margin))
     $itemSync = if ([string]$item.SyncTime -eq $syncTime) { $syncSerial } else { Convert-DateDisplayToSerial $item.SyncTime }
     $itemsO += ,@((New-ValueCell $itemSync))
     $itemsQ += ,@((New-ValueCell $item.ProductId))
 }
 $itemsLastRow = $itemRecords.Count + 1
-Set-CellMatrix '订单商品' "A2:D$itemsLastRow" $itemsAD
-Set-CellMatrix '订单商品' "F2:J$itemsLastRow" $itemsFJ
-Set-CellMatrix '订单商品' "O2:O$itemsLastRow" $itemsO
-Set-CellMatrix '订单商品' "Q2:Q$itemsLastRow" $itemsQ
-if ($existingItemsLastRow -gt $itemsLastRow) {
-    $tailStart = $itemsLastRow + 1
-    Clear-CellRange '订单商品' "A${tailStart}:D$existingItemsLastRow"
-    Clear-CellRange '订单商品' "F${tailStart}:J$existingItemsLastRow"
-    Clear-CellRange '订单商品' "O${tailStart}:O$existingItemsLastRow"
-    Clear-CellRange '订单商品' "Q${tailStart}:Q$existingItemsLastRow"
-}
 
 $existingInterventionRows = Get-SheetRows '干预订单' 'A2:M1001'
 $interventionRecords = [ordered]@{}
+$existingInterventionBusinessRecords = [Collections.Generic.List[object]]::new()
 foreach ($row in $existingInterventionRows) {
     $id = Get-CellValue $row 3
     if (-not $id) { continue }
-    $interventionRecords[$id] = [ordered]@{
+    $existingInterventionRecord = [pscustomobject][ordered]@{
         DateTime = Get-CellValue $row 0; DailyOrderNo = Get-CellValue $row 1
         Person = Get-CellValue $row 2; OrderNo = $id; Amount = Get-CellNumber $row 4
         DeliveryType = Get-CellValue $row 5; PlatformFee = Get-CellNumber $row 6
         DeliveryFee = Get-CellNumber $row 7; RestoreState = Get-CellValue $row 9
         Reviewed = Get-CellValue $row 10; Contents = Get-CellValue $row 11; Note = Get-CellValue $row 12
     }
+    $interventionRecords[$id] = $existingInterventionRecord
+    $existingInterventionBusinessRecords.Add((New-InterventionBusinessRecord $existingInterventionRecord))
 }
 foreach ($id in $interventionIds) {
     if (-not $interventionRecords.Contains($id)) {
@@ -539,26 +688,60 @@ foreach ($record in $interventionRecords.Values) {
     )
 }
 if ($interventionCells.Count -gt 1000) { throw '干预订单表容量不足' }
-if ($interventionCells.Count -gt 0) {
-    $interventionLastRow = $interventionCells.Count + 1
-    Set-CellMatrix '干预订单' "A2:M$interventionLastRow" $interventionCells
+$desiredInterventionBusinessRecords = @($interventionRecords.Values | ForEach-Object { New-InterventionBusinessRecord $_ })
+$summaryChanged = (Get-RecordsFingerprint $existingSummaryBusinessRecords) -ne (Get-RecordsFingerprint $desiredSummaryBusinessRecords)
+$itemsChanged = (Get-RecordsFingerprint $existingItemBusinessRecords) -ne (Get-RecordsFingerprint $desiredItemBusinessRecords)
+$interventionsChanged = (Get-RecordsFingerprint $existingInterventionBusinessRecords) -ne (Get-RecordsFingerprint $desiredInterventionBusinessRecords)
+$dataChanged = [bool]$Initialize -or $summaryChanged -or $itemsChanged -or $interventionsChanged
+
+if ($dataChanged) {
+    Set-CellMatrix '订单汇总' "A2:D$summaryLastRow" $summaryAD
+    Set-CellMatrix '订单汇总' "F2:J$summaryLastRow" $summaryFJ
+    Set-CellMatrix '订单汇总' "M2:P$summaryLastRow" $summaryMP
+    Set-CellMatrix '订单汇总' "Q2:Q$summaryLastRow" $summaryQ
+    if ($existingSummaryLastRow -gt $summaryLastRow) {
+        $tailStart = $summaryLastRow + 1
+        Clear-CellRange '订单汇总' "A${tailStart}:D$existingSummaryLastRow"
+        Clear-CellRange '订单汇总' "F${tailStart}:J$existingSummaryLastRow"
+        Clear-CellRange '订单汇总' "M${tailStart}:Q$existingSummaryLastRow"
+    }
+
+    Set-CellMatrix '订单商品' "A2:D$itemsLastRow" $itemsAD
+    Set-CellMatrix '订单商品' "F2:J$itemsLastRow" $itemsFJ
+    Set-CellMatrix '订单商品' "L2:N$itemsLastRow" $itemsLN
+    Set-CellMatrix '订单商品' "O2:O$itemsLastRow" $itemsO
+    Set-CellMatrix '订单商品' "Q2:Q$itemsLastRow" $itemsQ
+    if ($existingItemsLastRow -gt $itemsLastRow) {
+        $tailStart = $itemsLastRow + 1
+        Clear-CellRange '订单商品' "A${tailStart}:D$existingItemsLastRow"
+        Clear-CellRange '订单商品' "F${tailStart}:J$existingItemsLastRow"
+        Clear-CellRange '订单商品' "L${tailStart}:N$existingItemsLastRow"
+        Clear-CellRange '订单商品' "O${tailStart}:O$existingItemsLastRow"
+        Clear-CellRange '订单商品' "Q${tailStart}:Q$existingItemsLastRow"
+    }
+
+    if ($interventionCells.Count -gt 0) {
+        $interventionLastRow = $interventionCells.Count + 1
+        Set-CellMatrix '干预订单' "A2:M$interventionLastRow" $interventionCells
+    }
 }
 $interventionCount = @($extract.orders | Where-Object { $interventionSet.Contains([string]$_.orderNo) }).Count
 $naturalCount = $extract.total - $interventionCount
 
-$verifyTargets = @(
+$verifyTargets = if ($dataChanged) { @(
     @{Sheet='干预订单';Range='I2:I1001'},
     @{Sheet='订单汇总';Range='E2:E2001,K2:L2001'},
     @{Sheet='订单商品';Range='E2:E4001,K2:N4001,P2:P4001'},
     @{Sheet='库存快照';Range='M2:M2000'},
     @{Sheet='驾驶舱';Range='C2:C19'}
-)
+) } else { @() }
 foreach ($target in $verifyTargets) {
     $verify = Invoke-LarkJson { lark-cli sheets +formula-verify --as user --spreadsheet-token $spreadsheetToken --sheet-name $target.Sheet --range $target.Range --format json --exit-on-error } "公式校验调用失败：$($target.Sheet)"
     if ($verify.data.status -ne 'success') { throw "公式存在错误：$($target.Sheet)" }
 }
 
 $finalResult = [pscustomobject]@{
+    ok = $true
     start_date = $StartDate
     end_date = $EndDate
     extracted_orders = $extract.total
@@ -571,6 +754,10 @@ $finalResult = [pscustomobject]@{
     completed_refunds = @($refundMerge.state.events | Where-Object { [string]$_.order_date -ge $StartDate -and [string]$_.order_date -le $EndDate }).Count
     newly_detected_refunds = @($refundMerge.newly_detected).Count
     pending_refund_items = @($refundMerge.state.events | ForEach-Object { @($_.items) } | Where-Object { $_.disposition -eq 'pending' }).Count
+    data_changed = [bool]$dataChanged
+    writes_skipped = -not [bool]$dataChanged
+    change_details = [ordered]@{summary=[bool]$summaryChanged;items=[bool]$itemsChanged;interventions=[bool]$interventionsChanged;initialize_forced=[bool]$Initialize}
+    new_item_order_nos = @($newItemOrderNumbers | Sort-Object)
     refund_orders = @($extract.orders | Where-Object { @($_.refunds).Count -gt 0 } | ForEach-Object { [string]$_.orderNo })
     pending_refund_details = @($refundMerge.state.events | Where-Object { [string]$_.order_no -in $extractedOrderNos } | ForEach-Object {
         $event = $_

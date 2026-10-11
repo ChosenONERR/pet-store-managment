@@ -1,5 +1,6 @@
 ﻿param(
-    [string]$ProjectRoot
+    [string]$ProjectRoot,
+    [string[]]$EligibleOrderNumbers = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,6 +17,10 @@ $larkCli = Join-Path $PSScriptRoot 'lark_cli_noexit.ps1'
 . (Join-Path $PSScriptRoot 'intervention_record.ps1')
 . (Join-Path $PSScriptRoot 'refund_adjustments.ps1')
 $skuSchema = Get-SkuMasterSchema -SpreadsheetToken $token
+$eligibleOrderSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($eligibleOrderNo in @($EligibleOrderNumbers)) {
+    if ($eligibleOrderNo) { $null = $eligibleOrderSet.Add(([string]$eligibleOrderNo).Trim()) }
+}
 $stateRoot = Join-Path $ProjectRoot 'agent\state'
 $script:financeTransaction = Join-FinanceTransaction $stateRoot
 $script:financeTransactionOwner = $false
@@ -365,9 +370,12 @@ foreach ($event in $events) {
         $purchase.after_avg = $afterAvg
     } elseif ($event.kind -eq 'sale') {
         $item = $event.payload
-        $item.unit_cost = $state.avg
-        if ($null -ne $state.avg) {
-            $item.item_cost = [double]$state.avg * [double]$item.effective_quantity
+        $snapshotUnitCost = if ($null -ne $item.previous_unit_cost) { [double]$item.previous_unit_cost } elseif ($eligibleOrderSet.Contains([string]$item.order_no)) { $state.avg } else { $null }
+        $item.unit_cost = $snapshotUnitCost
+        if ($null -ne $snapshotUnitCost) {
+            # 已落账订单冻结成交时单位成本；退款或实际履约变化只按原单位成本调整有效数量。
+            # 只有调用方明确标记的本次新增订单，才允许从事件流初始化成本快照。
+            $item.item_cost = [double]$snapshotUnitCost * [double]$item.effective_quantity
             $effectiveSalesAmount = if ([double]$item.quantity -le 0) { 0.0 } else { [double]$item.sales_amount * ([double]$item.effective_quantity / [double]$item.quantity) }
             $item.margin = $effectiveSalesAmount - [double]$item.item_cost
         }
@@ -445,7 +453,7 @@ foreach ($item in $itemOutputs) {
         continue
     }
     if ($null -ne $item.unit_cost) { continue }
-    if ($item.canonical) {
+    if ($item.canonical -and $eligibleOrderSet.Contains([string]$item.order_no)) {
         $state = $states[$item.canonical]
         if ($null -ne $item.date -and $item.date.Date -lt $state.baseline_date) {
             $effectiveHistoricalCost = $state.baseline_cost
@@ -462,7 +470,7 @@ foreach ($item in $itemOutputs) {
         }
     }
     if ($null -eq $item.unit_cost) {
-        if (-not $item.canonical -and $null -ne $item.previous_unit_cost -and $null -ne $item.previous_item_cost) {
+        if ($null -ne $item.previous_unit_cost -and $null -ne $item.previous_item_cost) {
             # 无法确定稳定商品身份时，冻结既有订单快照，绝不因当前 KW 被复用而改写历史成本。
             $item.unit_cost = [double]$item.previous_unit_cost
             $item.item_cost = [double]$item.previous_item_cost
@@ -563,6 +571,7 @@ $finalResult = [ordered]@{
     cost_arithmetic_errors=$costArithmeticErrors.Count
     returned_refund_items=@($itemOutputs | Where-Object { $_.returned_quantity -gt 0 }).Count
     returned_refund_quantity=[math]::Round((@($itemOutputs | Measure-Object -Property returned_quantity -Sum).Sum),2)
+    eligible_order_numbers=@($eligibleOrderSet | Sort-Object)
     summary_orders=$summaryCount
     gift_rows=$giftEvents.Count
     gift_inventory_deductions=@($giftEvents | Where-Object { $_.canonical }).Count

@@ -51,6 +51,27 @@ function Convert-ToNullableNumber($Value) {
 }
 function New-ValueCell($Value) { if ($null -eq $Value -or [string]$Value -eq '') { return @{value=''} }; return @{value=$Value} }
 function Normalize-Code([string]$Value) { if (-not $Value) { return $null }; return $Value.Trim().ToLowerInvariant() }
+function Test-ActivePlatformStatus([string]$Value) {
+    if (-not $Value) { return $false }
+    return $Value -match '售卖|在售|上架' -and $Value -notmatch '下架|停售|停用'
+}
+function Test-RetiredPlatformStatus([string]$Value) {
+    if (-not $Value) { return $false }
+    return $Value -match '下架|停售|停用'
+}
+function Remove-KwConflictNote([string]$Value) {
+    if (-not $Value) { return $null }
+    $parts = @($Value -split '；' | Where-Object { $_ -and $_ -notmatch '^当前KW .+同时对应 \d+ 个美团SKU ID' })
+    if ($parts.Count -eq 0) { return $null }
+    return ($parts -join '；')
+}
+function Add-UniqueNote([string]$Existing, [string]$Addition) {
+    $parts = @($Existing -split '；' | Where-Object { $_ })
+    foreach ($additionPart in @($Addition -split '；' | Where-Object { $_ })) {
+        if ($additionPart -notin $parts) { $parts += $additionPart }
+    }
+    return (@($parts | Select-Object -Unique) -join '；')
+}
 function Get-TransitionCodes([string]$Value) {
     if (-not $Value) { return @() }
     return @([regex]::Split($Value, '[/,，、;；\s]+') | Where-Object { $_ -and $_ -notmatch '^(?i)kw\d+$' } | ForEach-Object { $_.Trim().ToLowerInvariant() } | Select-Object -Unique)
@@ -167,6 +188,36 @@ foreach ($row in $inventoryRows) {
     $newRows.Add($newRow)
 }
 
+# 平台可能为同一商品保留“单件、10件、20件”等多个 SKU ID，并给它们返回同一个货号。
+# 当且仅当其中恰好一个 SKU 仍在售、其余全部已下架时，当前 KW 只归属于在售 SKU；
+# 已下架行保留商品 ID、标题和历史资料，但不再占用当前 KW。多条在售时仍保留冲突并要求人工核对。
+$autoResolvedKwConflicts = [Collections.Generic.List[object]]::new()
+$updatesByKw = @{}
+foreach ($update in $updates) {
+    $normalizedKw = Normalize-Code ([string]$update.kw)
+    if (-not $normalizedKw) { continue }
+    if (-not $updatesByKw.ContainsKey($normalizedKw)) { $updatesByKw[$normalizedKw] = [Collections.Generic.List[object]]::new() }
+    $updatesByKw[$normalizedKw].Add($update)
+}
+foreach ($kw in $updatesByKw.Keys) {
+    $group = @($updatesByKw[$kw])
+    $owners = @($group | ForEach-Object { [string]$_.sku_id } | Select-Object -Unique)
+    if ($owners.Count -le 1) { continue }
+    $active = @($group | Where-Object { Test-ActivePlatformStatus ([string]$_.status) })
+    $retired = @($group | Where-Object { Test-RetiredPlatformStatus ([string]$_.status) })
+    if ($active.Count -ne 1 -or $retired.Count -ne ($group.Count - 1)) { continue }
+    foreach ($retiredUpdate in $retired) {
+        $autoResolvedKwConflicts.Add([pscustomobject]@{
+            kw=$kw
+            active_row=[int]$active[0].row
+            active_sku_id=[string]$active[0].sku_id
+            retired_row=[int]$retiredUpdate.row
+            retired_sku_id=[string]$retiredUpdate.sku_id
+        })
+        $retiredUpdate.kw = $null
+    }
+}
+
 $kwOwner = @{}
 foreach ($update in $updates) { if ($update.kw) { $kwOwner[$update.kw] = [string]$update.sku_id } }
 $clearKwRows = [Collections.Generic.HashSet[int]]::new()
@@ -206,6 +257,27 @@ if ($lastUsedRow -ge 2) {
     Set-CellMatrix "$($skuSchema.ProductId.Column)2:$($skuSchema.ProductId.Column)${lastUsedRow}" $productIdRows.ToArray()
     Set-CellMatrix "$($skuSchema.PlatformStatus.Column)2:$($skuSchema.PlatformStatus.Column)${lastUsedRow}" $platformStatusRows.ToArray()
     Set-CellMatrix "$($skuSchema.CurrentSpec.Column)2:$($skuSchema.CurrentSpec.Column)${lastUsedRow}" $currentSpecRows.ToArray()
+}
+
+foreach ($resolution in $autoResolvedKwConflicts) {
+    $retiredEntry = $masterByRow[[int]$resolution.retired_row]
+    $retiredOldNote = if ($retiredEntry) { Get-CellValue $retiredEntry.cells $skuSchema.Note.Index } else { $null }
+    $retiredNote = Add-UniqueNote (Remove-KwConflictNote $retiredOldNote) "商品已下架；当前KW $($resolution.kw) 自动保留给唯一在售SKU $($resolution.active_sku_id)"
+    Set-CellMatrix "$($skuSchema.CostStatus.Column)$($resolution.retired_row):$($skuSchema.CostStatus.Column)$($resolution.retired_row)" @((New-ValueCell '已下架/未分配KW'))
+    Set-CellMatrix "$($skuSchema.Note.Column)$($resolution.retired_row):$($skuSchema.Note.Column)$($resolution.retired_row)" @((New-ValueCell $retiredNote))
+
+    $activeEntry = $masterByRow[[int]$resolution.active_row]
+    if ($activeEntry) {
+        $activeOldStatus = Get-CellValue $activeEntry.cells $skuSchema.CostStatus.Index
+        if ($activeOldStatus -match '^当前KW冲突待核对') {
+            $baselineCost = Convert-ToNullableNumber (Get-CellValue $activeEntry.cells $skuSchema.BaselineUnitCost.Index)
+            $resolvedStatus = if ($null -ne $baselineCost) { '用户确认' } else { '缺少成本' }
+            Set-CellMatrix "$($skuSchema.CostStatus.Column)$($resolution.active_row):$($skuSchema.CostStatus.Column)$($resolution.active_row)" @((New-ValueCell $resolvedStatus))
+        }
+        $activeOldNote = Get-CellValue $activeEntry.cells $skuSchema.Note.Index
+        $activeNote = Add-UniqueNote (Remove-KwConflictNote $activeOldNote) "当前KW $($resolution.kw) 自动保留给唯一在售SKU $($resolution.active_sku_id)"
+        Set-CellMatrix "$($skuSchema.Note.Column)$($resolution.active_row):$($skuSchema.Note.Column)$($resolution.active_row)" @((New-ValueCell $activeNote))
+    }
 }
 
 $appendStart = $lastUsedRow + 1
@@ -252,7 +324,9 @@ foreach ($kw in $kwAssignments.Keys) {
 $finalResult = [ordered]@{
     ok=$true;snapshot_date=$SnapshotDate.ToString('yyyy-MM-dd');new_kw_count=$newRows.Count;mapped_existing_count=$updates.Count
     new_kw_codes=@($newRows | ForEach-Object {[string]$_[0].value});mapped_kw_codes=@($updates | ForEach-Object {[string]$_.kw})
-    stable_product_ids=$seenSkuIds.Count;kw_conflict_count=$conflictCodes.Count;kw_conflict_codes=@($conflictCodes);formula_verification='success'
+    stable_product_ids=$seenSkuIds.Count;auto_resolved_retired_kw_count=$autoResolvedKwConflicts.Count
+    auto_resolved_retired_kw_codes=@($autoResolvedKwConflicts | ForEach-Object { $_.kw } | Select-Object -Unique)
+    kw_conflict_count=$conflictCodes.Count;kw_conflict_codes=@($conflictCodes);formula_verification='success'
 }
 Close-SkuSyncTransaction $true
 $finalResult | ConvertTo-Json -Depth 6 -Compress

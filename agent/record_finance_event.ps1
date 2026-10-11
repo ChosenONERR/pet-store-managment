@@ -1,6 +1,6 @@
 ﻿param(
     [Parameter(Mandatory=$true)]
-    [ValidateSet('AddIntervention','RemoveIntervention','RestoreInventory','ConfirmSelfDelivery','SetExternalDeliveryFee','SetOrderDeliveryFee','SetOrderActuals','OfflineSale','AddOrderGift','Replenishment','CashExpense','OperatingExpense','OwnerWithdrawal','OwnerLabor','MarketRent','BeginningCash','ActualReceipt','AssetAmortization','SetSkuExpiry','SetSkuBatchDate','SetSkuCost','ChangeSkuCode','SetRefundDisposition')]
+    [ValidateSet('AddIntervention','RemoveIntervention','RestoreInventory','ConfirmSelfDelivery','SetExternalDeliveryFee','SetOrderDeliveryFee','SetOrderActuals','OfflineSale','AddOrderGift','Replenishment','BatchSkuMaintenance','CashExpense','OperatingExpense','OwnerWithdrawal','OwnerLabor','MarketRent','BeginningCash','ActualReceipt','AssetAmortization','SetSkuExpiry','SetSkuBatchDate','SetSkuCost','ChangeSkuCode','SetRefundDisposition')]
     [string]$Action,
     [datetime]$Date = [datetime]::Today,
     [string]$OrderNo,
@@ -30,6 +30,8 @@
     [ValidateSet('美团','淘宝闪购','京东到家','线下')][string]$Platform = '美团',
     [string]$Note,
     [string]$EventId,
+    [string]$OperationsJson,
+    [string]$OperationsPath,
     [switch]$DryRun,
     [string]$ProjectRoot
 )
@@ -155,6 +157,10 @@ function Convert-ToNumber($Value) {
     if (-not [double]::TryParse(([string]$Value).Replace(',',''), [Globalization.NumberStyles]::Any, [Globalization.CultureInfo]::InvariantCulture, [ref]$number)) { throw "金额不是有效数字：$Value" }
     return $number
 }
+function Convert-ToNullableNumber($Value) {
+    if ($null -eq $Value -or [string]$Value -eq '') { return $null }
+    return Convert-ToNumber $Value
+}
 function Convert-ToDateValue($Value) {
     if ($null -eq $Value -or [string]$Value -eq '') { return $null }
     $parsed = [datetime]::MinValue
@@ -199,7 +205,7 @@ function Get-SingleSheetRow([string]$SheetName, [string]$Range) {
     if ($null -eq $matrix -or @($matrix).Count -eq 0) { return $null }
     return @($matrix)[0]
 }
-function Get-SkuCostReadback([int]$RowNumber, [double]$ExpectedCost, [string]$ExpectedStatus, [int]$MaxAttempts = 12) {
+function Get-SkuCostReadback([int]$RowNumber, [double]$ExpectedCost, [string]$ExpectedStatus, [Nullable[double]]$ExpectedMovingCost = $null, [int]$MaxAttempts = 12) {
     $lastResult = $null
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         # 不经过 Get-SheetRows：PowerShell 会把“仅一行”的二维数组展开成单元格列表，
@@ -219,7 +225,8 @@ function Get-SkuCostReadback([int]$RowNumber, [double]$ExpectedCost, [string]$Ex
             status = $actualStatus
             attempt = $attempt
         }
-        if ([math]::Abs($actualBaseline - $ExpectedCost) -le 0.0001 -and $actualStatus -eq $ExpectedStatus) {
+        $movingMatches = $null -eq $ExpectedMovingCost -or [math]::Abs($actualMoving - [double]$ExpectedMovingCost) -le 0.0001
+        if ([math]::Abs($actualBaseline - $ExpectedCost) -le 0.0001 -and $movingMatches -and $actualStatus -eq $ExpectedStatus) {
             return $lastResult
         }
         if ($attempt -lt $MaxAttempts) { Start-Sleep -Milliseconds 1000 }
@@ -750,13 +757,232 @@ function Invoke-OperatingExpenseWrite([datetime]$TargetDate, [double]$TargetAmou
     }
 }
 
+function Get-BatchArgument($Arguments, [string]$Name) {
+    if ($null -eq $Arguments) { return $null }
+    $property = $Arguments.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+function Copy-CellRow($Row, [int]$Width) {
+    $copy = [object[]]::new($Width)
+    for ($index = 0; $index -lt $Width; $index++) {
+        $copy[$index] = if ($null -ne $Row -and $index -lt @($Row).Count -and $null -ne @($Row)[$index]) { @($Row)[$index] } else { @{} }
+    }
+    return ,$copy
+}
+
+function Set-WorkingRow([Collections.ArrayList]$Rows, [int]$RowNumber, [object[]]$Cells) {
+    $index = $RowNumber - 2
+    if ($index -lt 0) { throw "无效的工作表行号：$RowNumber" }
+    while ($Rows.Count -le $index) { $null = $Rows.Add([object[]]@()) }
+    $Rows[$index] = $Cells
+}
+
+function Convert-BatchDate($Value, [datetime]$Fallback, [string]$Name) {
+    if ($null -eq $Value -or -not ([string]$Value).Trim()) { return $Fallback.Date }
+    $parsed = [datetime]::MinValue
+    if (-not [datetime]::TryParse([string]$Value,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::None,[ref]$parsed)) {
+        throw "$Name 不是有效日期：$Value"
+    }
+    return $parsed.Date
+}
+
+function Get-BatchOperationsPayload {
+    $json = $OperationsJson
+    if ($OperationsPath) {
+        if (-not (Test-Path -LiteralPath $OperationsPath -PathType Leaf)) { throw "找不到批量经营操作文件：$OperationsPath" }
+        $json = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $OperationsPath).Path,[Text.Encoding]::UTF8)
+    }
+    if (-not $json) { throw '批量 SKU 维护必须提供 operations JSON' }
+    try { $operations = @($json | ConvertFrom-Json) } catch { throw "批量 SKU 维护参数不是有效 JSON：$($_.Exception.Message)" }
+    if ($operations.Count -eq 0) { throw '批量 SKU 维护没有可执行项目' }
+    return $operations
+}
+
+function Test-NullableNumberEqual($Actual, $Expected) {
+    $actualNumber = Convert-ToNullableNumber $Actual
+    if ($null -eq $Expected) { return $null -eq $actualNumber }
+    return $null -ne $actualNumber -and [math]::Abs([double]$actualNumber - [double]$Expected) -le 0.0001
+}
+
+function Invoke-BatchSkuMaintenance([object[]]$Operations) {
+    # Compatible ordinary SKU actions share these two reads and one atomic write.
+    # Historical-order corrections are deliberately rejected here and keep their existing path.
+    $skuRows = [Collections.ArrayList]::new()
+    foreach ($row in @(Get-SheetRows 'SKU成本主表' 'A2:Z3000')) { $null = $skuRows.Add((Copy-CellRow $row 26)) }
+    $replenishmentRows = [Collections.ArrayList]::new()
+    foreach ($row in @(Get-SheetRows '补货记录' 'A2:T1001')) { $null = $replenishmentRows.Add((Copy-CellRow $row 20)) }
+    $writes = [Collections.Generic.List[object]]::new()
+    $results = [Collections.Generic.List[object]]::new()
+    $expectedSku = @{}
+    $expectedReplenishment = @{}
+    $formulaRows = [Collections.Generic.HashSet[int]]::new()
+
+    for ($operationIndex = 0; $operationIndex -lt $Operations.Count; $operationIndex++) {
+        $operation = $Operations[$operationIndex]
+        $operationAction = [string](Get-BatchArgument $operation 'action')
+        $arguments = Get-BatchArgument $operation 'arguments'
+        if ($operationAction -notin @('Replenishment','SetSkuCost')) { throw "批量 SKU 维护不支持动作：$operationAction" }
+        if ($operationAction -eq 'SetSkuCost' -and (Get-BatchArgument $arguments 'order_no')) { throw '指定历史订单的成本修正不能与普通 SKU 维护合并执行' }
+
+        if ($operationAction -eq 'SetSkuCost') {
+            $goodsCode = [string](Get-BatchArgument $arguments 'goods_code')
+            $amountValue = Convert-ToNullableNumber (Get-BatchArgument $arguments 'amount')
+            if (-not $goodsCode -or $goodsCode.Trim().Length -gt 100) { throw "第$($operationIndex+1)项成本修改缺少可唯一定位的货号" }
+            Assert-NonNegative $amountValue "第$($operationIndex+1)项销售单位成本"
+            $operationDate = Convert-BatchDate (Get-BatchArgument $arguments 'date') $Date '成本确认日期'
+            $target = Resolve-UniqueSkuReference $skuRows $goodsCode.Trim().ToLowerInvariant()
+            $rowNumber = [int]$target.row_number
+            $cells = Copy-CellRow $skuRows[$rowNumber-2] 26
+            $canonicalKw = Get-CellValue $cells $skuSchema.CurrentKw.Index
+            $transitionCode = Get-CellValue $cells $skuSchema.TransitionCode.Index
+            $productId = Get-CellValue $cells $skuSchema.ProductId.Index
+            $displayCode = if ($canonicalKw) { $canonicalKw.Trim().ToLowerInvariant() } elseif ($transitionCode) { @([regex]::Split($transitionCode,'[/,，、;；\s]+') | Where-Object { $_ } | Select-Object -First 1)[0].Trim().ToLowerInvariant() } elseif ($productId) { "SKU ID $productId" } else { $goodsCode.Trim().ToLowerInvariant() }
+            $oldBaseline = Convert-ToNullableNumber (Get-CellValue $cells $skuSchema.BaselineUnitCost.Index)
+            $oldMoving = Convert-ToNullableNumber (Get-CellValue $cells $skuSchema.MovingAverageCost.Index)
+            $oldStatus = Get-CellValue $cells $skuSchema.CostStatus.Index
+            $newStatus = if ([string]$oldStatus -match '当前KW冲突') { '当前KW冲突待核对（成本已确认）' } else { '用户确认' }
+            $newCost = [math]::Round([double]$amountValue,4)
+            $noteValue = [string](Get-BatchArgument $arguments 'note')
+            $noteEntry = "店主通过飞书确认销售单位成本为 $($newCost.ToString('0.####',[Globalization.CultureInfo]::InvariantCulture)) 元（$($operationDate.ToString('yyyy-MM-dd'))）"
+            $newNote = ((@([regex]::Split([string](Get-CellValue $cells $skuSchema.Note.Index),'[；;]') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) + @($noteEntry,$noteValue) | Where-Object { $_ } | Select-Object -Unique) -join '；')
+
+            $cells[$skuSchema.BaselineUnitCost.Index] = New-UnitCostCell $newCost
+            $cells[$skuSchema.MovingAverageCost.Index] = New-UnitCostCell $newCost
+            $cells[$skuSchema.CostStatus.Index] = New-ValueCell $newStatus
+            $cells[$skuSchema.LastCostUpdate.Index] = New-ValueCell (Convert-ToExcelSerial ([datetime]::Now))
+            $cells[$skuSchema.ConversionBasis.Index] = New-ValueCell '店主确认的销售单位成本'
+            $cells[$skuSchema.Note.Index] = New-ValueCell $newNote
+            Set-WorkingRow $skuRows $rowNumber $cells
+
+            $costCells = @(); $costCells += ,@((New-UnitCostCell $newCost),(New-UnitCostCell $newCost))
+            $statusCells = @(); $statusCells += ,@((New-ValueCell $newStatus))
+            $updatedCells = @(); $updatedCells += ,@((New-ValueCell (Convert-ToExcelSerial ([datetime]::Now))))
+            $noteCells = @(); $noteCells += ,@((New-ValueCell '店主确认的销售单位成本'),(New-ValueCell $newNote))
+            $writes.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.BaselineUnitCost.Column)${rowNumber}:$($skuSchema.MovingAverageCost.Column)${rowNumber}";cells=$costCells}})
+            $writes.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.CostStatus.Column)${rowNumber}:$($skuSchema.CostStatus.Column)${rowNumber}";cells=$statusCells}})
+            $writes.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.LastCostUpdate.Column)${rowNumber}:$($skuSchema.LastCostUpdate.Column)${rowNumber}";cells=$updatedCells}})
+            $writes.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.ConversionBasis.Column)${rowNumber}:$($skuSchema.Note.Column)${rowNumber}";cells=$noteCells}})
+            $expectedSku[[string]$rowNumber] = [pscustomobject]@{baseline=$newCost;moving=$newCost;quantity=Convert-ToNullableNumber (Get-CellValue $cells $skuSchema.CostBookQuantity.Index);status=$newStatus}
+            $results.Add([pscustomobject]@{sheet='SKU成本主表';row=$rowNumber;range="$($skuSchema.BaselineUnitCost.Column)${rowNumber}:$($skuSchema.MovingAverageCost.Column)${rowNumber},$($skuSchema.CostStatus.Column)${rowNumber},$($skuSchema.LastCostUpdate.Column)${rowNumber}:$($skuSchema.Note.Column)${rowNumber}";goods_code=$displayCode;sku_reference=$goodsCode.Trim().ToLowerInvariant();product_id=$productId;title=Get-CellValue $cells 2;old_baseline_cost=$oldBaseline;old_moving_average_cost=$oldMoving;new_unit_cost=$newCost;new_moving_average_cost=$newCost;old_status=$oldStatus;new_status=$newStatus;historical_order_no=$null;affected_tables=@('SKU成本主表')})
+            continue
+        }
+
+        $goodsCode = [string](Get-BatchArgument $arguments 'goods_code')
+        $transitionCode = [string](Get-BatchArgument $arguments 'transition_code')
+        $quantityValue = Convert-ToNullableNumber (Get-BatchArgument $arguments 'quantity')
+        $purchaseAmountValue = Convert-ToNullableNumber (Get-BatchArgument $arguments 'purchase_amount')
+        $paymentAmountValue = Convert-ToNullableNumber (Get-BatchArgument $arguments 'payment_amount')
+        if (-not $goodsCode -or $goodsCode -notmatch '(?i)^(?:kw|csx)\d+$') { throw "第$($operationIndex+1)项补货必须提供有效的 KW 或 CSX 货号" }
+        if ($transitionCode -and $transitionCode -notmatch '(?i)^csx\d+$') { throw "第$($operationIndex+1)项补货关联的过渡货号无效" }
+        Assert-Positive $quantityValue "第$($operationIndex+1)项补货数量"
+        Assert-NonNegative $purchaseAmountValue "第$($operationIndex+1)项实际采购金额"
+        if ($null -ne $paymentAmountValue) { Assert-NonNegative $paymentAmountValue "第$($operationIndex+1)项付款金额" }
+        $operationDate = Convert-BatchDate (Get-BatchArgument $arguments 'date') $Date '补货日期'
+        $normalizedCode = $goodsCode.Trim().ToLowerInvariant()
+        $normalizedTransition = if ($transitionCode) { $transitionCode.Trim().ToLowerInvariant() } else { $null }
+        $requestedKw = if ($normalizedCode -match '^kw') { $normalizedCode } else { $null }
+        $requestedCsx = if ($normalizedTransition) { $normalizedTransition } elseif ($normalizedCode -match '^csx') { $normalizedCode } else { $null }
+        $candidateRows = @{}
+        foreach ($lookupCode in @($normalizedCode,$normalizedTransition | Where-Object { $_ } | Select-Object -Unique)) {
+            $matches = @(Get-SkuCodeCandidates $skuRows $lookupCode)
+            if ($matches.Count -gt 1) { throw "SKU成本主表中的货号 $lookupCode 重复出现在第 $(@($matches|ForEach-Object{$_.row_number}) -join '、') 行；批量补货未写入" }
+            if ($matches.Count -eq 1) { $candidateRows[[string]$matches[0].row_number] = $matches[0] }
+        }
+        if ($candidateRows.Count -gt 1) { throw "第$($operationIndex+1)项提供的 KW/CSX 指向不同 SKU 行；批量操作未写入" }
+        $newSku = $candidateRows.Count -eq 0
+        $mappingUpdate = $false
+        if ($newSku) {
+            $skuRowNumber = Get-FirstCompletelyEmptyRow $skuRows 26 2 3000
+            $cells = Copy-CellRow $null 26
+            $currentKw = $requestedKw
+            $productId = $null
+            $unitsPerPack = 1.0
+        } else {
+            $target = @($candidateRows.Values)[0]
+            $skuRowNumber = [int]$target.row_number
+            $cells = Copy-CellRow $skuRows[$skuRowNumber-2] 26
+            $existingKw = Get-CellValue $cells $skuSchema.CurrentKw.Index
+            $existingCsx = Get-CellValue $cells $skuSchema.TransitionCode.Index
+            if ($requestedKw) {
+                $kwMatches = @(Get-SkuCodeCandidates $skuRows $requestedKw)
+                if ($kwMatches.Count -eq 1 -and [int]$kwMatches[0].row_number -ne $skuRowNumber) { throw "当前 KW $requestedKw 已属于 SKU成本主表第 $($kwMatches[0].row_number) 行" }
+                $mappingUpdate = -not $existingKw -or $existingKw.Trim().ToLowerInvariant() -ne $requestedKw
+            }
+            if ($requestedCsx -and $existingCsx -and $existingCsx.Trim().ToLowerInvariant() -ne $requestedCsx) { throw "SKU成本主表第 $skuRowNumber 行已有过渡货号 $existingCsx，与 $requestedCsx 不一致" }
+            $currentKw = if ($requestedKw) { $requestedKw } else { $existingKw }
+            $productId = Get-CellValue $cells $skuSchema.ProductId.Index
+            $unitsPerPack = Convert-ToNumber (Get-CellValue $cells $skuSchema.UnitsPerPack.Index)
+            if ($unitsPerPack -le 0) { $unitsPerPack = 1.0 }
+        }
+        $productionRaw = Get-BatchArgument $arguments 'production_date'
+        $shelfLife = Convert-ToNullableNumber (Get-BatchArgument $arguments 'shelf_life_value')
+        $shelfUnit = [string](Get-BatchArgument $arguments 'shelf_life_unit'); if (-not $shelfUnit) { $shelfUnit = '月' }
+        if (($null -ne $productionRaw) -xor ($null -ne $shelfLife)) { throw "第$($operationIndex+1)项补货的生产日期和保质期必须一起提供" }
+        $productionDateValue = $null; $expiry = $null
+        if ($null -ne $productionRaw) { $productionDateValue = Convert-BatchDate $productionRaw $operationDate '生产日期'; Assert-Positive $shelfLife '保质期'; $expiry = Add-ShelfLife $productionDateValue ([double]$shelfLife) $shelfUnit }
+        $salesQuantity = [double]$quantityValue * $unitsPerPack
+        $incomingUnitCost = [double]$purchaseAmountValue / $salesQuantity
+        $beforeQuantity = if ($newSku) { 0.0 } else { Convert-ToNullableNumber (Get-CellValue $cells $skuSchema.CostBookQuantity.Index) }; if ($null -eq $beforeQuantity) { $beforeQuantity = 0.0 }
+        $beforeAverage = if ($newSku) { $null } else { Convert-ToNullableNumber (Get-CellValue $cells $skuSchema.MovingAverageCost.Index) }
+        $afterQuantity = [double]$beforeQuantity + $salesQuantity
+        $afterAverage = if ($null -eq $beforeAverage -and [double]$beforeQuantity -gt 0) { $null } else { ((if($null-eq$beforeAverage){0.0}else{[double]$beforeAverage*[double]$beforeQuantity}) + [double]$purchaseAmountValue) / $afterQuantity }
+        $noteValue = [string](Get-BatchArgument $arguments 'note')
+        if ($newSku) {
+            $zeroCost = [double]$purchaseAmountValue -eq 0
+            $cells[$skuSchema.CurrentKw.Index] = New-ValueCell $requestedKw; $cells[$skuSchema.TransitionCode.Index] = New-ValueCell $requestedCsx
+            $cells[$skuSchema.InitialInventory.Index] = New-ValueCell 0; $cells[$skuSchema.BaselineUnitCost.Index] = New-ValueCell $(if($zeroCost){0.0}else{$null})
+            $cells[$skuSchema.UnitsPerPack.Index] = New-ValueCell 1; $cells[$skuSchema.PurchaseUnit.Index] = New-ValueCell '个'
+            $cells[$skuSchema.CostStatus.Index] = New-ValueCell $(if($zeroCost){'零成本'}else{'新SKU待核对'})
+            $cells[$skuSchema.InitializationDate.Index] = New-ValueCell (Convert-ToExcelSerial $operationDate)
+            $cells[$skuSchema.ConversionBasis.Index] = New-ValueCell $(if($zeroCost){'用户明确试吃装/赠品成本为0'}else{'新SKU按本次补货建立成本，采购包装换算默认1'})
+            $cells[$skuSchema.Note.Index] = New-ValueCell $(if($noteValue){"新货号待平台库存同步补全商品资料；$noteValue"}else{'新货号待平台库存同步补全商品资料'})
+            $cells[$skuSchema.EarliestExpiry.Index] = New-ValueCell $(if($expiry){Convert-ToExcelSerial $expiry}else{$null}); $cells[$skuSchema.PlatformStatus.Index] = New-ValueCell '待平台同步'
+            $matrix = @(); $matrix += ,$cells; $writes.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="A${skuRowNumber}:Z${skuRowNumber}";cells=$matrix}})
+        } elseif ($mappingUpdate) {
+            $cells[$skuSchema.CurrentKw.Index] = New-ValueCell $requestedKw
+            $matrix = @(); $matrix += ,@((New-ValueCell $requestedKw)); $writes.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="A${skuRowNumber}:A${skuRowNumber}";cells=$matrix}})
+        }
+        $cells[$skuSchema.MovingAverageCost.Index] = New-UnitCostCell $afterAverage; $cells[$skuSchema.CostBookQuantity.Index] = New-UnitCostCell $afterQuantity; $cells[$skuSchema.LastCostUpdate.Index] = New-ValueCell (Convert-ToExcelSerial ([datetime]::Now))
+        Set-WorkingRow $skuRows $skuRowNumber $cells
+        $matrix = @(); $matrix += ,@((New-UnitCostCell $afterAverage),(New-UnitCostCell $afterQuantity)); $writes.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.MovingAverageCost.Column)${skuRowNumber}:$($skuSchema.CostBookQuantity.Column)${skuRowNumber}";cells=$matrix}})
+        $matrix = @(); $matrix += ,@((New-ValueCell (Convert-ToExcelSerial ([datetime]::Now)))); $writes.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.LastCostUpdate.Column)${skuRowNumber}:$($skuSchema.LastCostUpdate.Column)${skuRowNumber}";cells=$matrix}})
+        $rowNumber = Get-FirstEmptyRow $replenishmentRows 1 2 1001
+        $operationEventId = [string](Get-BatchArgument $arguments 'event_id'); if (-not $operationEventId) { $operationEventId = "$EventId-$operationIndex-Replenishment" }
+        $batchId = 'EVT-' + (Get-StableEventKey $operationEventId)
+        $paymentDateValue = if ($null-ne$paymentAmountValue) { Convert-ToExcelSerial (Convert-BatchDate (Get-BatchArgument $arguments 'payment_date') $operationDate '付款日期') } else { $null }
+        $displayCode = if ($currentKw) { $currentKw } else { $normalizedCode }
+        $rowCells = Copy-CellRow $null 20
+        $rowCells[0]=New-ValueCell (Convert-ToExcelSerial $operationDate);$rowCells[1]=New-ValueCell $displayCode;$rowCells[2]=New-ValueCell ([double]$quantityValue);$rowCells[3]=New-ValueCell $unitsPerPack
+        $rowCells[4]=@{formula="=IF(OR(C${rowNumber}=`"`",D${rowNumber}=`"`"),`"`",C${rowNumber}*D${rowNumber})"};$rowCells[5]=New-ValueCell ([double]$purchaseAmountValue);$rowCells[6]=@{formula="=IF(OR(E${rowNumber}=`"`",F${rowNumber}=`"`"),`"`",F${rowNumber}/E${rowNumber})"}
+        $rowCells[7]=New-UnitCostCell $beforeQuantity;$rowCells[8]=New-UnitCostCell $beforeAverage;$rowCells[9]=New-UnitCostCell $afterQuantity;$rowCells[10]=New-UnitCostCell $afterAverage
+        $rowCells[11]=New-ValueCell $paymentDateValue;$rowCells[12]=New-ValueCell $paymentAmountValue;$rowCells[13]=New-ValueCell $noteValue;$rowCells[14]=New-ValueCell $productId
+        $rowCells[15]=New-ValueCell $(if($productionDateValue){Convert-ToExcelSerial $productionDateValue}else{$null});$rowCells[16]=New-ValueCell $shelfLife;$rowCells[17]=New-ValueCell $(if($productionDateValue){$shelfUnit}else{$null});$rowCells[18]=New-ValueCell $(if($expiry){Convert-ToExcelSerial $expiry}else{$null});$rowCells[19]=New-ValueCell $batchId
+        Set-WorkingRow $replenishmentRows $rowNumber $rowCells
+        $matrix=@();$matrix+=,$rowCells;$writes.Add(@{shortcut='+cells-set';input=@{sheet_name='补货记录';range="A${rowNumber}:T${rowNumber}";cells=$matrix}})
+        $expectedSku[[string]$skuRowNumber]=[pscustomobject]@{baseline=Convert-ToNullableNumber (Get-CellValue $cells $skuSchema.BaselineUnitCost.Index);moving=$afterAverage;quantity=$afterQuantity;status=Get-CellValue $cells $skuSchema.CostStatus.Index}
+        $expectedReplenishment[[string]$rowNumber]=[pscustomobject]@{goods_code=$displayCode;quantity=[double]$quantityValue;purchase_amount=[double]$purchaseAmountValue;batch_id=$batchId;after_quantity=$afterQuantity;after_average=$afterAverage};$null=$formulaRows.Add($rowNumber)
+        $results.Add([pscustomobject]@{row=$rowNumber;sku_master_row=$skuRowNumber;goods_code=$displayCode;transition_code=$requestedCsx;product_id=$productId;package_quantity=[double]$quantityValue;sales_unit_quantity=$salesQuantity;purchase_amount=[double]$purchaseAmountValue;payment_amount=$paymentAmountValue;unit_cost=$incomingUnitCost;before_quantity=$beforeQuantity;before_average_cost=$beforeAverage;after_quantity=$afterQuantity;after_average_cost=$afterAverage;production_date=$(if($productionDateValue){$productionDateValue.ToString('yyyy-MM-dd')}else{$null});expiry_date=$(if($expiry){$expiry.ToString('yyyy-MM-dd')}else{$null});sku_status=$(if($newSku){$(if($DryRun){'will_create_pending_profile'}else{'created_pending_profile'})}elseif($mappingUpdate){$(if($DryRun){'will_attach_kw_by_csx'}else{'attached_kw_by_csx'})}else{'matched'});affected_tables=@('补货记录','SKU成本主表');remote_replay=$false})
+    }
+
+    if ($DryRun) {
+        return [pscustomobject]@{operations=$results.ToArray();operation_count=$results.Count;write_operation_count=0;master_read_count=1;replenishment_read_count=1;preview=$true}
+    }
+    Set-AtomicCellOperations $writes.ToArray()
+    foreach($entry in $expectedSku.GetEnumerator()) { $row=[int]$entry.Key;$e=$entry.Value;$a=Get-SingleSheetRow 'SKU成本主表' "A${row}:Z${row}";if($null-eq$a -or -not(Test-NullableNumberEqual (Get-CellValue $a $skuSchema.BaselineUnitCost.Index) $e.baseline) -or -not(Test-NullableNumberEqual (Get-CellValue $a $skuSchema.MovingAverageCost.Index) $e.moving) -or -not(Test-NullableNumberEqual (Get-CellValue $a $skuSchema.CostBookQuantity.Index) $e.quantity) -or [string](Get-CellValue $a $skuSchema.CostStatus.Index)-ne[string]$e.status){throw "批量 SKU 维护写后校验失败：SKU成本主表第 $row 行"} }
+    foreach($entry in $expectedReplenishment.GetEnumerator()) { $row=[int]$entry.Key;$e=$entry.Value;$a=Get-SingleSheetRow '补货记录' "A${row}:T${row}";if($null-eq$a -or [string](Get-CellValue $a 1)-ne[string]$e.goods_code -or -not(Test-NullableNumberEqual (Get-CellValue $a 2) $e.quantity) -or -not(Test-NullableNumberEqual (Get-CellValue $a 5) $e.purchase_amount) -or [string](Get-CellValue $a 19)-ne[string]$e.batch_id -or -not(Test-NullableNumberEqual (Get-CellValue $a 9) $e.after_quantity) -or -not(Test-NullableNumberEqual (Get-CellValue $a 10) $e.after_average)){throw "批量补货写后校验失败：补货记录第 $row 行"} }
+    if($formulaRows.Count-gt 0){$ranges=@($formulaRows|Sort-Object|ForEach-Object{"D${_}:E${_},G${_}:G${_}"})-join',';Assert-FormulaRange '补货记录' $ranges}
+    return [pscustomobject]@{operations=$results.ToArray();operation_count=$results.Count;write_operation_count=$writes.Count;master_read_count=1;replenishment_read_count=1}
+}
+
 if (-not $DryRun -and $EventId -and (Test-ProcessedEvent $EventId)) {
     [ordered]@{ok=$true;duplicate=$true;event_id=$EventId;action=$Action;message='该事件已处理，本次未重复写入'} | ConvertTo-Json -Depth 6
     Complete-CurrentFinanceTransaction
     exit 0
 }
 
-$nativeDryRunActions = @('AddIntervention','RemoveIntervention','SetOrderDeliveryFee','SetOrderActuals','OfflineSale','AddOrderGift','Replenishment','SetSkuCost','SetSkuExpiry','SetSkuBatchDate','ChangeSkuCode','OperatingExpense','SetRefundDisposition')
+$nativeDryRunActions = @('AddIntervention','RemoveIntervention','SetOrderDeliveryFee','SetOrderActuals','OfflineSale','AddOrderGift','Replenishment','BatchSkuMaintenance','SetSkuCost','SetSkuExpiry','SetSkuBatchDate','ChangeSkuCode','OperatingExpense','SetRefundDisposition')
 if ($DryRun -and $Action -notin $nativeDryRunActions) {
     throw "动作 $Action 暂不支持直接预演；已在任何写入前停止"
 }
@@ -773,7 +999,22 @@ if (-not $DryRun) {
 $reference = ''
 $writeResult = $null
 $costResult = $null
+$explicitHistoricalOrderDate = $null
 switch ($Action) {
+    'BatchSkuMaintenance' {
+        $batchOperations = @(Get-BatchOperationsPayload)
+        $batchResult = Invoke-BatchSkuMaintenance $batchOperations
+        if ([int]$batchResult.operation_count -ne $batchOperations.Count) {
+            throw "批量 SKU 维护结果不完整：计划 $($batchOperations.Count) 项，实际 $($batchResult.operation_count) 项"
+        }
+        if ($DryRun) {
+            [ordered]@{ok=$true;dry_run=$true;action=$Action;result=$batchResult;message='批量预演成功，未写入飞书'} | ConvertTo-Json -Depth 12
+            Complete-CurrentFinanceTransaction
+            exit 0
+        }
+        $reference = "batch-sku-maintenance x$($batchOperations.Count)"
+        $writeResult = $batchResult
+    }
     'SetOrderActuals' {
         if (-not $OrderNo -or $OrderNo -notmatch '^\d{10,30}$') { throw '修正订单实际履约必须提供有效平台订单号' }
         Assert-NonNegative $Amount '订单实际收入'
@@ -1452,6 +1693,11 @@ switch ($Action) {
         }
         $displayCode = if ($currentKw) { $currentKw } else { $normalizedCode }
         $salesUnitQuantity = [double]$Quantity * $unitsPerPack
+        $purchaseAmountValue = [double]$PurchaseAmount
+        $incomingUnitCost = if ($salesUnitQuantity -gt 0) { $purchaseAmountValue / $salesUnitQuantity } else { $null }
+        $beforeQuantity = if ($newSkuPending) { 0.0 } else { Convert-ToNullableNumber (Get-CellValue $skuTarget.cells $skuSchema.CostBookQuantity.Index) }
+        if ($null -eq $beforeQuantity) { $beforeQuantity = 0.0 }
+        $beforeAverage = if ($newSkuPending) { $null } else { Convert-ToNullableNumber (Get-CellValue $skuTarget.cells $skuSchema.MovingAverageCost.Index) }
         $computedExpiry = $null
         if (($null -ne $ProductionDate) -xor ($null -ne $ShelfLifeValue)) { throw '登记批次时，生产日期和保质期必须一起提供' }
         if ($null -ne $ProductionDate) {
@@ -1470,12 +1716,32 @@ switch ($Action) {
         }
         $rowNumber = if ($existingEventIndex -ge 0) { 2 + $existingEventIndex } else { Get-FirstEmptyRow $rows 1 2 1001 }
         $quantityValue = [double]$Quantity
-        $purchaseAmountValue = [double]$PurchaseAmount
         $paymentDateValue = if ($null -ne $PaymentAmount) { Convert-ToExcelSerial $(if ($null -ne $PaymentDate) { [datetime]$PaymentDate } else { $Date }) } else { $null }
         $paymentAmountValue = if ($null -ne $PaymentAmount) { [double]$PaymentAmount } else { $null }
         $batchId = if ($eventBatchId) { $eventBatchId } elseif ($computedExpiry) { "BATCH-$($Date.ToString('yyyyMMdd'))-$('{0:D4}' -f $rowNumber)" } else { $null }
+        $existingBeforeQuantity = if ($existingEventIndex -ge 0) { Convert-ToNullableNumber (Get-CellValue $rows[$existingEventIndex] 7) } else { $null }
+        $existingBeforeAverage = if ($existingEventIndex -ge 0) { Convert-ToNullableNumber (Get-CellValue $rows[$existingEventIndex] 8) } else { $null }
+        $existingAfterQuantity = if ($existingEventIndex -ge 0) { Convert-ToNullableNumber (Get-CellValue $rows[$existingEventIndex] 9) } else { $null }
+        $existingAfterAverage = if ($existingEventIndex -ge 0) { Convert-ToNullableNumber (Get-CellValue $rows[$existingEventIndex] 10) } else { $null }
+        if ($null -ne $existingAfterQuantity) {
+            $beforeQuantity = $existingBeforeQuantity
+            $beforeAverage = $existingBeforeAverage
+            $afterQuantity = $existingAfterQuantity
+            $afterAverage = $existingAfterAverage
+        } else {
+            $afterQuantity = [double]$beforeQuantity + [double]$salesUnitQuantity
+            if ($null -eq $beforeAverage -and [double]$beforeQuantity -gt 0) {
+                # 旧库存成本未知时，不能只用本次进价伪造整批库存成本。
+                $afterAverage = $null
+            } elseif ($afterQuantity -le 0) {
+                $afterAverage = $incomingUnitCost
+            } else {
+                $beforeValue = if ($null -eq $beforeAverage) { 0.0 } else { [double]$beforeAverage * [double]$beforeQuantity }
+                $afterAverage = ($beforeValue + $purchaseAmountValue) / $afterQuantity
+            }
+        }
         if ($DryRun) {
-            [ordered]@{ok=$true;dry_run=$true;action=$Action;result=[ordered]@{row=$rowNumber;sku_master_row=[int]$skuTarget.row_number;goods_code=$displayCode;transition_code=$requestedCsx;product_id=$productId;package_quantity=$quantityValue;sales_unit_quantity=$salesUnitQuantity;purchase_amount=$purchaseAmountValue;production_date=$(if($ProductionDate){([datetime]$ProductionDate).ToString('yyyy-MM-dd')}else{$null});expiry_date=$(if($computedExpiry){$computedExpiry.ToString('yyyy-MM-dd')}else{$null});sku_status=$(if($newSkuPending){'will_create_pending_profile'}elseif($mappingUpdate){'will_attach_kw_by_csx'}else{'matched'});mapping_update=$mappingUpdate;remote_replay=($existingEventIndex -ge 0)};message='预演成功，未写入飞书'} | ConvertTo-Json -Depth 8
+            [ordered]@{ok=$true;dry_run=$true;action=$Action;result=[ordered]@{row=$rowNumber;sku_master_row=[int]$skuTarget.row_number;goods_code=$displayCode;transition_code=$requestedCsx;product_id=$productId;package_quantity=$quantityValue;sales_unit_quantity=$salesUnitQuantity;purchase_amount=$purchaseAmountValue;unit_cost=$incomingUnitCost;before_quantity=$beforeQuantity;before_average_cost=$beforeAverage;after_quantity=$afterQuantity;after_average_cost=$afterAverage;production_date=$(if($ProductionDate){([datetime]$ProductionDate).ToString('yyyy-MM-dd')}else{$null});expiry_date=$(if($computedExpiry){$computedExpiry.ToString('yyyy-MM-dd')}else{$null});sku_status=$(if($newSkuPending){'will_create_pending_profile'}elseif($mappingUpdate){'will_attach_kw_by_csx'}else{'matched'});mapping_update=$mappingUpdate;affected_tables=@('补货记录','SKU成本主表');remote_replay=($existingEventIndex -ge 0)};message='预演成功，未写入飞书'} | ConvertTo-Json -Depth 8
             Complete-CurrentFinanceTransaction
             exit 0
         }
@@ -1530,26 +1796,21 @@ switch ($Action) {
             $(if($computedExpiry){Convert-ToExcelSerial $computedExpiry}else{$null}),
             $batchId
         )
-        if ($computedExpiry) {
-            $batchRows = Get-SheetRows '库存批次' 'A2:M2000'
-            $existingBatchIndex = -1
-            if ($batchId) {
-                for ($i = 0; $i -lt $batchRows.Count; $i++) {
-                    if ((Get-CellValue $batchRows[$i] 0) -eq $batchId) { $existingBatchIndex = $i; break }
-                }
-            }
-            $batchRow = if ($existingBatchIndex -ge 0) { 2 + $existingBatchIndex } else { Get-FirstEmptyRow $batchRows 1 2 2000 }
-            Set-OneRow '库存批次' "A${batchRow}:M${batchRow}" @(
-                $batchId,$productId,$currentKw,(Convert-ToExcelSerial $Date),$salesUnitQuantity,(Convert-ToExcelSerial ([datetime]$ProductionDate)),
-                [double]$ShelfLifeValue,$ShelfLifeUnit,(Convert-ToExcelSerial $computedExpiry),$salesUnitQuantity,"补货记录第${rowNumber}行",'在库',$Note
-            )
-            $oldExpiry = if ($newSkuPending) { $null } else { Convert-ToDateValue (Get-CellValue $skuTarget.cells $skuSchema.EarliestExpiry.Index) }
-            if ($null -eq $oldExpiry -or $computedExpiry.Date -lt $oldExpiry.Date) {
-                Set-OneRow 'SKU成本主表' "$($skuSchema.EarliestExpiry.Column)$($skuTarget.row_number):$($skuSchema.EarliestExpiry.Column)$($skuTarget.row_number)" @((Convert-ToExcelSerial $computedExpiry))
-            }
-        }
+        $snapshotCells = @(); $snapshotCells += ,@(
+            (New-UnitCostCell $beforeQuantity),(New-UnitCostCell $beforeAverage),
+            (New-UnitCostCell $afterQuantity),(New-UnitCostCell $afterAverage)
+        )
+        $masterCostCells = @(); $masterCostCells += ,@(
+            (New-UnitCostCell $afterAverage),(New-UnitCostCell $afterQuantity)
+        )
+        $masterUpdatedAtCells = @(); $masterUpdatedAtCells += ,@((New-ValueCell (Convert-ToExcelSerial ([datetime]::Now))))
+        Set-AtomicCellOperations @(
+            @{shortcut='+cells-set';input=@{sheet_name='补货记录';range="H${rowNumber}:K${rowNumber}";cells=$snapshotCells}},
+            @{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.MovingAverageCost.Column)$($skuTarget.row_number):$($skuSchema.CostBookQuantity.Column)$($skuTarget.row_number)";cells=$masterCostCells}},
+            @{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.LastCostUpdate.Column)$($skuTarget.row_number):$($skuSchema.LastCostUpdate.Column)$($skuTarget.row_number)";cells=$masterUpdatedAtCells}}
+        )
         $reference = "$GoodsCode x$quantityValue"
-        $writeResult = [pscustomobject]@{row=$rowNumber;sku_master_row=[int]$skuTarget.row_number;goods_code=$displayCode;transition_code=$requestedCsx;product_id=$productId;package_quantity=$quantityValue;sales_unit_quantity=$salesUnitQuantity;purchase_amount=$purchaseAmountValue;payment_amount=$paymentAmountValue;batch_id=$batchId;expiry_date=$(if($computedExpiry){$computedExpiry.ToString('yyyy-MM-dd')}else{$null});sku_status=$(if($newSkuPending){'created_pending_profile'}elseif($mappingUpdate){'attached_kw_by_csx'}else{'matched'});mapping_update=$mappingUpdate;remote_replay=($existingEventIndex -ge 0)}
+        $writeResult = [pscustomobject]@{row=$rowNumber;sku_master_row=[int]$skuTarget.row_number;goods_code=$displayCode;transition_code=$requestedCsx;product_id=$productId;package_quantity=$quantityValue;sales_unit_quantity=$salesUnitQuantity;purchase_amount=$purchaseAmountValue;payment_amount=$paymentAmountValue;unit_cost=$incomingUnitCost;before_quantity=$beforeQuantity;before_average_cost=$beforeAverage;after_quantity=$afterQuantity;after_average_cost=$afterAverage;batch_id=$batchId;expiry_date=$(if($computedExpiry){$computedExpiry.ToString('yyyy-MM-dd')}else{$null});sku_status=$(if($newSkuPending){'created_pending_profile'}elseif($mappingUpdate){'attached_kw_by_csx'}else{'matched'});mapping_update=$mappingUpdate;affected_tables=@('补货记录','SKU成本主表');remote_replay=($existingEventIndex -ge 0)}
     }
     'SetSkuCost' {
         if (-not $GoodsCode -or $GoodsCode.Trim().Length -gt 100) { throw '修改成本必须提供 SKU成本主表中可唯一定位的当前货号或过渡标识' }
@@ -1582,12 +1843,47 @@ switch ($Action) {
         $newNoteEntry = "店主通过飞书确认销售单位成本为 $($newCost.ToString('0.####',[Globalization.CultureInfo]::InvariantCulture)) 元（$($Date.ToString('yyyy-MM-dd'))）"
         $oldNoteParts = @([regex]::Split([string]$oldNote, '[；;]') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
         $newNote = ((@($oldNoteParts + @($newNoteEntry,$Note)) | Where-Object { $_ } | Select-Object -Unique) -join '；')
+        $targetOrderItems = [Collections.Generic.List[object]]::new()
+        if ($OrderNo) {
+            if ($OrderNo -notmatch '^\d{10,30}$') { throw '更新历史订单成本必须提供有效的平台订单号' }
+            $orderItemRows = Get-SheetRows '订单商品' 'A2:Q4001'
+            $matchingCodes = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($code in @($normalizedCode,$canonicalKw) + @([regex]::Split([string]$transitionCode, '[/,，、;；\s]+'))) {
+                if ($code) { $null = $matchingCodes.Add(([string]$code).Trim().ToLowerInvariant()) }
+            }
+            for ($itemIndex = 0; $itemIndex -lt $orderItemRows.Count; $itemIndex++) {
+                $itemRow = $orderItemRows[$itemIndex]
+                if ((Get-CellValue $itemRow 2) -ne $OrderNo) { continue }
+                $itemProductId = ([string](Get-CellValue $itemRow 16)).Trim()
+                $itemCode = ([string](Get-CellValue $itemRow 5)).Trim().ToLowerInvariant()
+                $sameProduct = ($productId -and $itemProductId -eq $productId) -or ($itemCode -and $matchingCodes.Contains($itemCode))
+                if (-not $sameProduct) { continue }
+                $itemDate = Convert-ToDateValue (Get-CellValue $itemRow 0)
+                if ($null -eq $itemDate) { throw "订单 $OrderNo 的商品日期缺失，不能安全更新成本" }
+                $itemQuantity = Convert-ToNumber (Get-CellValue $itemRow 8)
+                $itemSalesAmount = Convert-ToNumber (Get-CellValue $itemRow 10)
+                $targetOrderItems.Add([pscustomobject]@{
+                    row=2+$itemIndex;date=$itemDate;quantity=$itemQuantity;sales_amount=$itemSalesAmount
+                    old_unit_cost=Convert-ToNullableNumber (Get-CellValue $itemRow 11)
+                    old_item_cost=Convert-ToNullableNumber (Get-CellValue $itemRow 12)
+                    new_unit_cost=$newCost
+                    new_item_cost=[math]::Round(($newCost * $itemQuantity),4)
+                    new_margin=[math]::Round(($itemSalesAmount - ($newCost * $itemQuantity)),4)
+                })
+            }
+            if ($targetOrderItems.Count -eq 0) { throw "订单 $OrderNo 中找不到与 $displayCode 对应的商品；没有修改任何成本" }
+            $distinctOrderDates = @($targetOrderItems | ForEach-Object { $_.date.ToString('yyyy-MM-dd') } | Select-Object -Unique)
+            if ($distinctOrderDates.Count -ne 1) { throw "订单 $OrderNo 的商品日期不一致，不能安全刷新对应月份" }
+            $explicitHistoricalOrderDate = [datetime]$targetOrderItems[0].date
+        }
+        $affectedTables = if ($OrderNo) { @('SKU成本主表','指定订单的订单商品','订单汇总','对应月份收入','驾驶舱') } else { @('SKU成本主表') }
 
         if ($DryRun) {
             [ordered]@{ok=$true;dry_run=$true;action=$Action;result=[ordered]@{
-                sheet='SKU成本主表';row=$rowNumber;range="$($skuSchema.BaselineUnitCost.Column)${rowNumber},$($skuSchema.CostStatus.Column)${rowNumber},$($skuSchema.ConversionBasis.Column)${rowNumber}:$($skuSchema.Note.Column)${rowNumber}"
+                sheet='SKU成本主表';row=$rowNumber;range="$($skuSchema.BaselineUnitCost.Column)${rowNumber}:$($skuSchema.MovingAverageCost.Column)${rowNumber},$($skuSchema.CostStatus.Column)${rowNumber},$($skuSchema.LastCostUpdate.Column)${rowNumber}:$($skuSchema.Note.Column)${rowNumber}"
                 goods_code=$displayCode;sku_reference=$normalizedCode;product_id=$productId;title=$title;old_baseline_cost=$oldBaselineCost;old_moving_average_cost=$oldMovingCost
-                new_unit_cost=$newCost;old_status=$oldStatus;new_status=$newStatus;affected_tables=@('SKU成本主表','订单商品','订单汇总','对应月份收入','驾驶舱')
+                new_unit_cost=$newCost;new_moving_average_cost=$newCost;old_status=$oldStatus;new_status=$newStatus;historical_order_no=$OrderNo
+                historical_order_items=@($targetOrderItems);affected_tables=$affectedTables
             };message='预演成功，未写入飞书'} | ConvertTo-Json -Depth 10
             Complete-CurrentFinanceTransaction
             exit 0
@@ -1597,35 +1893,36 @@ switch ($Action) {
         $backupPath = Join-Path $stateRoot ("sku_cost_change_backup_{0}_{1}.json" -f $displayCode,[datetime]::Now.ToString('yyyyMMdd_HHmmss'))
         [ordered]@{source="SKU成本主表!A${rowNumber}:Z${rowNumber}";captured_at=[datetime]::Now.ToString('o');cells=@($target.cells)} | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $backupPath -Encoding UTF8
 
-        $eMatrix = @(); $eMatrix += ,@((New-UnitCostCell $newCost))
+        $costMatrix = @(); $costMatrix += ,@((New-UnitCostCell $newCost),(New-UnitCostCell $newCost))
         $jMatrix = @(); $jMatrix += ,@((New-ValueCell $newStatus))
+        $updatedAtMatrix = @(); $updatedAtMatrix += ,@((New-ValueCell (Convert-ToExcelSerial ([datetime]::Now))))
         $mnMatrix = @(); $mnMatrix += ,@((New-ValueCell '店主确认的销售单位成本'),(New-ValueCell $newNote))
-        Set-AtomicCellOperations @(
-            @{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.BaselineUnitCost.Column)${rowNumber}:$($skuSchema.BaselineUnitCost.Column)${rowNumber}";cells=$eMatrix}},
-            @{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.CostStatus.Column)${rowNumber}:$($skuSchema.CostStatus.Column)${rowNumber}";cells=$jMatrix}},
-            @{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.ConversionBasis.Column)${rowNumber}:$($skuSchema.Note.Column)${rowNumber}";cells=$mnMatrix}}
-        )
-
-        # 飞书写入成功后，紧接着的大范围成本重算偶尔会让第一次回读命中旧 revision。
-        # 先等待关键字段可见，再重算；重算完成后再次回读，避免“数据其实已写入但回复失败”。
-        $writeReadback = Get-SkuCostReadback $rowNumber $newCost $newStatus
-        if ([math]::Abs([double]$writeReadback.baseline_cost - $newCost) -gt 0.0001 -or [string]$writeReadback.status -ne $newStatus) {
-            throw "SKU成本写入后回读不一致：$displayCode（实际成本=$($writeReadback.baseline_cost)，状态=$($writeReadback.status)，重试=$($writeReadback.attempt)次）"
+        $costOperations = [Collections.Generic.List[object]]::new()
+        $costOperations.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.BaselineUnitCost.Column)${rowNumber}:$($skuSchema.MovingAverageCost.Column)${rowNumber}";cells=$costMatrix}})
+        $costOperations.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.CostStatus.Column)${rowNumber}:$($skuSchema.CostStatus.Column)${rowNumber}";cells=$jMatrix}})
+        $costOperations.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.LastCostUpdate.Column)${rowNumber}:$($skuSchema.LastCostUpdate.Column)${rowNumber}";cells=$updatedAtMatrix}})
+        $costOperations.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.ConversionBasis.Column)${rowNumber}:$($skuSchema.Note.Column)${rowNumber}";cells=$mnMatrix}})
+        foreach ($targetItem in $targetOrderItems) {
+            $itemCostCells = @(); $itemCostCells += ,@(
+                (New-UnitCostCell $targetItem.new_unit_cost),(New-UnitCostCell $targetItem.new_item_cost),(New-UnitCostCell $targetItem.new_margin)
+            )
+            $costOperations.Add(@{shortcut='+cells-set';input=@{sheet_name='订单商品';range="L$($targetItem.row):N$($targetItem.row)";cells=$itemCostCells}})
         }
-        $costResult = Invoke-CostSnapshotRebuild
-        $finalReadback = Get-SkuCostReadback $rowNumber $newCost $newStatus
+        Set-AtomicCellOperations $costOperations.ToArray()
+
+        $finalReadback = Get-SkuCostReadback $rowNumber $newCost $newStatus $newCost
         $actualBaseline = [double]$finalReadback.baseline_cost
         $actualMoving = [double]$finalReadback.moving_average_cost
         $actualStatus = [string]$finalReadback.status
-        if ([math]::Abs($actualBaseline - $newCost) -gt 0.0001 -or $actualStatus -ne $newStatus) {
-            throw "SKU成本重算后回读不一致：$displayCode（实际成本=$actualBaseline，状态=$actualStatus，重试=$($finalReadback.attempt)次）"
+        if ([math]::Abs($actualBaseline - $newCost) -gt 0.0001 -or [math]::Abs($actualMoving - $newCost) -gt 0.0001 -or $actualStatus -ne $newStatus) {
+            throw "SKU成本写入后回读不一致：$displayCode（基准成本=$actualBaseline，当前成本=$actualMoving，状态=$actualStatus，重试=$($finalReadback.attempt)次）"
         }
         $reference = "$displayCode $newCost"
         $writeResult = [pscustomobject]@{
-            sheet='SKU成本主表';row=$rowNumber;range="$($skuSchema.BaselineUnitCost.Column)${rowNumber},$($skuSchema.CostStatus.Column)${rowNumber},$($skuSchema.ConversionBasis.Column)${rowNumber}:$($skuSchema.Note.Column)${rowNumber}"
+            sheet='SKU成本主表';row=$rowNumber;range="$($skuSchema.BaselineUnitCost.Column)${rowNumber}:$($skuSchema.MovingAverageCost.Column)${rowNumber},$($skuSchema.CostStatus.Column)${rowNumber},$($skuSchema.LastCostUpdate.Column)${rowNumber}:$($skuSchema.Note.Column)${rowNumber}"
             goods_code=$displayCode;sku_reference=$normalizedCode;product_id=$productId;title=$title;old_baseline_cost=$oldBaselineCost;old_moving_average_cost=$oldMovingCost
             new_unit_cost=$newCost;new_moving_average_cost=$actualMoving;old_status=$oldStatus;new_status=$actualStatus
-            affected_tables=@('SKU成本主表','订单商品','订单汇总','对应月份收入','驾驶舱')
+            historical_order_no=$OrderNo;historical_order_items=@($targetOrderItems);affected_tables=$affectedTables
         }
     }
     'SetSkuExpiry' {
@@ -1940,12 +2237,16 @@ if ($Action -in @('AddIntervention','RemoveIntervention','RestoreInventory','Con
 }
 if ($Action -eq 'Replenishment') { Assert-FormulaRange '补货记录' 'D2:E1001,G2:G1001' }
 if ($Action -eq 'OfflineSale') { Assert-FormulaRange '线下订单' 'G2:G1001' }
+if ($Action -eq 'SetSkuCost' -and $OrderNo) {
+    Assert-FormulaRange '订单汇总' 'E2:E2001,K2:L2001'
+    Assert-FormulaRange '订单商品' 'E2:E4001,K2:K4001,P2:P4001'
+}
 
 $ledgerResult = $null
-if ($Action -in @('AddIntervention','RemoveIntervention','SetOrderActuals','AddOrderGift','Replenishment','ChangeSkuCode','SetSkuCost','SetRefundDisposition') -and $null -eq $costResult) {
+if ($Action -in @('AddIntervention','RemoveIntervention','SetOrderActuals','AddOrderGift','SetRefundDisposition') -and $null -eq $costResult) {
     $costResult = Invoke-CostSnapshotRebuild
 }
-if ($Action -in @('AddIntervention','RemoveIntervention','ConfirmSelfDelivery','SetExternalDeliveryFee','SetOrderDeliveryFee','SetOrderActuals','OfflineSale','AddOrderGift','Replenishment','ChangeSkuCode','SetSkuCost','SetRefundDisposition')) {
+if ($Action -in @('AddIntervention','RemoveIntervention','ConfirmSelfDelivery','SetExternalDeliveryFee','SetOrderDeliveryFee','SetOrderActuals','OfflineSale','AddOrderGift','SetRefundDisposition')) {
     # Order-local changes only require rebuilding their own month. Cost-basis changes
     # can affect FIFO snapshots across multiple months and deliberately keep the full rebuild.
     $ledgerTargetMonth = $null
@@ -1960,6 +2261,10 @@ if ($Action -in @('AddIntervention','RemoveIntervention','ConfirmSelfDelivery','
         if ($null -ne $candidateDate) { $ledgerTargetMonth = [datetime]$candidateDate }
     }
     $ledgerResult = Invoke-DailyLedgerSync $ledgerTargetMonth
+}
+if ($Action -eq 'SetSkuCost' -and $null -ne $explicitHistoricalOrderDate) {
+    # 只有店主明确指定历史订单时才刷新其所属月份；普通 SKU 成本修改不得改写历史订单或简账。
+    $ledgerResult = Invoke-DailyLedgerSync $explicitHistoricalOrderDate
 }
 
 Save-ProcessedEvent $EventId $Action $reference

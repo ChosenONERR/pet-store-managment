@@ -625,14 +625,32 @@ function Invoke-DailyLedgerSync {
     if (-not $jsonLine) { throw '每日经营简账未返回有效结果' }
     return ($jsonLine | ConvertFrom-Json)
 }
-function Invoke-CostSnapshotRebuild {
+function Invoke-CostSnapshotRebuild([string[]]$EligibleOrderNumbers = @()) {
     if (-not (Test-Path -LiteralPath $costScript)) { throw '缺少成本快照刷新脚本' }
     $global:LASTEXITCODE = 0
-    $output = @(& $costScript -ProjectRoot $projectRoot)
+    $output = @(& $costScript -ProjectRoot $projectRoot -EligibleOrderNumbers $EligibleOrderNumbers)
     if ($LASTEXITCODE -ne 0) { throw '成本快照刷新失败' }
     $jsonLine = @($output | ForEach-Object { [string]$_ } | Where-Object { $_.Trim().StartsWith('{') -and $_.Trim().EndsWith('}') } | Select-Object -Last 1)
     if (-not $jsonLine) { throw '成本快照未返回有效结果' }
     return ($jsonLine | ConvertFrom-Json)
+}
+
+function Test-UseNoChangeFastPath(
+    [string]$SyncMode,
+    $OrderSyncResult,
+    $GiftSyncResult,
+    [bool]$WasSyncSkipped,
+    [bool]$WereOrdersSkipped
+) {
+    if ($SyncMode -notin @('midday','reminder') -or $WasSyncSkipped -or $WereOrdersSkipped) { return $false }
+    if ($null -eq $OrderSyncResult -or $null -eq $GiftSyncResult) { return $false }
+    $orderOkProperty = $OrderSyncResult.PSObject.Properties['ok']
+    $orderChangedProperty = $OrderSyncResult.PSObject.Properties['data_changed']
+    $giftUpdatedProperty = $GiftSyncResult.PSObject.Properties['updated_cells']
+    $giftOkProperty = $GiftSyncResult.PSObject.Properties['ok']
+    if ($null -eq $orderOkProperty -or $null -eq $orderChangedProperty -or $null -eq $giftUpdatedProperty -or $null -eq $giftOkProperty) { return $false }
+    if ($OrderSyncResult.ok -ne $true -or $GiftSyncResult.ok -ne $true) { return $false }
+    return ($OrderSyncResult.data_changed -eq $false -and [int]$GiftSyncResult.updated_cells -eq 0)
 }
 
 function Get-CurrentUserOpenId {
@@ -1281,6 +1299,8 @@ $costResult = $null
 $giftReconcileResult = $null
 $preflightResult = $null
 $promotionCapture = $null
+$integrityAuditResult = $null
+$useNoChangeFastPath = $false
 $syncWarnings = [Collections.Generic.List[string]]::new()
 $operationalDegraded = $false
 try {
@@ -1347,23 +1367,31 @@ try {
     foreach ($orderNo in @($giftReconcileResult.ambiguous_orders)) {
         $syncWarnings.Add("赠品订单匹配不唯一：$orderNo；系统未自动绑定。")
     }
-    $stage = Invoke-WithRetry 'cost_snapshot' { Invoke-CostSnapshotRebuild } 3
-    $costResult = $stage.value
-    $null = Invoke-WithRetry 'formula_verification' {
-        Assert-FormulaRange '订单汇总' 'E2:E2001,K2:L2001'
-        Assert-FormulaRange '订单商品' 'E2:E4001,K2:K4001,P2:P4001'
-        Assert-FormulaRange '库存快照' 'H2:I2000,K2:K2000,M2:M2000'
-        Assert-FormulaRange '补货记录' 'D2:E1001,G2:G1001'
-        Assert-FormulaRange '驾驶舱' 'C2:C19'
-        return 'success'
-    } 3
+    $useNoChangeFastPath = Test-UseNoChangeFastPath $Mode $orderResult $giftReconcileResult ([bool]$SkipSync) ([bool]$SkipOrders)
+    if ($useNoChangeFastPath) {
+        foreach ($skippedStage in @('cost_snapshot','formula_verification','daily_ledger','integrity_audit')) {
+            $stageTelemetry[$skippedStage] = [ordered]@{seconds=0.0;attempts=0;skipped=$true;reason='订单与赠品数据无变化'}
+        }
+    } else {
+        $eligibleCostOrders = if ($null -ne $orderResult) { @($orderResult.new_item_order_nos) } else { @() }
+        $stage = Invoke-WithRetry 'cost_snapshot' { Invoke-CostSnapshotRebuild $eligibleCostOrders } 3
+        $costResult = $stage.value
+        $null = Invoke-WithRetry 'formula_verification' {
+            Assert-FormulaRange '订单汇总' 'E2:E2001,K2:L2001'
+            Assert-FormulaRange '订单商品' 'E2:E4001,K2:K4001,P2:P4001'
+            Assert-FormulaRange '库存快照' 'H2:I2000,K2:K2000,M2:M2000'
+            Assert-FormulaRange '补货记录' 'D2:E1001,G2:G1001'
+            Assert-FormulaRange '驾驶舱' 'C2:C19'
+            return 'success'
+        } 3
 
-    $stage = Invoke-WithRetry 'daily_ledger' { Invoke-DailyLedgerSync } 3
-    $ledgerResult = $stage.value
-    # 飞书不提供跨工作簿原生事务，因此在提交前做一次全账交叉核对。
-    # 任一重复、漏单、干预单泄漏、配送费丢失或利润算术错误都会触发整批回滚。
-    $stage = Invoke-WithRetry 'integrity_audit' { Invoke-FinanceIntegrityAudit } 2
-    $integrityAuditResult = $stage.value
+        $stage = Invoke-WithRetry 'daily_ledger' { Invoke-DailyLedgerSync } 3
+        $ledgerResult = $stage.value
+        # 飞书不提供跨工作簿原生事务，因此在提交前做一次全账交叉核对。
+        # 任一重复、漏单、干预单泄漏、配送费丢失或利润算术错误都会触发整批回滚。
+        $stage = Invoke-WithRetry 'integrity_audit' { Invoke-FinanceIntegrityAudit } 2
+        $integrityAuditResult = $stage.value
+    }
     # 当日利润与推广费是账目提交条件；通知卡片中的库存、临期和提醒信息不是。
     # 先完成关键财务回读，避免纯通知读取故障把已通过完整性审计的整套账目回滚。
     $stage = Invoke-WithRetry 'daily_profit_readback' { Get-DailyNetProfit } 3
@@ -1416,6 +1444,11 @@ try {
         sync_skipped = [bool]$SkipSync
         date = $dateText
         mode = $Mode
+        fast_path = [ordered]@{
+            used = [bool]$useNoChangeFastPath
+            reason = if ($useNoChangeFastPath) { '订单与赠品数据无变化，已跳过成本重建、全量公式校验、每日简账刷新和完整性全量审计' } else { $null }
+            skipped_stages = if ($useNoChangeFastPath) { @('cost_snapshot','formula_verification','daily_ledger','integrity_audit') } else { @() }
+        }
         sent = [bool]$sendResult.sent
         dry_run = [bool]$sendResult.dry_run
         preflight = $preflightResult
@@ -1435,7 +1468,7 @@ try {
         restore_inventory_count = @($snapshot.restore_inventory).Count
         pending_delivery_count = @($snapshot.pending_delivery).Count
         pending_cost_count = @($snapshot.pending_cost).Count
-        formula_verification = 'success'
+        formula_verification = if ($useNoChangeFastPath) { 'skipped_no_change' } else { 'success' }
         message_format = $sendResult.format
         card_error = $sendResult.card_error
         warnings = @($syncWarnings)

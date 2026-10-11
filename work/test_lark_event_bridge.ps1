@@ -55,6 +55,7 @@ if ($longPurposeKey.Length -gt 50 -or -not $longPurposeKey.StartsWith('petstar-c
 
 $testStateRoot = Join-Path $env:TEMP ("petstar-confirmation-test-" + [guid]::NewGuid().ToString('N'))
 $null = New-Item -ItemType Directory -Path $testStateRoot
+$stateRoot = $testStateRoot
 $pendingConfirmationsPath = Join-Path $testStateRoot 'pending.json'
 $pendingAcknowledgementsPath = Join-Path $testStateRoot 'pending_ack.json'
 $handledMessagesLog = Join-Path $testStateRoot 'handled.ndjson'
@@ -73,6 +74,7 @@ if ($flushedAck.sent -ne 1 -or $flushedAck.failed -ne 0 -or @(Read-PendingAcknow
 $script:testAcks = [Collections.Generic.List[string]]::new()
 $script:testCalls = [Collections.Generic.List[object]]::new()
 $script:testCodexCalls = [Collections.Generic.List[object]]::new()
+$script:testBatchCalls = [Collections.Generic.List[object]]::new()
 $script:failNextAction = ''
 $script:testCostRebuildCalls = 0
 $script:previewMode = $false
@@ -139,6 +141,13 @@ function Invoke-PetstarCodex([string]$Text, [string]$MessageId, [string]$Mode = 
         $fee = if ($Text -match '改成8') { 8 } else { 6.5 }
         $actions = @(New-TestCodexAction 'SetOrderDeliveryFee' @{date='2026-09-12';order_no='3402294850565247821';amount=$fee})
         $reply = "📝 待确认：配送费改为 $fee 元。"
+    } elseif ($Text -match '批量SKU维护测试') {
+        $actions = @(
+            (New-TestCodexAction 'Replenishment' @{date='2026-09-13';goods_code='kw1104';quantity=2;purchase_amount=20;note='批量测试补货'}),
+            (New-TestCodexAction 'SetSkuCost' @{date='2026-09-13';goods_code='kw1109';amount=1.25;note='批量测试成本'}),
+            (New-TestCodexAction 'Replenishment' @{date='2026-09-13';goods_code='kw1113';quantity=3;purchase_amount=0;note='批量测试零成本补货'})
+        )
+        $reply = '📝 待确认：批量登记两笔补货和一笔普通成本修改。'
     } elseif ($Text -match 'kw1113') {
         $actions = @(New-TestCodexAction 'Replenishment' @{date='2026-09-13';goods_code='kw1113';quantity=12;purchase_amount=0;production_date='2026-08-26';shelf_life_value=18;shelf_life_unit='月';note='试吃装，成本为0'})
         $reply = '📝 待确认：登记 kw1113 零成本试吃装补货。'
@@ -148,6 +157,9 @@ function Invoke-PetstarCodex([string]$Text, [string]$MessageId, [string]$Mode = 
     } elseif ($Text -match 'kw1048.*生产日期') {
         $actions = @(New-TestCodexAction 'SetSkuBatchDate' @{goods_code='kw1048';production_date='2026-08-13';shelf_life_value=12;shelf_life_unit='月'})
         $reply = '📝 待确认：更新 kw1048 批次日期。'
+    } elseif ($Text -match '历史订单成本修正') {
+        $actions = @(New-TestCodexAction 'SetSkuCost' @{goods_code='kw1109';amount=0;order_no='888888888888888888';note='明确修正指定历史订单成本'})
+        $reply = '📝 待确认：修改 kw1109 成本，并只联动指定历史订单。'
     } elseif ($Text -match 'kw1109.*成本') {
         $actions = @(New-TestCodexAction 'SetSkuCost' @{goods_code='kw1109';amount=0;note='试吃装成本为0'})
         $reply = '📝 待确认：把 kw1109 每个销售单位成本改为0元。'
@@ -176,11 +188,11 @@ function Invoke-PetstarEvent([string[]]$Arguments) {
             $isPendingGift = [string]$map.order_no -eq '999999999999999999'
             [pscustomobject]@{status=$(if($isPendingGift){'pending_order'}else{'matched'});order_no=$map.order_no;daily_order_no=$(if($isPendingGift){'待同步'}else{'美团1号单'});gift_items='kw4189×1';gift_cost=2.1;pending_cost_codes=@();accounting=$(if($isPendingGift){'待匹配'}else{'并入货物成本'})}
         }
-        'Replenishment' { [pscustomobject]@{goods_code=$map.goods_code;package_quantity=[double]$map.quantity;purchase_amount=[double]$map.purchase_amount;payment_amount=$(if($null-ne$map.payment_amount){[double]$map.payment_amount}else{$null});production_date=$map.production_date;expiry_date=$(if($map.goods_code -eq 'kw1113'){'2028-02-26'}else{'2028-02-28'});sku_status=$(if($map.goods_code -eq 'kw1113'){$(if($script:previewMode){'will_create_pending_profile'}else{'created_pending_profile'})}else{'matched'})} }
+        'Replenishment' { [pscustomobject]@{goods_code=$map.goods_code;package_quantity=[double]$map.quantity;purchase_amount=[double]$map.purchase_amount;payment_amount=$(if($null-ne$map.payment_amount){[double]$map.payment_amount}else{$null});after_average_cost=$(if([double]$map.purchase_amount -eq 0){0}else{55});production_date=$map.production_date;expiry_date=$(if($map.goods_code -eq 'kw1113'){'2028-02-26'}else{'2028-02-28'});sku_status=$(if($map.goods_code -eq 'kw1113'){$(if($script:previewMode){'will_create_pending_profile'}else{'created_pending_profile'})}else{'matched'})} }
         'ChangeSkuCode' { [pscustomobject]@{status='ready';old_code=$map.goods_code;new_code=$map.new_goods_code} }
         'SetOrderDeliveryFee' { [pscustomobject]@{order_no=$map.order_no;order_type='自然单';date='2026-09-12';daily_order_no='美团2号单';old_delivery_fee=0;delivery_fee=$amount} }
         'SetSkuBatchDate' { [pscustomobject]@{goods_code=$map.goods_code;production_date=$map.production_date;shelf_life="$($map.shelf_life_value)$($map.shelf_life_unit)";expiry_date='2027-08-13'} }
-        'SetSkuCost' { [pscustomobject]@{sheet='SKU成本主表';row=19;range='E19,J19,M19:N19';goods_code=$map.goods_code;title='测试试吃装';old_baseline_cost=3.5;old_moving_average_cost=3.5;new_unit_cost=[double]$map.amount;new_moving_average_cost=[double]$map.amount;old_status='待人工核对';new_status='用户确认';affected_tables=@('SKU成本主表','订单商品','订单汇总','9月收入','驾驶舱')} }
+        'SetSkuCost' { [pscustomobject]@{sheet='SKU成本主表';row=19;range='F19:G19,K19,M19:O19';goods_code=$map.goods_code;title='测试试吃装';old_baseline_cost=3.5;old_moving_average_cost=3.5;new_unit_cost=[double]$map.amount;new_moving_average_cost=[double]$map.amount;old_status='待人工核对';new_status='用户确认';historical_order_no=$map.order_no;affected_tables=$(if($map.order_no){@('SKU成本主表','指定订单的订单商品','订单汇总','9月收入','驾驶舱')}else{@('SKU成本主表')})} }
         default { [pscustomobject]@{} }
     }
     if ($script:previewMode) {
@@ -189,6 +201,22 @@ function Invoke-PetstarEvent([string[]]$Arguments) {
         $script:testCalls.Add([pscustomobject]@{action=$action;arguments=$map})
     }
     return [pscustomobject]@{ok=$true;duplicate=$false;result=$result}
+}
+
+function Invoke-PetstarBatchSkuMaintenance($StoredOperations, $Event, [int]$StartIndex, [switch]$Preview) {
+    $items = @($StoredOperations)
+    $script:testBatchCalls.Add([pscustomobject]@{count=$items.Count;start_index=$StartIndex;actions=@($items.action);preview=[bool]$Preview})
+    $executed = [Collections.Generic.List[object]]::new()
+    foreach ($stored in $items) {
+        $args = $stored.arguments
+        $details = if ([string]$stored.action -eq 'Replenishment') {
+            [pscustomobject]@{row=80+$executed.Count;goods_code=$args.goods_code;package_quantity=[double]$args.quantity;purchase_amount=[double]$args.purchase_amount;after_average_cost=$(if([double]$args.purchase_amount-eq 0){0}else{10});sku_status=$(if($Preview -and $args.goods_code -eq 'kw1113'){'will_create_pending_profile'}else{'matched'})}
+        } else {
+            [pscustomobject]@{sheet='SKU成本主表';row=19;goods_code=$args.goods_code;old_baseline_cost=3.5;new_unit_cost=[double]$args.amount;new_moving_average_cost=[double]$args.amount;historical_order_no=$null}
+        }
+        $executed.Add([pscustomobject]@{action=[string]$stored.action;arguments=$args;result=$details;formula_verification='success';duplicate=$false})
+    }
+    return $executed.ToArray()
 }
 
 $script:previewMode = $true
@@ -272,6 +300,18 @@ try {
     $zeroCostCall = @($script:testCalls | Where-Object action -eq 'Replenishment')[-1]
     if (-not $zeroCostCall -or [double]$zeroCostCall.arguments.purchase_amount -ne 0 -or [double]$zeroCostCall.arguments.quantity -ne 12 -or $zeroCostConfirm.ack -notmatch '待平台同步') { throw "零成本新SKU补货确认执行失败：ack=$($zeroCostConfirm.ack) call=$($zeroCostCall|ConvertTo-Json -Compress -Depth 6)" }
 
+    $script:testCalls.Clear()
+    $script:testBatchCalls.Clear()
+    $batchSkuDraft = Invoke-TestMessage 'draft-batch-sku-maintenance' '批量SKU维护测试'
+    if ($batchSkuDraft.ack -notmatch '待确认' -or $batchSkuDraft.ack -notmatch '不会重算历史订单' -or $script:testBatchCalls.Count -ne 1 -or -not [bool]$script:testBatchCalls[0].preview -or [int]$script:testBatchCalls[0].count -ne 3 -or $script:testCalls.Count -ne 0) {
+        throw "批量 SKU 维护预览没有一次处理全部兼容动作：ack=$($batchSkuDraft.ack) batch=$($script:testBatchCalls|ConvertTo-Json -Compress -Depth 8) single=$($script:testCalls.Count)"
+    }
+    $batchSkuConfirm = Invoke-TestMessage 'confirm-batch-sku-maintenance' '确认'
+    $executionBatchCalls = @($script:testBatchCalls | Where-Object { -not [bool]$_.preview })
+    if ($script:testBatchCalls.Count -ne 2 -or $executionBatchCalls.Count -ne 1 -or [int]$executionBatchCalls[0].count -ne 3 -or $script:testCalls.Count -ne 0 -or $batchSkuConfirm.ack -notmatch '补货记录第' -or $batchSkuConfirm.ack -notmatch '未修改历史订单或经营简账') {
+        throw "批量 SKU 维护没有一次执行全部兼容动作：ack=$($batchSkuConfirm.ack) batch=$($script:testBatchCalls|ConvertTo-Json -Compress -Depth 8) single=$($script:testCalls.Count)"
+    }
+
     $codexQuestion = Invoke-TestMessage 'codex-question' '你现在用什么方式理解我的话？'
     if (-not $codexQuestion.ok -or $codexQuestion.ack -notmatch '本机 Codex 正常回答') { throw 'Codex 普通对话回退失败' }
 
@@ -284,10 +324,17 @@ try {
 
     $script:testCalls.Clear()
     $costDraft = Invoke-TestMessage 'draft-sku-cost' '把kw1109的销售单位成本改成0元，这是试吃装'
-    if ($costDraft.ack -notmatch 'SKU成本主表第19行' -or $costDraft.ack -notmatch '¥3.5 → ¥0' -or $costDraft.ack -notmatch '订单商品' -or $script:testCalls.Count -ne 0) { throw "SKU成本明确预览失败：$($costDraft.ack)" }
+    if ($costDraft.ack -notmatch 'SKU成本主表第19行' -or $costDraft.ack -notmatch '¥3.5 → ¥0' -or $costDraft.ack -match '订单商品' -or $costDraft.ack -notmatch '不会自动重算历史订单' -or $script:testCalls.Count -ne 0) { throw "普通SKU成本修改错误联动历史订单：$($costDraft.ack)" }
     $costConfirm = Invoke-TestMessage 'confirm-sku-cost' '确认'
     $costCall = @($script:testCalls | Where-Object action -eq 'SetSkuCost')[-1]
-    if (-not $costCall -or [double]$costCall.arguments.amount -ne 0 -or $costConfirm.ack -notmatch 'SKU成本主表第19行' -or $costConfirm.ack -notmatch '移动平均成本现为') { throw "SKU成本确认执行失败：$($costConfirm.ack)" }
+    if (-not $costCall -or [double]$costCall.arguments.amount -ne 0 -or $costCall.arguments.order_no -or $costConfirm.ack -notmatch 'SKU成本主表第19行' -or $costConfirm.ack -notmatch '未修改历史订单') { throw "普通SKU成本确认错误联动历史订单：$($costConfirm.ack)" }
+
+    $script:testCalls.Clear()
+    $targetedCostDraft = Invoke-TestMessage 'draft-targeted-order-cost' '历史订单成本修正：订单888888888888888888的kw1109成本改成0元'
+    if ($targetedCostDraft.ack -notmatch '明确联动历史订单：888888888888888888' -or $targetedCostDraft.ack -notmatch '指定订单的订单商品' -or $script:testCalls.Count -ne 0) { throw "指定历史订单成本预览失败：$($targetedCostDraft.ack)" }
+    $targetedCostConfirm = Invoke-TestMessage 'confirm-targeted-order-cost' '确认'
+    $targetedCostCall = @($script:testCalls | Where-Object action -eq 'SetSkuCost')[-1]
+    if (-not $targetedCostCall -or $targetedCostCall.arguments.order_no -ne '888888888888888888' -or $targetedCostConfirm.ack -notmatch '已按明确要求更新订单 888888888888888888') { throw "指定历史订单成本确认失败：$($targetedCostConfirm.ack)" }
 
     $script:testCalls.Clear()
     $failureDraft = Invoke-TestMessage 'draft-confirmation-failure' '昨天3402294620217435837是干预单，补单人爸爸，我自己送，没有配送费，库存已恢复'
@@ -316,7 +363,7 @@ try {
     if ((Read-PendingConfirmation) -or @($script:testCalls | Where-Object action -eq 'SetSkuCost').Count -ne 1) { throw '第二项待确认没有按队列执行' }
 
     if (@($script:testCodexCalls | Where-Object {$_.text -match '3402294620217435837'}).Count -eq 0) { throw '干预单自然语言没有经过 Codex' }
-    [ordered]@{ok=$true;command_json='multiline-supported';ack_idempotency='max-50';ack_outbox='queue-and-retry';routing='codex-first';manual_sync='codex-dispatched';intervention='preview-confirm';intervention_correction='remove-add-atomic';non_executable_reply='not-pending';confirmation_execution='stored-plan-no-reparse';confirmation_failure='atomic-rollback-and-full-retry';delivery_fee='preview-amend-confirm';batch_date='calculated-preview-cancel';zero_cost_new_sku='preview-confirm';codex_question='direct-reply';pending_gift='preview-confirm-auto-match';sku_cost='explicit-preview-confirm';pending_queue='fifo-preserved'} | ConvertTo-Json -Depth 5
+    [ordered]@{ok=$true;command_json='multiline-supported';ack_idempotency='max-50';ack_outbox='queue-and-retry';routing='codex-first';manual_sync='codex-dispatched';intervention='preview-confirm';intervention_correction='remove-add-atomic';non_executable_reply='not-pending';confirmation_execution='stored-plan-no-reparse';confirmation_failure='atomic-rollback-and-full-retry';delivery_fee='preview-amend-confirm';batch_date='calculated-preview-cancel';zero_cost_new_sku='preview-confirm';codex_question='direct-reply';pending_gift='preview-confirm-auto-match';sku_cost='explicit-preview-confirm';batch_sku_maintenance='preview-and-execute-single-call';pending_queue='fifo-preserved'} | ConvertTo-Json -Depth 5
 } finally {
     if (Test-Path -LiteralPath $testStateRoot) { Remove-Item -LiteralPath $testStateRoot -Recurse -Force }
 }
