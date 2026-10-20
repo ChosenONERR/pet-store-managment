@@ -91,6 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--silent", action="store_true")
     sync.add_argument("--dry-run", action="store_true")
     sync.add_argument("--force-resend", action="store_true")
+    sync.add_argument("--full-rebuild", action="store_true", help="强制执行全量成本、简账和完整性流程")
 
     event = subparsers.add_parser("event", help="录入一条结构化经营事件")
     event.add_argument(
@@ -168,6 +169,7 @@ def main() -> int:
                 ("Silent", args.silent, True),
                 ("DryRun", args.dry_run, True),
                 ("ForceResend", args.force_resend, True),
+                ("FullRebuild", args.full_rebuild, True),
                 ("ProjectRoot", PROJECT_ROOT, False),
             ],
         )

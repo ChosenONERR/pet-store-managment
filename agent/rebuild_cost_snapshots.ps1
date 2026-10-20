@@ -1,6 +1,7 @@
 ﻿param(
     [string]$ProjectRoot,
-    [string[]]$EligibleOrderNumbers = @()
+    [string[]]$EligibleOrderNumbers = @(),
+    [switch]$Incremental
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,6 +21,9 @@ $skuSchema = Get-SkuMasterSchema -SpreadsheetToken $token
 $eligibleOrderSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($eligibleOrderNo in @($EligibleOrderNumbers)) {
     if ($eligibleOrderNo) { $null = $eligibleOrderSet.Add(([string]$eligibleOrderNo).Trim()) }
+}
+if ($Incremental -and $eligibleOrderSet.Count -eq 0) {
+    throw '增量成本刷新必须提供至少一个新订单号'
 }
 $stateRoot = Join-Path $ProjectRoot 'agent\state'
 $script:financeTransaction = Join-FinanceTransaction $stateRoot
@@ -412,7 +416,7 @@ foreach ($gift in $giftEvents) {
 
 $normalizedGiftCostRows = @($giftEvents | Where-Object { $null -ne $_.gift_cost -and $_.cost_status -ne '成本待核对' })
 $resolvedGiftCostRows = @($giftEvents | Where-Object { $_.resolved_from_master })
-foreach ($gift in $normalizedGiftCostRows) {
+foreach ($gift in @($normalizedGiftCostRows | Where-Object { -not $Incremental })) {
     $cleanNote = [string]$gift.note
     if($gift.resolved_from_master){
         $cleanNoteParts = @([regex]::Split([string]$gift.note, '[；;]') | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notmatch '^赠品成本待核对(?:[:：]|$)' })
@@ -479,20 +483,29 @@ foreach ($item in $itemOutputs) {
     }
 }
 
-Clear-Range '订单商品!L2:N4001'
 $itemCostMatrix = @()
 $itemByRow = @{}
 foreach ($item in $itemOutputs) { $itemByRow[[int]$item.row] = $item }
 $lastItemRow = if ($itemOutputs.Count -gt 0) { [int](($itemOutputs | Measure-Object -Property row -Maximum).Maximum) } else { 1 }
-for ($sheetRow=2; $sheetRow -le $lastItemRow; $sheetRow++) {
-    if ($itemByRow.ContainsKey($sheetRow)) {
-        $item = $itemByRow[$sheetRow]
-        $itemCostMatrix += ,@((New-UnitCostCell $item.unit_cost),(New-OverwriteCell $item.item_cost),(New-OverwriteCell $item.margin))
-    } else {
-        $itemCostMatrix += ,@((New-OverwriteCell $null),(New-OverwriteCell $null),(New-OverwriteCell $null))
+if ($Incremental) {
+    foreach ($item in @($itemOutputs | Where-Object { $eligibleOrderSet.Contains([string]$_.order_no) } | Sort-Object row)) {
+        $itemCostUpdate = @(); $itemCostUpdate += ,@(
+            (New-UnitCostCell $item.unit_cost),(New-OverwriteCell $item.item_cost),(New-OverwriteCell $item.margin)
+        )
+        Set-CellMatrix '订单商品' "L$($item.row):N$($item.row)" $itemCostUpdate
     }
+} else {
+    Clear-Range '订单商品!L2:N4001'
+    for ($sheetRow=2; $sheetRow -le $lastItemRow; $sheetRow++) {
+        if ($itemByRow.ContainsKey($sheetRow)) {
+            $item = $itemByRow[$sheetRow]
+            $itemCostMatrix += ,@((New-UnitCostCell $item.unit_cost),(New-OverwriteCell $item.item_cost),(New-OverwriteCell $item.margin))
+        } else {
+            $itemCostMatrix += ,@((New-OverwriteCell $null),(New-OverwriteCell $null),(New-OverwriteCell $null))
+        }
+    }
+    if ($itemCostMatrix.Count -gt 0) { Set-CellMatrix '订单商品' "L2:N$lastItemRow" $itemCostMatrix }
 }
-if ($itemCostMatrix.Count -gt 0) { Set-CellMatrix '订单商品' "L2:N$lastItemRow" $itemCostMatrix }
 
 $masterUpdate = @()
 $lastMasterIndex = -1
@@ -517,14 +530,30 @@ for ($i=0; $i -le $lastMasterIndex; $i++) {
         )
     }
 }
-if ($masterUpdate.Count -gt 0) {
+if ($Incremental) {
+    $affectedCanonical = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($item in @($itemOutputs | Where-Object { $eligibleOrderSet.Contains([string]$_.order_no) -and $_.canonical })) {
+        $null = $affectedCanonical.Add([string]$item.canonical)
+    }
+    foreach ($canonical in $affectedCanonical) {
+        if (-not $states.ContainsKey($canonical) -or -not $masterRowByCanonical.ContainsKey($canonical)) { continue }
+        $state = $states[$canonical]
+        $masterRow = [int]$masterRowByCanonical[$canonical]
+        $fg = @(); $fg += ,@((New-UnitCostCell $state.avg),(New-OverwriteCell $state.qty))
+        $l = @(); $l += ,@((New-OverwriteCell (Convert-ToExcelSerial ([datetime]::Now))))
+        $fgRange = "$($skuSchema.MovingAverageCost.Column)${masterRow}:$($skuSchema.CostBookQuantity.Column)${masterRow}"
+        $lastUpdateRange = "$($skuSchema.LastCostUpdate.Column)${masterRow}:$($skuSchema.LastCostUpdate.Column)${masterRow}"
+        Set-CellMatrix 'SKU成本主表' $fgRange $fg
+        Set-CellMatrix 'SKU成本主表' $lastUpdateRange $l
+    }
+} elseif ($masterUpdate.Count -gt 0) {
     $fg = @(); $l = @()
     foreach ($row in $masterUpdate) { $fg += ,@($row[0],$row[1]); $l += ,@($row[2]) }
     Set-CellMatrix 'SKU成本主表' "$($skuSchema.MovingAverageCost.Column)2:$($skuSchema.CostBookQuantity.Column)$lastMasterRow" $fg
     Set-CellMatrix 'SKU成本主表' "$($skuSchema.LastCostUpdate.Column)2:$($skuSchema.LastCostUpdate.Column)$lastMasterRow" $l
 }
 
-if ($replenishments.Count -gt 0) {
+if (-not $Incremental -and $replenishments.Count -gt 0) {
     foreach ($purchase in $replenishments) {
         $replenishmentSnapshot = @(); $replenishmentSnapshot += ,@(
             (New-OverwriteCell $purchase.before_qty),(New-OverwriteCell $purchase.before_avg),
@@ -537,12 +566,27 @@ if ($replenishments.Count -gt 0) {
 $summaryRows = Get-SheetRows '订单汇总' 'A2:P2001'
 $summaryCount = @($summaryRows | Where-Object { Get-CellValue $_ 2 }).Count
 $summaryK=@();$summaryL=@()
+$incrementalSummaryRows = [Collections.Generic.List[int]]::new()
 for ($row=2; $row -le 2001; $row++) {
-    $summaryK += ,@((New-FormulaCell "=IF(C$row=`"`",`"`",IF(COUNTIFS('订单商品'!`$C`$2:`$C`$4001,C$row,'订单商品'!`$E`$2:`$E`$4001,`"自然`",'订单商品'!`$L`$2:`$L`$4001,`"`")+IF(E$row=`"自然`",COUNTIFS('赠品记录'!`$D`$2:`$D`$2001,C$row,'赠品记录'!`$I`$2:`$I`$2001,`"成本待核对`",'赠品记录'!`$C`$2:`$C`$2001,`"<>待同步`",'赠品记录'!`$C`$2:`$C`$2001,`"<>订单已取消待处理`"),0)>0,`"`",SUMIFS('订单商品'!`$M`$2:`$M`$4001,'订单商品'!`$C`$2:`$C`$4001,C$row)+IF(E$row=`"自然`",SUMIFS('赠品记录'!`$H`$2:`$H`$2001,'赠品记录'!`$D`$2:`$D`$2001,C$row,'赠品记录'!`$C`$2:`$C`$2001,`"<>待同步`",'赠品记录'!`$C`$2:`$C`$2001,`"<>订单已取消待处理`"),0)))"))
-    $summaryL += ,@((New-FormulaCell "=IF(C$row=`"`",`"`",IF(K$row=`"`",`"`",IFERROR(H$row*1,0)-IFERROR(K$row*1,0)-IFERROR(J$row*1,0)))"))
+    $kCell = New-FormulaCell "=IF(C$row=`"`",`"`",IF(COUNTIFS('订单商品'!`$C`$2:`$C`$4001,C$row,'订单商品'!`$E`$2:`$E`$4001,`"自然`",'订单商品'!`$L`$2:`$L`$4001,`"`")+IF(E$row=`"自然`",COUNTIFS('赠品记录'!`$D`$2:`$D`$2001,C$row,'赠品记录'!`$I`$2:`$I`$2001,`"成本待核对`",'赠品记录'!`$C`$2:`$C`$2001,`"<>待同步`",'赠品记录'!`$C`$2:`$C`$2001,`"<>订单已取消待处理`"),0)>0,`"`",SUMIFS('订单商品'!`$M`$2:`$M`$4001,'订单商品'!`$C`$2:`$C`$4001,C$row)+IF(E$row=`"自然`",SUMIFS('赠品记录'!`$H`$2:`$H`$2001,'赠品记录'!`$D`$2:`$D`$2001,C$row,'赠品记录'!`$C`$2:`$C`$2001,`"<>待同步`",'赠品记录'!`$C`$2:`$C`$2001,`"<>订单已取消待处理`"),0)))"
+    $lCell = New-FormulaCell "=IF(C$row=`"`",`"`",IF(K$row=`"`",`"`",IFERROR(H$row*1,0)-IFERROR(K$row*1,0)-IFERROR(J$row*1,0)))"
+    if ($Incremental) {
+        $summaryIndex = $row - 2
+        $summaryOrderNo = if ($summaryIndex -lt $summaryRows.Count) { Get-CellValue $summaryRows[$summaryIndex] 2 } else { $null }
+        if ($summaryOrderNo -and $eligibleOrderSet.Contains([string]$summaryOrderNo)) {
+            $formulaUpdate = @(); $formulaUpdate += ,@($kCell,$lCell)
+            Set-CellMatrix '订单汇总' "K${row}:L${row}" $formulaUpdate
+            $incrementalSummaryRows.Add($row)
+        }
+    } else {
+        $summaryK += ,@($kCell)
+        $summaryL += ,@($lCell)
+    }
 }
-Set-CellMatrix '订单汇总' 'K2:K2001' $summaryK
-Set-CellMatrix '订单汇总' 'L2:L2001' $summaryL
+if (-not $Incremental) {
+    Set-CellMatrix '订单汇总' 'K2:K2001' $summaryK
+    Set-CellMatrix '订单汇总' 'L2:L2001' $summaryL
+}
 
 Assert-FormulaRange '订单汇总' 'E2:E2001,K2:L2001'
 Assert-FormulaRange '订单商品' 'E2:E4001,K2:K4001,P2:P4001'
@@ -577,6 +621,9 @@ $finalResult = [ordered]@{
     gift_inventory_deductions=@($giftEvents | Where-Object { $_.canonical }).Count
     gift_cost_rows_resolved=$resolvedGiftCostRows.Count
     gift_pending_cost_orders=$pendingGiftCostByOrder.Count
+    mode=$(if($Incremental){'incremental'}else{'full'})
+    incremental_item_rows=$(if($Incremental){@($itemOutputs | Where-Object { $eligibleOrderSet.Contains([string]$_.order_no) } | ForEach-Object { [int]$_.row })}else{@()})
+    incremental_summary_rows=$(if($Incremental){@($incrementalSummaryRows)}else{@()})
 }
 Close-CostTransaction $true
 $finalResult | ConvertTo-Json -Compress

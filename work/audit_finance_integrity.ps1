@@ -101,7 +101,7 @@ foreach ($row in $interventionRows) {
 $incomeByOrder = @{}
 $duplicateIncomeOrders = @()
 $incomeSourceMismatch = @()
-$preservedManualDelivery = @()
+$unmigratedManualDelivery = @()
 $interventionLeak = @()
 $arithmeticErrors = @()
 $sortErrors = @()
@@ -118,10 +118,10 @@ foreach ($row in $incomeRows) {
             $sourceValue = To-Number (Get-CellValue $source $pair[2])
             if ($null -eq $ledgerValue) { $ledgerValue = 0.0 }
             if ($null -eq $sourceValue) { $sourceValue = 0.0 }
-            # 美团源表可能无法识别外部骑手费，值会是 0；收入表中的正数是店主人工补录，
-            # 同步脚本应保留该覆盖值，不能把它误报为源表不一致。
+            # 人工配送费必须回写订单汇总并带来源标记。若只存在月度收入表，
+            # 驾驶舱会漏扣该费用，因此它是阻断性数据分叉，不再视为合法覆盖。
             if ($pair[0] -eq 'delivery' -and [math]::Abs($sourceValue) -lt 0.000001 -and $ledgerValue -gt 0) {
-                $preservedManualDelivery += "$orderNo|$ledgerValue"
+                $unmigratedManualDelivery += "$orderNo|$ledgerValue"
                 continue
             }
             if ([math]::Abs($ledgerValue-$sourceValue) -gt 0.02) { $incomeSourceMismatch += "$orderNo|$($pair[0])|$ledgerValue|$sourceValue" }
@@ -173,7 +173,7 @@ foreach ($orderNo in $interventionSet.Keys) {
 }
 
 [ordered]@{
-    ok = ($duplicateSourceOrders.Count -eq 0 -and $duplicateIncomeOrders.Count -eq 0 -and $incomeSourceMismatch.Count -eq 0 -and $interventionLeak.Count -eq 0 -and $arithmeticErrors.Count -eq 0 -and $sortErrors.Count -eq 0 -and $missingNaturalOrders.Count -eq 0 -and $expensePairErrors.Count -eq 0 -and $orderItemQuantityMismatches.Count -eq 0)
+    ok = ($duplicateSourceOrders.Count -eq 0 -and $duplicateIncomeOrders.Count -eq 0 -and $incomeSourceMismatch.Count -eq 0 -and $unmigratedManualDelivery.Count -eq 0 -and $interventionLeak.Count -eq 0 -and $arithmeticErrors.Count -eq 0 -and $sortErrors.Count -eq 0 -and $missingNaturalOrders.Count -eq 0 -and $expensePairErrors.Count -eq 0 -and $orderItemQuantityMismatches.Count -eq 0)
     source_orders = $sourceByOrder.Count
     income_orders = $incomeByOrder.Count
     intervention_orders = $interventionSet.Count
@@ -182,7 +182,7 @@ foreach ($orderNo in $interventionSet.Keys) {
     duplicate_source_orders = $duplicateSourceOrders
     duplicate_income_orders = $duplicateIncomeOrders
     income_source_mismatches = $incomeSourceMismatch
-    preserved_manual_delivery_fees = $preservedManualDelivery
+    unmigrated_manual_delivery_fees = $unmigratedManualDelivery
     intervention_orders_in_income = $interventionLeak
     profit_arithmetic_errors = $arithmeticErrors
     income_sort_errors = $sortErrors

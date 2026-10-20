@@ -518,7 +518,9 @@ foreach ($monthSheet in $monthSheets) {
         }
         $delivery = Convert-ToNullableNumber (Get-CellValue $row $(if ($isOffline) { 4 } else { 9 }))
         $old = if ($entry.order_no -and $oldIncomeByOrder.ContainsKey($entry.order_no)) { $oldIncomeByOrder[$entry.order_no] } else { $null }
-        if (($null -eq $delivery -or [math]::Abs($delivery) -lt 0.000001) -and $null -ne $old -and $null -ne $old.delivery -and $old.delivery -gt 0) { $delivery = $old.delivery }
+        if (($null -eq $delivery -or [math]::Abs($delivery) -lt 0.000001) -and $null -ne $old -and $null -ne $old.delivery -and $old.delivery -gt 0) {
+            throw "配送费来源分叉：订单 $($entry.order_no) 的月度收入表为 $($old.delivery) 元，但订单汇总为0；请先运行 work\reconcile_manual_delivery_fees.ps1，禁止驾驶舱继续漏扣费用"
+        }
         if ($null -eq $delivery) { $delivery = 0.0 }
         $soldText = if ($isOffline) { Get-CellValue $row 7 } else { '' }
         if (-not $isOffline -and $entry.order_no -and $soldByOrder.ContainsKey($entry.order_no)) {

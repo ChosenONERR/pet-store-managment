@@ -76,6 +76,7 @@ function Get-PetstarWebAccessCheck {
     $userProfile = [Environment]::GetFolderPath('UserProfile')
     $roots = @(
         $env:PETSTAR_WEB_ACCESS_CHECK,
+        (Join-Path $PSScriptRoot 'check_meituan_browser.mjs'),
         (Join-Path $userProfile '.agents\skills\web-access\scripts\check-deps.mjs'),
         (Join-Path $userProfile '.codex\skills\web-access\scripts\check-deps.mjs')
     )
