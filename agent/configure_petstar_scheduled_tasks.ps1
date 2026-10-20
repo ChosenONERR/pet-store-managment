@@ -27,7 +27,7 @@ if (-not $Apply) {
     exit 0
 }
 
-$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 35) -MultipleInstances IgnoreNew
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 60) -MultipleInstances IgnoreNew
 $installed = [Collections.Generic.List[object]]::new()
 $watchdogAction = New-ScheduledTaskAction -Execute $wscript -Argument ('//B //Nologo "{0}"' -f $watchdogLauncher)
 $watchdogTrigger = New-ScheduledTaskTrigger -Once -At ([datetime]::Now.AddMinutes(1)) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
@@ -46,4 +46,14 @@ foreach ($spec in $specs) {
     $installed.Add([ordered]@{name=$spec.Name;state=[string]$actual.State;job=$spec.Job;at=$spec.At})
 }
 
-[ordered]@{ok=$true;dry_run=$false;launcher=$launcher;watchdog_launcher=$watchdogLauncher;tasks=@($installed);legacy_hermes_scheduler_disabled=$false} | ConvertTo-Json -Depth 5
+$legacyHermesDisabled = $false
+$legacyJobsPath = Join-Path $env:LOCALAPPDATA 'hermes\profiles\viral-video-analyzer\cron\jobs.json'
+if (Test-Path -LiteralPath $legacyJobsPath -PathType Leaf) {
+    try {
+        $legacyJobNames = @('petstar-hourly-sync','petstar-night-sync','petstar-input-reminder','petstar-night-recovery','petstar-promotion-expense')
+        $legacyJobs = @(([IO.File]::ReadAllText($legacyJobsPath,[Text.Encoding]::UTF8) | ConvertFrom-Json).jobs | Where-Object { $_.name -in $legacyJobNames })
+        $legacyHermesDisabled = ($legacyJobs.Count -eq $legacyJobNames.Count -and @($legacyJobs | Where-Object enabled).Count -eq 0)
+    } catch {}
+}
+
+[ordered]@{ok=$true;dry_run=$false;launcher=$launcher;watchdog_launcher=$watchdogLauncher;tasks=@($installed);legacy_hermes_scheduler_disabled=$legacyHermesDisabled} | ConvertTo-Json -Depth 5

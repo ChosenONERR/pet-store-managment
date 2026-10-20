@@ -13,9 +13,12 @@ scriptPath = fso.BuildPath(agentRoot, "run_scheduled_job.ps1")
 command = Quote(powershellExe) & " -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File " & _
           Quote(scriptPath) & " -Job " & Quote(job) & " -ProjectRoot " & Quote(projectRoot)
 
-shell.Run command, 0, False
+' Keep the window hidden, but wait for the PowerShell child so Task Scheduler
+' records the real exit code and applies its execution limit to the real job.
+Dim exitCode
+exitCode = shell.Run(command, 0, True)
+WScript.Quit exitCode
 
 Function Quote(ByVal value)
     Quote = Chr(34) & value & Chr(34)
 End Function
-
