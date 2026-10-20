@@ -13,6 +13,7 @@ $runtimePowerShellFiles += @(Get-ChildItem -LiteralPath $agentRoot -Filter '*.ps
 $runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\sync_meituan_orders.ps1')
 $runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\sync_meituan_inventory.ps1')
 $runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\reconcile_manual_delivery_fees.ps1')
+$runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\repair_dashboard_offline_formulas.ps1')
 $runtimePowerShellFiles += @(Get-ChildItem -LiteralPath (Join-Path $projectRoot 'work') -Filter 'test_*.ps1' -File)
 
 $parseFailures = [Collections.Generic.List[string]]::new()
@@ -46,6 +47,7 @@ $businessQuery = [IO.File]::ReadAllText((Join-Path $agentRoot 'query_business_da
 $runtimePaths = [IO.File]::ReadAllText((Join-Path $agentRoot 'runtime_paths.ps1'),[Text.Encoding]::UTF8)
 $browserPreflight = [IO.File]::ReadAllText((Join-Path $agentRoot 'check_meituan_browser.mjs'),[Text.Encoding]::UTF8)
 $deliveryReconciliation = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\reconcile_manual_delivery_fees.ps1'),[Text.Encoding]::UTF8)
+$dashboardFormulaRepair = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\repair_dashboard_offline_formulas.ps1'),[Text.Encoding]::UTF8)
 $orderExtractor = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\meituan_order_extract.mjs'),[Text.Encoding]::UTF8)
 $orderSync = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\sync_meituan_orders.ps1'),[Text.Encoding]::UTF8)
 $refundAdjustments = [IO.File]::ReadAllText((Join-Path $agentRoot 'refund_adjustments.ps1'),[Text.Encoding]::UTF8)
@@ -181,6 +183,7 @@ $contracts = [ordered]@{
     runtime_prefers_project_browser_preflight = ($runtimePaths -match 'Join-Path \$PSScriptRoot ''check_meituan_browser\.mjs''')
     manual_delivery_fee_requires_one_authoritative_source = ($ledgerSync -match '配送费来源分叉' -and $integrityAudit -match 'unmigrated_manual_delivery_fees' -and $integrityAudit -notmatch 'preserved_manual_delivery_fees')
     manual_delivery_repair_is_atomic_and_read_back = ($deliveryReconciliation -match 'New-FinanceTransaction' -and $deliveryReconciliation -match 'Register-FinanceRangeBeforeImage' -and $deliveryReconciliation -match 'Invoke-FinanceTransactionRollback' -and $deliveryReconciliation -match '配送费回读订单数量不一致')
+    dashboard_includes_offline_orders_and_matches_ledger = ($dashboardFormulaRepair -match "''线下订单''" -and $dashboardFormulaRepair -match 'dashboard_gross_profit' -and $dashboardFormulaRepair -match 'ledger_profit' -and $dashboardFormulaRepair -match 'Invoke-FinanceTransactionRollback')
     confirmed_writes_wait_for_running_sync = ($financeTransaction -match 'LockTimeoutSeconds' -and $bridge -match 'Invoke-StoredConfirmationOperations \$pending \$executeEvent 5' -and $bridge -match "Mode', 'RetryPending'" -and $bridge -match 'Invoke-StoredConfirmationOperations \$pending \$executeEvent 2700')
     codex_mutation_preview_reuses_first_parse = ($bridge -match 'function New-ConfirmationDraftFromCodexResult' -and $bridge -match 'Reuse them[\s\S]{0,240}New-ConfirmationDraftFromCodexResult')
 }

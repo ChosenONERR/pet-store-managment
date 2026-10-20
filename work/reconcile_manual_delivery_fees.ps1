@@ -114,15 +114,40 @@ foreach ($orderNo in @($ledgerFees.Keys | Sort-Object)) {
     $cleanNote = [regex]::Replace($oldNote,'(?:^|[；;])\s*人工确认配送费：?\s*\d+(?:\.\d+)?\s*元?','').Trim('；',';',' ')
     $newNote = (@($cleanNote,$marker) | Where-Object { $_ }) -join '；'
     if ([math]::Abs($sourceFee-$ledgerFee) -gt 0.001 -or $oldNote -ne $newNote) {
-        $targets.Add([pscustomobject]@{order_no=$orderNo;row_number=[int]$source.row_number;fee=$ledgerFee;note=$newNote;month=$ledgerFees[$orderNo].month})
+        $targets.Add([pscustomobject]@{
+            order_no=$orderNo
+            row_number=[int]$source.row_number
+            fee=$ledgerFee
+            note=$newNote
+            month=$ledgerFees[$orderNo].month
+            fee_changed=([math]::Abs($sourceFee-$ledgerFee) -gt 0.001)
+        })
     }
 }
 
 $totalsByMonth = @($targets | Group-Object month | ForEach-Object {
-    [ordered]@{month=$_.Name;orders=$_.Count;amount=[math]::Round((($_.Group.fee | Measure-Object -Sum).Sum),2)}
+    $feeChanges = @($_.Group | Where-Object fee_changed)
+    [ordered]@{
+        month=$_.Name
+        orders=$_.Count
+        amount=[math]::Round((($_.Group.fee | Measure-Object -Sum).Sum),2)
+        source_fee_updates=$feeChanges.Count
+        source_fee_update_amount=[math]::Round((($feeChanges.fee | Measure-Object -Sum).Sum),2)
+    }
 })
+$feeChangeTargets = @($targets | Where-Object fee_changed)
+$resultSummary = [ordered]@{
+    updates=$targets.Count
+    amount=[math]::Round((($targets.fee | Measure-Object -Sum).Sum),2)
+    source_fee_updates=$feeChangeTargets.Count
+    source_fee_update_amount=[math]::Round((($feeChangeTargets.fee | Measure-Object -Sum).Sum),2)
+    marker_only_updates=($targets.Count-$feeChangeTargets.Count)
+    by_month=$totalsByMonth
+}
 if ($DryRun -or $targets.Count -eq 0) {
-    [ordered]@{ok=$true;dry_run=[bool]$DryRun;updates=$targets.Count;amount=[math]::Round((($targets.fee | Measure-Object -Sum).Sum),2);by_month=$totalsByMonth} | ConvertTo-Json -Depth 6
+    $result = [ordered]@{ok=$true;dry_run=[bool]$DryRun}
+    foreach ($key in $resultSummary.Keys) { $result[$key] = $resultSummary[$key] }
+    $result | ConvertTo-Json -Depth 6
     exit 0
 }
 
@@ -166,7 +191,10 @@ try {
     Complete-FinanceTransaction $transaction
     Close-FinanceTransaction $transaction
     $closed = $true
-    [ordered]@{ok=$true;dry_run=$false;updates=$targets.Count;amount=[math]::Round((($targets.fee | Measure-Object -Sum).Sum),2);by_month=$totalsByMonth;source_protected=$true} | ConvertTo-Json -Depth 6
+    $result = [ordered]@{ok=$true;dry_run=$false}
+    foreach ($key in $resultSummary.Keys) { $result[$key] = $resultSummary[$key] }
+    $result['source_protected'] = $true
+    $result | ConvertTo-Json -Depth 6
 } catch {
     $failure = $_.Exception.Message
     if (-not $closed) {

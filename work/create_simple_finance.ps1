@@ -146,11 +146,11 @@ foreach ($r in $blankRows) { $orderData += ,@($r[0],$r[1],$r[2],$r[3],$r[4],$r[5
 $orderItemData = @()
 for ($i = 0; $i -lt 4000; $i++) { $orderItemData += ,@($null,$null,$null,$null,$null,$null,$null,$null,$null,$null,$null,$null,$null,$null,$null,$null) }
 $dashboardData = @()
-$dashboardData += ,@('经营结果','本月自然订单数',$null,'只统计未标记为干预且未取消的订单',$null,'')
-$dashboardData += ,@('经营结果','本月自然商品销售额',$null,'订单商品小计',$null,'')
-$dashboardData += ,@('经营结果','本月预计结算收入',$null,'订单页商家预计收入，非实际到账',$null,'')
-$dashboardData += ,@('经营结果','本月商品成本',$null,'按货号成本汇总',$null,'')
-$dashboardData += ,@('经营结果','本月经营毛利',$null,'预计结算收入-商品成本-配送费',$null,'')
+$dashboardData += ,@('经营结果','本月自然订单数',$null,'线上自然单与线下订单合计；不含干预单和取消单',$null,'')
+$dashboardData += ,@('经营结果','本月自然商品销售额',$null,'线上商品小计加线下成交收入',$null,'')
+$dashboardData += ,@('经营结果','本月预计结算收入',$null,'线上商家预计收入加线下成交收入，非实际到账',$null,'')
+$dashboardData += ,@('经营结果','本月商品成本',$null,'线上与线下订单货物成本合计',$null,'')
+$dashboardData += ,@('经营结果','本月经营毛利',$null,'线上与线下收入-商品成本-配送费',$null,'')
 $dashboardData += ,@('经营结果','本月经营利润',$null,'经营毛利-其他经营费用-老板人工',$null,'')
 $dashboardData += ,@('经营结果','本月经济利润',$null,'经营利润-市场租金机会成本',$null,'')
 $dashboardData += ,@('现金与库存','本月实际到账',$null,'月底在月度结算补当月这一行',$null,'')
@@ -259,11 +259,11 @@ Set-FormulaColumn '库存快照' 'M' 2000 '=IF(B{r}="","",SUMIFS(''订单商品'
 $currentMonth = 'DATE(YEAR(TODAY()),MONTH(TODAY()),1)'
 $nextMonth = 'EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1)'
 $dashboardFormulas = @(
-    '=COUNTIFS(''订单汇总''!$A$2:$A$2001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''订单汇总''!$A$2:$A$2001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''订单汇总''!$D$2:$D$2001,"<>已取消",''订单汇总''!$E$2:$E$2001,"自然")',
-    '=SUMIFS(''订单汇总''!$F$2:$F$2001,''订单汇总''!$A$2:$A$2001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''订单汇总''!$A$2:$A$2001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''订单汇总''!$E$2:$E$2001,"自然",''订单汇总''!$D$2:$D$2001,"<>已取消")',
-    '=SUMIFS(''订单汇总''!$H$2:$H$2001,''订单汇总''!$A$2:$A$2001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''订单汇总''!$A$2:$A$2001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''订单汇总''!$E$2:$E$2001,"自然",''订单汇总''!$D$2:$D$2001,"<>已取消")',
-    '=SUMIFS(''订单汇总''!$K$2:$K$2001,''订单汇总''!$A$2:$A$2001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''订单汇总''!$A$2:$A$2001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''订单汇总''!$E$2:$E$2001,"自然",''订单汇总''!$D$2:$D$2001,"<>已取消")',
-    '=SUMIFS(''订单汇总''!$L$2:$L$2001,''订单汇总''!$A$2:$A$2001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''订单汇总''!$A$2:$A$2001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''订单汇总''!$E$2:$E$2001,"自然",''订单汇总''!$D$2:$D$2001,"<>已取消")',
+    '=COUNTIFS(''订单汇总''!$A$2:$A$2001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''订单汇总''!$A$2:$A$2001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''订单汇总''!$D$2:$D$2001,"<>已取消",''订单汇总''!$E$2:$E$2001,"自然")+COUNTIFS(''线下订单''!$A$2:$A$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''线下订单''!$A$2:$A$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''线下订单''!$C$2:$C$1001,"<>")',
+    '=SUMIFS(''订单汇总''!$F$2:$F$2001,''订单汇总''!$A$2:$A$2001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''订单汇总''!$A$2:$A$2001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''订单汇总''!$E$2:$E$2001,"自然",''订单汇总''!$D$2:$D$2001,"<>已取消")+SUMIFS(''线下订单''!$D$2:$D$1001,''线下订单''!$A$2:$A$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''线下订单''!$A$2:$A$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))',
+    '=SUMIFS(''订单汇总''!$H$2:$H$2001,''订单汇总''!$A$2:$A$2001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''订单汇总''!$A$2:$A$2001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''订单汇总''!$E$2:$E$2001,"自然",''订单汇总''!$D$2:$D$2001,"<>已取消")+SUMIFS(''线下订单''!$D$2:$D$1001,''线下订单''!$A$2:$A$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''线下订单''!$A$2:$A$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))',
+    '=SUMIFS(''订单汇总''!$K$2:$K$2001,''订单汇总''!$A$2:$A$2001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''订单汇总''!$A$2:$A$2001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''订单汇总''!$E$2:$E$2001,"自然",''订单汇总''!$D$2:$D$2001,"<>已取消")+SUMIFS(''线下订单''!$F$2:$F$1001,''线下订单''!$A$2:$A$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''线下订单''!$A$2:$A$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))',
+    '=SUMIFS(''订单汇总''!$L$2:$L$2001,''订单汇总''!$A$2:$A$2001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''订单汇总''!$A$2:$A$2001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''订单汇总''!$E$2:$E$2001,"自然",''订单汇总''!$D$2:$D$2001,"<>已取消")+SUMIFS(''线下订单''!$D$2:$D$1001,''线下订单''!$A$2:$A$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''线下订单''!$A$2:$A$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))-SUMIFS(''线下订单''!$F$2:$F$1001,''线下订单''!$A$2:$A$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''线下订单''!$A$2:$A$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))-SUMIFS(''线下订单''!$E$2:$E$1001,''线下订单''!$A$2:$A$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''线下订单''!$A$2:$A$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))',
     '=C6-SUMIFS(''月度结算''!$G$2:$G$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))-SUMIFS(''月度结算''!$I$2:$I$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))-SUMIFS(''月度结算''!$M$2:$M$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))',
     '=C7-SUMIFS(''月度结算''!$J$2:$J$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))',
     '=SUMIFS(''月度结算''!$B$2:$B$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))+SUMIFS(''月度结算''!$C$2:$C$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))+SUMIFS(''月度结算''!$D$2:$D$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))+SUMIFS(''月度结算''!$E$2:$E$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))',
