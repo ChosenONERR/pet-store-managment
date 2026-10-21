@@ -178,6 +178,7 @@ function Get-TextFingerprint([string]$Value) {
 
 function Get-FailureNotificationCategory([string]$Reason) {
     if ($Reason -match '推广费.*(?:读取|补抓|状态|抓取)|当天推广费') { return 'promotion-capture' }
+    if ($Reason -match 'MEITUAN_CDP_AUTH_REQUIRED') { return 'meituan-cdp-auth' }
     if ($Reason -match 'MEITUAN_STORE_CONTEXT_REQUIRED|MEITUAN_BOUND_PROFILE_UNAVAILABLE|MEITUAN_STORE_IDENTITY_UNVERIFIED') { return 'meituan-context' }
     if ($Reason -match 'MEITUAN_AUTH_REQUIRED|login_gw|美团商家后台登录态已失效') { return 'meituan-auth' }
     return (Get-TextFingerprint $Reason)
@@ -188,7 +189,7 @@ function Get-FailureNotificationReceiptPath([string]$Category) {
         $null = New-Item -ItemType Directory -Path $failureNotificationRoot
     }
     $safeCategory = $Category -replace '[^a-zA-Z0-9_-]', '_'
-    if ($Category -in @('meituan-auth','meituan-context')) {
+    if ($Category -in @('meituan-auth','meituan-context','meituan-cdp-auth')) {
         return (Join-Path $failureNotificationRoot "active-$safeCategory.json")
     }
     return (Join-Path $failureNotificationRoot "$dateText-$Mode-$safeCategory.json")
@@ -196,7 +197,7 @@ function Get-FailureNotificationReceiptPath([string]$Category) {
 
 function Test-FailureNotificationReceipt([string]$Path, [string]$Category) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
-    if ($Category -notin @('meituan-auth','meituan-context')) { return $true }
+    if ($Category -notin @('meituan-auth','meituan-context','meituan-cdp-auth')) { return $true }
     try {
         $receipt = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8) | ConvertFrom-Json
         return ($receipt.active -eq $true)
@@ -221,7 +222,7 @@ function Save-FailureNotificationReceipt([string]$Path, [string]$Category, [stri
 }
 
 function Resolve-FailureNotification([string]$Category) {
-    if ($Category -notin @('meituan-auth','meituan-context')) { return }
+    if ($Category -notin @('meituan-auth','meituan-context','meituan-cdp-auth')) { return }
     $path = Get-FailureNotificationReceiptPath $Category
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return }
     $payload = [ordered]@{
@@ -251,7 +252,7 @@ function Invoke-WithRetry([string]$Name, [scriptblock]$Operation, [int]$MaxAttem
         } catch {
             $message = $_.Exception.Message
             $errors.Add($message)
-            $nonRetryable = $message -match 'MEITUAN_CDP_UNAVAILABLE|MEITUAN_STORE_CONTEXT_REQUIRED|MEITUAN_BOUND_PROFILE_UNAVAILABLE|MEITUAN_STORE_IDENTITY_UNVERIFIED|MEITUAN_AUTH_REQUIRED|美团商家后台登录态已失效|表头与自动同步约定不一致|缺少必要字段|超过\d+行容量|公式存在错误|数量不一致|不是完整XLSX|干预订单匹配校验失败|"type"\s*:\s*"validation"|invalid JSON|invalid_argument'
+            $nonRetryable = $message -match 'MEITUAN_CDP_UNAVAILABLE|MEITUAN_CDP_AUTH_REQUIRED|MEITUAN_STORE_CONTEXT_REQUIRED|MEITUAN_BOUND_PROFILE_UNAVAILABLE|MEITUAN_STORE_IDENTITY_UNVERIFIED|MEITUAN_AUTH_REQUIRED|美团商家后台登录态已失效|表头与自动同步约定不一致|缺少必要字段|超过\d+行容量|公式存在错误|数量不一致|不是完整XLSX|干预订单匹配校验失败|"type"\s*:\s*"validation"|invalid JSON|invalid_argument'
             if ($attempt -ge $MaxAttempts -or $nonRetryable) {
                 $stageTelemetry[$Name] = [ordered]@{
                     ok = $false
@@ -996,6 +997,7 @@ function Limit-Text([string]$Value, [int]$Length) {
 }
 
 function Get-FailureGuidance([string]$Reason) {
+    if ($Reason -match 'MEITUAN_CDP_AUTH_REQUIRED') { return 'Chrome 重启后会生成新的浏览器实例，旧实例的 Allow 不会继承。请打开 chrome://inspect/#remote-debugging，勾选“Allow remote debugging for this browser instance”；系统不会再每小时主动触发授权弹窗，允许后下一次计划任务自动恢复。' }
     if ($Reason -match 'MEITUAN_STORE_CONTEXT_REQUIRED|MEITUAN_BOUND_PROFILE_UNAVAILABLE|MEITUAN_STORE_IDENTITY_UNVERIFIED') { return '系统只使用已绑定的 Chrome 资料“人员 1”。请打开该资料并确认进入“宠速星宠物用品店”后台；系统不会检查其他 Chrome 账户。' }
     if ($Reason -match 'CDP|remote debugging|远程调试') { return '请保持 Chrome 打开，并确认 chrome://inspect/#remote-debugging 中已允许远程调试。' }
     if ($Reason -match '登录|login|扫码') { return '请在 Chrome 中重新登录美团商家后台；登录后系统会在下一次计划任务自动重试。' }
@@ -1370,6 +1372,7 @@ try {
             # A successful authenticated order read resolves the persistent login incident.
             Resolve-FailureNotification 'meituan-auth'
             Resolve-FailureNotification 'meituan-context'
+            Resolve-FailureNotification 'meituan-cdp-auth'
             foreach ($pendingRefund in @($orderResult.pending_refund_details)) {
                 $syncWarnings.Add("退款待确认：订单 $($pendingRefund.order_no)｜$($pendingRefund.goods_code)×$($pendingRefund.quantity)｜顾客退款 ¥$($pendingRefund.refund_amount)；收入已扣减，货物成本暂保留。请告诉经营管家商品是‘已退回入库’、‘未退货’还是‘退回报损’。")
             }
