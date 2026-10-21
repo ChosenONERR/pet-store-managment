@@ -78,7 +78,7 @@ Windows 计划任务
 |---|---|
 | `agent/AGENTS.md` | `agent/` 子目录的补充维护约束 |
 | `agent/check_environment.ps1` | 新电脑或故障时只读检查依赖、路径和配置 |
-| `agent/check_meituan_browser.mjs` | 有界检查绑定 Chrome、美团登录态和店铺页面；先读取当前 Chrome 实例的远程调试授权状态，未授权时不主动连接，避免每小时重复弹出 Allow |
+| `agent/check_meituan_browser.mjs` | 有界检查绑定 Chrome、美团登录态和店铺页面；每个新 Chrome 实例未授权时主动连接并触发一次 Allow 提醒，同一实例后续整点不重复弹窗 |
 | `agent/codex_chat_bridge.py` | 调用 Codex 理解飞书消息、查询数据并输出结构化动作 |
 | `agent/codex_response_schema.json` | Codex 动作协议的 JSON Schema |
 | `agent/configure_hidden_gateway_startup.ps1` | 预览/配置 Hermes Gateway 隐藏启动 |

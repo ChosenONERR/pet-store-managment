@@ -1,16 +1,20 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const host = '127.0.0.1';
 const proxyPort = Number(process.env.CDP_PROXY_PORT || 3456);
 const localAppData = process.env.LOCALAPPDATA || '';
 const activePortPath = path.join(localAppData, 'Google', 'Chrome', 'User Data', 'DevToolsActivePort');
 const localStatePath = path.join(localAppData, 'Google', 'Chrome', 'User Data', 'Local State');
+const agentRoot = path.dirname(fileURLToPath(import.meta.url));
+const promptStatePath = path.join(agentRoot, 'state', 'cdp_authorization_prompt.json');
 const proxyCandidates = [
   path.join(os.homedir(), '.agents', 'skills', 'web-access', 'scripts', 'cdp-proxy.mjs'),
   path.join(os.homedir(), '.codex', 'skills', 'web-access', 'scripts', 'cdp-proxy.mjs'),
@@ -44,6 +48,36 @@ async function readChromePort() {
   return null;
 }
 
+function readChromeInstanceFingerprint() {
+  try {
+    const lines = fs.readFileSync(activePortPath, 'utf8').trim().split(/\r?\n/);
+    if (!lines[0] || !lines[1]) return null;
+    return createHash('sha256').update(`${lines[0]}\n${lines[1]}`).digest('hex');
+  } catch (_) {
+    return null;
+  }
+}
+
+function readPromptedFingerprint() {
+  try {
+    return JSON.parse(fs.readFileSync(promptStatePath, 'utf8'))?.instance_fingerprint || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function savePromptedFingerprint(fingerprint) {
+  fs.mkdirSync(path.dirname(promptStatePath), { recursive: true });
+  const payload = JSON.stringify({
+    version: 1,
+    instance_fingerprint: fingerprint,
+    prompted_at: new Date().toISOString(),
+  });
+  const temporary = `${promptStatePath}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, payload, 'utf8');
+  fs.renameSync(temporary, promptStatePath);
+}
+
 function readRemoteDebuggingConsent() {
   try {
     const localState = JSON.parse(fs.readFileSync(localStatePath, 'utf8'));
@@ -65,6 +99,18 @@ async function getTargets(timeoutMs = 2500) {
   }
 }
 
+async function getProxyHealth(timeoutMs = 1800) {
+  try {
+    const response = await fetch(`http://${host}:${proxyPort}/health`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const body = await response.json();
+    return body?.status === 'ok' ? body : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 function startProxy() {
   const proxyScript = proxyCandidates.find((candidate) => fs.existsSync(candidate));
   if (!proxyScript) throw new Error('MEITUAN_CDP_UNAVAILABLE: cdp-proxy.mjs not found');
@@ -80,33 +126,63 @@ function startProxy() {
 }
 
 async function main() {
-  const remoteDebuggingAllowed = readRemoteDebuggingConsent();
-  if (remoteDebuggingAllowed === false) {
-    throw new Error(
-      'MEITUAN_CDP_AUTH_REQUIRED: 当前 Chrome 实例尚未允许远程调试；' +
-      '为避免计划任务每小时重复弹出 Allow，系统不会自动发起连接。' +
-      '请打开 chrome://inspect/#remote-debugging，勾选“Allow remote debugging for this browser instance”；下一次计划任务会自动恢复同步'
-    );
-  }
-  if (remoteDebuggingAllowed === null) {
-    throw new Error('MEITUAN_CDP_UNAVAILABLE: 无法读取 Chrome 远程调试授权状态；本次未发起连接，避免误触发授权弹窗');
-  }
   const chromePort = await readChromePort();
   if (!chromePort) {
     throw new Error('MEITUAN_CDP_UNAVAILABLE: 已固定的 Chrome 调试连接不可用；请保持当前“宠速星宠物用品店”后台所在 Chrome 开启');
   }
 
-  let targets = await getTargets();
-  if (!targets) {
+  let proxyHealth = await getProxyHealth();
+  let targets = proxyHealth?.connected ? await getTargets() : null;
+  if (targets) {
+    console.log(`chrome: ok (port ${chromePort})`);
+    console.log('proxy: ready');
+    return;
+  }
+
+  const remoteDebuggingAllowed = readRemoteDebuggingConsent();
+  const instanceFingerprint = readChromeInstanceFingerprint();
+  if (remoteDebuggingAllowed === false) {
+    if (!instanceFingerprint) {
+      throw new Error('MEITUAN_CDP_UNAVAILABLE: 无法识别当前 Chrome 实例；本次未发起授权连接');
+    }
+    if (readPromptedFingerprint() === instanceFingerprint) {
+      throw new Error(
+        'MEITUAN_CDP_AUTH_REQUIRED: 当前 Chrome 实例仍未允许远程调试；' +
+        '系统已为这个实例主动弹出过一次 Allow，本次不重复打扰。' +
+        '请打开 chrome://inspect/#remote-debugging，勾选“Allow remote debugging for this browser instance”；下一次计划任务会自动恢复同步'
+      );
+    }
+    // A new Chrome instance gets one active connection attempt so the browser
+    // can surface its Allow prompt. Persist the fingerprint before connecting;
+    // a missed prompt must not be retriggered by every hourly task.
+    savePromptedFingerprint(instanceFingerprint);
+  } else if (remoteDebuggingAllowed === null) {
+    throw new Error('MEITUAN_CDP_UNAVAILABLE: 无法读取 Chrome 远程调试授权状态；本次未发起连接，避免误触发授权弹窗');
+  }
+
+  let startedProxy = false;
+  if (!proxyHealth) {
+    startedProxy = true;
     startProxy();
     const deadline = Date.now() + 12000;
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 1000));
-      targets = await getTargets(1800);
-      if (targets) break;
+      proxyHealth = await getProxyHealth();
+      if (proxyHealth?.connected) break;
     }
   }
+  if (proxyHealth?.connected) {
+    targets = await getTargets();
+  } else if (!startedProxy || remoteDebuggingAllowed === true) {
+    targets = await getTargets(12000);
+  }
   if (!targets) {
+    if (remoteDebuggingAllowed === false) {
+      throw new Error(
+        'MEITUAN_CDP_AUTH_REQUIRED: 已为当前 Chrome 实例主动请求一次远程调试授权，但尚未允许；' +
+        '为避免每小时重复弹窗，后续定时任务只保留飞书提醒。请在 chrome://inspect/#remote-debugging 完成 Allow'
+      );
+    }
     throw new Error('MEITUAN_CDP_UNAVAILABLE: Chrome 正常，但本地 CDP 代理在 12 秒内未就绪；本次快速失败，下一小时自动重试');
   }
 
