@@ -42,6 +42,8 @@ Windows 计划任务
 
 普通同步必须走轻量路径；夜间日结、退款、干预单、赠品变化、证据不完整或显式 `--full-rebuild` 才允许走重建路径。普通补货只更新补货记录和 SKU 当前成本，不能自动倒改历史订单和简账。
 
+指定订单或月份刷新若发现旧版数据把正数人工配送费只保存在月度收入表、而订单汇总仍为 0，`agent/sync_daily_ledger.ps1` 会在同一经营事务内按完整订单号把金额回写到订单汇总并增加“人工确认配送费”来源标记，然后继续当前操作。无法唯一定位订单时仍停止；不得静默丢弃或改写存在金额冲突的配送费。
+
 ## 当前功能登记
 
 | 功能 | 主入口 | 读取/写入范围 | 使用说明 |
@@ -50,7 +52,7 @@ Windows 计划任务
 | 美团订单同步 | `work/sync_meituan_orders.ps1`、`work/meituan_order_extract.mjs` | 美团只读；写订单汇总/商品/干预数据 | 绑定唯一 Chrome 店铺；不得修改美团订单或库存 |
 | 美团库存同步 | `work/sync_meituan_inventory.ps1`、`work/meituan_inventory_export.mjs` | 美团只读导出；写库存相关飞书表 | 导出器默认字段保持稳定，附加字段通过环境变量请求 |
 | 成本与利润 | `agent/rebuild_cost_snapshots.ps1` | 写订单成本快照和公式结果 | 历史快照默认冻结；只有明确指定订单才改历史成本 |
-| 每日经营简账 | `agent/sync_daily_ledger.ps1` | 写月份收入/支出及驾驶舱来源数据 | 普通新增订单按月局部刷新；风险场景全量校验 |
+| 每日经营简账 | `agent/sync_daily_ledger.ps1` | 写月份收入/支出及驾驶舱来源数据；必要时把旧月表孤立的人工配送费原子归一到订单汇总 | 普通新增订单按月局部刷新；配送费来源分叉可安全自愈；无法唯一定位或金额冲突仍停止；风险场景全量校验 |
 | 推广费 | `agent/sync_promotion_expense.ps1`、`work/meituan_promotion_extract.mjs` | 美团只读；写经营支出 | 日结前读取当天累计消费；读取失败不得猜金额 |
 | 退款补偿 | `agent/refund_adjustments.ps1` | 写退款调整及对应成本 | 按退款记录 ID 幂等；退回库存只冲回实际退回商品成本 |
 | 实际履约修正 | `agent/order_actual_overrides.ps1` | 写本地实际商品/配送方式覆盖 | 不修改美团库存，店主手工恢复的平台库存不重复处理 |
@@ -103,7 +105,7 @@ Windows 计划任务
 | `agent/runtime_paths.ps1` | 解析 Python、PowerShell、Lark CLI 等本机路径 |
 | `agent/sku_master_schema.ps1` | SKU 主表字段、规范化和安全访问函数 |
 | `agent/start_hidden_gateway.ps1` | 隐藏启动 Gateway 的 PowerShell 包装 |
-| `agent/sync_daily_ledger.ps1` | 同步月收入、月支出、格式和驾驶舱来源数据 |
+| `agent/sync_daily_ledger.ps1` | 同步月收入、月支出、格式和驾驶舱来源数据；在同一事务内自愈“旧月表有人工配送费但订单汇总为 0”的遗留分叉 |
 | `agent/sync_new_skus.ps1` | 从平台发现并安全新增 SKU |
 | `agent/sync_promotion_expense.ps1` | 读取并登记每日美团推广消费 |
 | `agent/sync_sku_master_by_identity.ps1` | 按稳定商品身份合并/校正 SKU 主表 |

@@ -131,7 +131,7 @@ function Get-SheetRows([string]$Token, [string]$SheetName, [string]$Range) {
     if ($result.data.has_more) { throw "飞书读取结果不完整：$SheetName" }
     # Wrap rows in an object so PowerShell cannot flatten a one-row result into
     # its individual cells when the function writes to the success stream.
-    return [pscustomobject]@{rows=[object[]]@($result.data.ranges[0].cells)}
+    return [pscustomobject]@{rows=[object[]]@($result.data.ranges[0].cells);row_indices=[int[]]@($result.data.ranges[0].row_indices)}
 }
 
 function Set-CellMatrix([string]$SheetName, [string]$Range, $Rows) {
@@ -142,6 +142,16 @@ function Set-CellMatrix([string]$SheetName, [string]$Range, $Rows) {
     if ($LASTEXITCODE -ne 0) { throw "写入飞书失败：$SheetName $Range" }
     $result = $raw | ConvertFrom-Json
     if (-not $result.ok) { throw "写入飞书失败：$SheetName $Range" }
+}
+
+function Set-SourceCellMatrix([string]$SheetName, [string]$Range, $Rows) {
+    if (@($Rows).Count -eq 0) { return }
+    Register-FinanceRangeBeforeImage $script:financeTransaction 'source' $sourceToken $SheetName $Range $larkCli
+    $payload = ConvertTo-Json -InputObject $Rows -Depth 12 -Compress
+    $raw = $payload | & $larkCli sheets +cells-set --as user --spreadsheet-token $sourceToken --sheet-name $SheetName --range $Range --cells - --format json | Out-String
+    if ($LASTEXITCODE -ne 0) { throw "写入经营主表失败：$SheetName $Range" }
+    $result = $raw | ConvertFrom-Json
+    if (-not $result.ok) { throw "写入经营主表失败：$SheetName $Range" }
 }
 
 function Clear-SheetData([string]$SheetName, [string]$LastColumn) {
@@ -296,7 +306,17 @@ function Ensure-MonthSheets([datetime]$Month) {
     return [pscustomobject]@{month=$Month;income=$incomeName;expense=$expenseName}
 }
 
-$orderRows = (Get-SheetRows $sourceToken '订单汇总' 'A2:Q2001').rows
+$orderRange = Get-SheetRows $sourceToken '订单汇总' 'A2:Q2001'
+$orderRows = $orderRange.rows
+$orderRowNumbers = @($orderRange.row_indices)
+$orderSourceRowByOrderNo = @{}
+for ($orderIndex = 0; $orderIndex -lt $orderRows.Count; $orderIndex++) {
+    $sourceOrderNo = ([string](Get-CellValue $orderRows[$orderIndex] 2)).Trim()
+    if (-not $sourceOrderNo) { continue }
+    if ($orderSourceRowByOrderNo.ContainsKey($sourceOrderNo)) { throw "订单汇总存在重复订单：$sourceOrderNo" }
+    $sourceRowNumber = if ($orderRowNumbers.Count -eq $orderRows.Count) { [int]$orderRowNumbers[$orderIndex] } else { 2 + $orderIndex }
+    $orderSourceRowByOrderNo[$sourceOrderNo] = $sourceRowNumber
+}
 $itemRows = (Get-SheetRows $sourceToken '订单商品' 'A2:N4001').rows
 $inventoryRows = (Get-SheetRows $sourceToken '库存快照' 'B2:G2000').rows
 $interventionRows = @((Get-SheetRows $sourceToken '干预订单' 'A2:M1001').rows | Where-Object { Test-ActiveInterventionOrderNo (Get-CellValue $_ 3) })
@@ -451,6 +471,7 @@ foreach ($row in $interventionRows) {
 
 $summaries = @()
 $requestedDateSummary = $null
+$autoReconciledDeliveryFees = [Collections.Generic.List[object]]::new()
 foreach ($monthSheet in $monthSheets) {
     $monthStart = $monthSheet.month
     $monthEnd = $monthStart.AddMonths(1).AddDays(-1)
@@ -519,7 +540,43 @@ foreach ($monthSheet in $monthSheets) {
         $delivery = Convert-ToNullableNumber (Get-CellValue $row $(if ($isOffline) { 4 } else { 9 }))
         $old = if ($entry.order_no -and $oldIncomeByOrder.ContainsKey($entry.order_no)) { $oldIncomeByOrder[$entry.order_no] } else { $null }
         if (($null -eq $delivery -or [math]::Abs($delivery) -lt 0.000001) -and $null -ne $old -and $null -ne $old.delivery -and $old.delivery -gt 0) {
-            throw "配送费来源分叉：订单 $($entry.order_no) 的月度收入表为 $($old.delivery) 元，但订单汇总为0；请先运行 work\reconcile_manual_delivery_fees.ps1，禁止驾驶舱继续漏扣费用"
+            # 旧版本曾允许人工配送费只存在于月度收入表。该差异与当前
+            # 订单修正无关，不应阻断用户已经确认的写入。把旧月表的明确
+            # 正数配送费原子迁移到订单汇总权威字段，再继续刷新；订单号
+            # 不唯一或无法定位时仍停止，避免把金额写到错误订单。
+            if (-not $entry.order_no -or -not $orderSourceRowByOrderNo.ContainsKey([string]$entry.order_no)) {
+                throw "配送费自动归一失败：订单 $($entry.order_no) 无法在订单汇总中唯一定位"
+            }
+            $sourceRowNumber = [int]$orderSourceRowByOrderNo[[string]$entry.order_no]
+            $oldSourceNote = [string](Get-CellValue $row 15)
+            $deliveryValue = [math]::Round([double]$old.delivery,2)
+            $marker = '人工确认配送费：{0}元' -f $deliveryValue.ToString('0.00',[Globalization.CultureInfo]::InvariantCulture)
+            $cleanSourceNote = [regex]::Replace($oldSourceNote,'(?:^|[；;])\s*人工确认配送费：?\s*\d+(?:\.\d+)?\s*元?','').Trim('；',';',' ')
+            $newSourceNote = (@($cleanSourceNote,$marker) | Where-Object { $_ }) -join '；'
+            $feeCells = @(); $feeCells += ,@((New-ValueCell $deliveryValue))
+            $noteCells = @(); $noteCells += ,@((New-ValueCell $newSourceNote))
+            Set-SourceCellMatrix '订单汇总' "J${sourceRowNumber}:J${sourceRowNumber}" $feeCells
+            Set-SourceCellMatrix '订单汇总' "P${sourceRowNumber}:P${sourceRowNumber}" $noteCells
+            $reconciledSourceRows = (Get-SheetRows $sourceToken '订单汇总' "A${sourceRowNumber}:Q${sourceRowNumber}").rows
+            if ($reconciledSourceRows.Count -ne 1) {
+                throw "配送费自动归一回读失败：订单 $($entry.order_no) 未返回唯一订单行"
+            }
+            $reconciledSourceRow = $reconciledSourceRows[0]
+            $reconciledOrderNo = ([string](Get-CellValue $reconciledSourceRow 2)).Trim()
+            $reconciledDelivery = Convert-ToNullableNumber (Get-CellValue $reconciledSourceRow 9)
+            $reconciledNote = [string](Get-CellValue $reconciledSourceRow 15)
+            if ($reconciledOrderNo -ne [string]$entry.order_no -or $null -eq $reconciledDelivery -or [math]::Abs($reconciledDelivery - $deliveryValue) -gt 0.000001 -or $reconciledNote -notlike "*$marker*") {
+                throw "配送费自动归一回读失败：订单 $($entry.order_no) 的金额或来源标记未正确保存"
+            }
+            $row[9] = New-ValueCell $deliveryValue
+            $row[15] = New-ValueCell $newSourceNote
+            $delivery = $deliveryValue
+            $autoReconciledDeliveryFees.Add([pscustomobject]@{
+                order_no=[string]$entry.order_no
+                source_row=$sourceRowNumber
+                amount=$deliveryValue
+                month=$monthSheet.month.ToString('yyyy-MM')
+            })
         }
         if ($null -eq $delivery) { $delivery = 0.0 }
         $soldText = if ($isOffline) { Get-CellValue $row 7 } else { '' }
@@ -762,6 +819,9 @@ $finalResult = [ordered]@{
     data_through_date = $dataThroughDate.ToString('yyyy-MM-dd')
     scope = $(if ($selectedMonthKeys.Count -gt 0) { 'selected_months' } else { 'all_months' })
     month_filter = @($selectedMonthKeys)
+    auto_reconciled_delivery_fee_count = $autoReconciledDeliveryFees.Count
+    auto_reconciled_delivery_fee_amount = $(if ($autoReconciledDeliveryFees.Count -gt 0) { [math]::Round((($autoReconciledDeliveryFees | Measure-Object amount -Sum).Sum),2) } else { 0.0 })
+    auto_reconciled_delivery_fees = $autoReconciledDeliveryFees.ToArray()
     months = $summaries
     requested_date_summary = $requestedDateSummary
     formula_verification = 'success'
