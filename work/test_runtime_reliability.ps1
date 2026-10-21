@@ -55,6 +55,8 @@ $orderSync = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\sync_meituan_o
 $refundAdjustments = [IO.File]::ReadAllText((Join-Path $agentRoot 'refund_adjustments.ps1'),[Text.Encoding]::UTF8)
 $orderActualOverrides = [IO.File]::ReadAllText((Join-Path $agentRoot 'order_actual_overrides.ps1'),[Text.Encoding]::UTF8)
 $inventoryExporter = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\meituan_inventory_export.mjs'),[Text.Encoding]::UTF8)
+$productExportFieldInspectorPath = Join-Path $projectRoot 'work\inspect_meituan_product_export_fields.mjs'
+$productExportFieldInspector = [IO.File]::ReadAllText($productExportFieldInspectorPath,[Text.Encoding]::UTF8)
 $meituanBrowserContext = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\meituan_browser_context.mjs'),[Text.Encoding]::UTF8)
 $inventorySync = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\sync_meituan_inventory.ps1'),[Text.Encoding]::UTF8)
 $interventionRecord = [IO.File]::ReadAllText((Join-Path $agentRoot 'intervention_record.ps1'),[Text.Encoding]::UTF8)
@@ -161,6 +163,8 @@ $contracts = [ordered]@{
     codex_persistent_runtime_follows_account_switches = ($codexBridge -match 'get_auth_fingerprint' -and $codexBridge -match 'ensure_current_auth' -and $codexBridge -match 'auth_reloaded')
     meituan_automation_binds_verified_store_context = ($meituanBrowserContext -match '宠速星宠物用品店' -and $meituanBrowserContext -match 'authenticatedStore' -and $orderExtractor -match 'openPetstarMerchantTab' -and $inventoryExporter -match 'openPetstarMerchantTab' -and $promotionExtractor -match 'openPetstarMerchantTab')
     meituan_automation_uses_only_bound_chrome_profile = ($meituanBrowserContext -match 'loadBinding' -and $meituanBrowserContext -match 'profile_directory' -and $meituanBrowserContext -match 'resolveBoundContext' -and $meituanBrowserContext -match 'boundPages' -and $meituanBrowserContext -match 'MEITUAN_AUTH_REQUIRED')
+    meituan_inventory_export_supports_explicit_extra_fields = ($inventoryExporter -match 'MEITUAN_EXPORT_EXTRA_FIELDS' -and $inventoryExporter -match '\.\.\.extraFields')
+    meituan_product_field_inspector_is_read_only = ((Test-Path -LiteralPath $productExportFieldInspectorPath) -and $productExportFieldInspector -match 'openPetstarMerchantTab' -and $productExportFieldInspector -match 'releasePetstarMerchantTab' -and $productExportFieldInspector -notmatch 'createExport|clickCreateExport|修改库存')
     business_queries_are_parallel_and_bounded = ($codexBridge -match 'ThreadPoolExecutor' -and $codexBridge -match 'max_workers=min\(3')
     query_cache_is_short_and_bypassed_for_writes = ($codexBridge -match 'QUERY_CACHE_SECONDS = 30' -and $codexBridge -match 'use_cache=\(mode == "normal"\)' -and $bridge -match 'Clear-PetstarCodexQueryCache')
     message_latency_has_stage_telemetry = ($codexBridge -match 'codex_performance\.ndjson' -and $codexBridge -match 'model_seconds' -and $codexBridge -match 'query_seconds' -and $bridge -match 'message timing')
@@ -211,6 +215,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Python entry-point compile check failed' }
 $nodeFiles = @(
     (Join-Path $projectRoot 'work\meituan_order_extract.mjs'),
     (Join-Path $projectRoot 'work\meituan_inventory_export.mjs'),
+    (Join-Path $projectRoot 'work\inspect_meituan_product_export_fields.mjs'),
     (Join-Path $projectRoot 'work\meituan_promotion_extract.mjs')
     (Join-Path $projectRoot 'work\meituan_browser_context.mjs')
     (Join-Path $agentRoot 'check_meituan_browser.mjs')

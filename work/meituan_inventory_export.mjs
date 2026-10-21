@@ -329,10 +329,17 @@ async function clickCreateExport(targetId) {
 }
 
 async function ensureRequiredExportFields(targetId) {
-  const required = [
+  // Keep the scheduled inventory schema stable while allowing explicit,
+  // read-only exports (for example sale-price reports) to request extra fields.
+  const extraFields = String(process.env.MEITUAN_EXPORT_EXTRA_FIELDS || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const required = [...new Set([
     'spu_name', 'source_food_code', 'sku_id', 'locator_code',
     'spec_name', 'stock', 'month_sale', 'sell_status', 'product_date',
-  ];
+    ...extraFields,
+  ])];
   // The export modal becomes visible before Meituan finishes loading its
   // checkbox definitions. Seeing the modal (or the create button) is not
   // enough: wait until every required field actually exists in the DOM.

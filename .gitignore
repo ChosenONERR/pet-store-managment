@@ -19,6 +19,7 @@ work/daily_ledger_meta.json
 work/pets_finance_sheets.json
 work/lark_device_flow.json
 work/feishu-auth-qr.png
+/lark-auth.png
 
 # Generated audits, snapshots and browser diagnostics
 work/_tmp_*
