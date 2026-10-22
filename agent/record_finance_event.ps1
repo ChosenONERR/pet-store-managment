@@ -1018,7 +1018,7 @@ switch ($Action) {
     'SetOrderActuals' {
         if (-not $OrderNo -or $OrderNo -notmatch '^\d{10,30}$') { throw '修正订单实际履约必须提供有效平台订单号' }
         Assert-NonNegative $Amount '订单实际收入'
-        Assert-NonNegative $DeliveryFee '订单实际配送费'
+        if ($null -ne $DeliveryFee) { Assert-NonNegative $DeliveryFee '订单实际配送费' }
         if (-not $Items) { throw '修正订单实际履约必须提供实际售出商品，例如 kw3001×1' }
         $actualItemMatches = @([regex]::Matches($Items, '(?i)\b((?:kw|csx)\d+)\s*[×xX*]\s*(\d+(?:\.\d+)?)'))
         if ($actualItemMatches.Count -eq 0) { throw '订单实际履约修正必须明确提供最终实际交付商品，例如 kw1096×2、kw1095×1；漏送或退回商品不要写入' }
@@ -1062,12 +1062,12 @@ switch ($Action) {
 
         $skuRows = Get-SheetRows 'SKU成本主表' 'A2:Z3000'
         $actualIncome = [double][math]::Round([double]$Amount, 2)
-        $actualDeliveryFee = [double][math]::Round([double]$DeliveryFee, 2)
-        $actualItems = [Collections.Generic.List[object]]::new()
-        $costDetails = [Collections.Generic.List[object]]::new()
-        $lineIndex = 0
+        $oldIncome = Convert-ToNumber (Get-CellValue $orderMatches[0].cells 7)
+        $oldDeliveryFee = Convert-ToNumber (Get-CellValue $orderMatches[0].cells 9)
+        $oldCost = Convert-ToNumber (Get-CellValue $orderMatches[0].cells 10)
+        $actualDeliveryFee = if ($null -eq $DeliveryFee) { $oldDeliveryFee } else { [double][math]::Round([double]$DeliveryFee, 2) }
+        $resolvedRequestedItems = [Collections.Generic.List[object]]::new()
         foreach ($requested in $requestedQuantities.GetEnumerator()) {
-            $lineIndex++
             $requestedCode = [string]$requested.Key
             $actualQuantity = [double]$requested.Value
             $skuTarget = Resolve-UniqueSkuReference $skuRows $requestedCode
@@ -1081,38 +1081,76 @@ switch ($Action) {
             $unitCostText = Get-CellValue $skuTarget.cells $skuSchema.MovingAverageCost.Index
             if ($null -eq $unitCostText -or $unitCostText -eq '') { $unitCostText = Get-CellValue $skuTarget.cells $skuSchema.BaselineUnitCost.Index }
             if ($null -eq $unitCostText -or $unitCostText -eq '') { throw "$canonicalKw 当前成本为空，不能安全重算该订单" }
-            $unitCost = Convert-ToNumber $unitCostText
             $originalMatch = @($originalItemRecords | Where-Object {
                 $_.code -ieq $requestedCode -or $_.code -ieq $canonicalKw -or ($productId -and $_.product_id -eq $productId)
             } | Select-Object -First 1)
-            if ($originalMatch.Count -gt 0) {
-                $actualUnitPrice = [double]$originalMatch[0].unit_price
-            } elseif ($requestedQuantities.Count -eq 1) {
-                $actualUnitPrice = [double][math]::Round($actualIncome / $actualQuantity, 4)
-            } else {
-                throw "实际交付包含多个替换商品，且 $canonicalKw 不在原订单中；请分别说明各商品成交金额后再处理"
-            }
-            $actualItems.Add([pscustomobject]@{
-                goods_code = $canonicalKw
+            $resolvedRequestedItems.Add([pscustomobject]@{
+                requested_code = $requestedCode
+                canonical_kw = $canonicalKw
                 title = $title
                 spec = $spec
                 product_id = $productId
                 quantity = $actualQuantity
+                unit_cost = Convert-ToNumber $unitCostText
+                sku_master_row = $skuTarget.row_number
+                original_item = $(if ($originalMatch.Count -gt 0) { $originalMatch[0] } else { $null })
+            })
+        }
+
+        $newRequestedItems = @($resolvedRequestedItems | Where-Object { $null -eq $_.original_item })
+        $allOriginalItemsPreserved = $true
+        foreach ($originalRecord in $originalItemRecords) {
+            $preservedQuantity = [double](($resolvedRequestedItems | Where-Object {
+                $_.requested_code -ieq $originalRecord.code -or $_.canonical_kw -ieq $originalRecord.code -or
+                ($originalRecord.product_id -and $_.product_id -eq $originalRecord.product_id)
+            } | Measure-Object -Property quantity -Sum).Sum)
+            if ([math]::Abs($preservedQuantity - [double]$originalRecord.quantity) -gt 0.000001) {
+                $allOriginalItemsPreserved = $false
+                break
+            }
+        }
+
+        $actualItems = [Collections.Generic.List[object]]::new()
+        $costDetails = [Collections.Generic.List[object]]::new()
+        $lineIndex = 0
+        foreach ($resolvedItem in $resolvedRequestedItems) {
+            $lineIndex++
+            $actualQuantity = [double]$resolvedItem.quantity
+            if ($null -ne $resolvedItem.original_item) {
+                $actualUnitPrice = [double]$resolvedItem.original_item.unit_price
+                $unitPriceBasis = 'original_order_item'
+            } elseif ($requestedQuantities.Count -eq 1) {
+                $actualUnitPrice = [double][math]::Round($actualIncome / $actualQuantity, 4)
+                $unitPriceBasis = 'single_item_actual_income'
+            } elseif ($newRequestedItems.Count -eq 1 -and $allOriginalItemsPreserved) {
+                $additionalIncome = [double][math]::Round($actualIncome - $oldIncome, 2)
+                if ($additionalIncome -lt 0) {
+                    throw "新增商品 $($resolvedItem.canonical_kw) 无法从收入差额安全定价：最终收入低于原商家收入；请明确该商品成交金额"
+                }
+                $actualUnitPrice = [double][math]::Round($additionalIncome / $actualQuantity, 4)
+                $unitPriceBasis = 'additional_income_delta'
+            } else {
+                throw "实际交付包含多个替换商品，且 $($resolvedItem.canonical_kw) 不在原订单中；请分别说明各商品成交金额后再处理"
+            }
+            $actualItems.Add([pscustomobject]@{
+                goods_code = $resolvedItem.canonical_kw
+                title = $resolvedItem.title
+                spec = $resolvedItem.spec
+                product_id = $resolvedItem.product_id
+                quantity = $actualQuantity
                 unit_price = $actualUnitPrice
+                unit_price_basis = $unitPriceBasis
                 line_index = $lineIndex
             })
             $costDetails.Add([pscustomobject]@{
-                goods_code = $canonicalKw
+                goods_code = $resolvedItem.canonical_kw
                 quantity = $actualQuantity
-                unit_cost = $unitCost
-                item_cost = [math]::Round($unitCost * $actualQuantity, 2)
-                sku_master_row = $skuTarget.row_number
-                title = $title
+                unit_cost = $resolvedItem.unit_cost
+                item_cost = [math]::Round([double]$resolvedItem.unit_cost * $actualQuantity, 2)
+                sku_master_row = $resolvedItem.sku_master_row
+                title = $resolvedItem.title
             })
         }
-        $oldIncome = Convert-ToNumber (Get-CellValue $orderMatches[0].cells 7)
-        $oldDeliveryFee = Convert-ToNumber (Get-CellValue $orderMatches[0].cells 9)
-        $oldCost = Convert-ToNumber (Get-CellValue $orderMatches[0].cells 10)
         $newCost = [math]::Round((($costDetails | Measure-Object -Property item_cost -Sum).Sum), 2)
         $newProfit = [math]::Round($actualIncome - $actualDeliveryFee - $newCost, 2)
         $newItemsText = @($actualItems | ForEach-Object {
@@ -1131,6 +1169,7 @@ switch ($Action) {
             new_delivery_fee = $actualDeliveryFee
             old_items = @($originalItems)
             new_items = $newItemsText
+            actual_items = @($actualItems)
             sku_master_rows = @($costDetails | ForEach-Object { $_.sku_master_row })
             cost_details = @($costDetails)
             old_cost = $oldCost

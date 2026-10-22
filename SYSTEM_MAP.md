@@ -55,7 +55,7 @@ Windows 计划任务
 | 每日经营简账 | `agent/sync_daily_ledger.ps1` | 写月份收入/支出及驾驶舱来源数据；必要时把旧月表孤立的人工配送费原子归一到订单汇总 | 新单、退款、补单和赠品变化只刷新受影响月份；配送费来源分叉可安全自愈；补单平台扣款未知时留空并标记待识别，禁止写成0 |
 | 推广费 | `agent/sync_promotion_expense.ps1`、`work/meituan_promotion_extract.mjs` | 美团只读；写经营支出 | 日结前读取当天累计消费；尚未结算时标记待补并自动重试，不阻断订单同步，不得猜金额 |
 | 退款补偿 | `agent/refund_adjustments.ps1` | 写退款调整及对应成本 | 按退款记录 ID 幂等；退回库存只冲回实际退回商品成本 |
-| 实际履约修正 | `agent/order_actual_overrides.ps1` | 写本地实际商品/配送方式覆盖 | 不修改美团库存，店主手工恢复的平台库存不重复处理 |
+| 实际履约修正 | `agent/record_finance_event.ps1`、`agent/order_actual_overrides.ps1` | 写指定订单的本地实际商品、最终收入和配送方式覆盖，再只刷新该单及所属月份 | 不修改美团库存；原商品数量不变且仅新增一个私下加购商品时，可按“最终收入－原商家收入”确定新增商品成交额；用户未提配送时确认执行沿用订单当前配送费；多个新增/替换商品仍须明确金额分摊 |
 | SKU 主表维护 | `agent/sync_new_skus.ps1`、`agent/sync_sku_master_by_identity.ps1`、`agent/sku_master_schema.ps1` | 写 SKU 成本主表 | 写入前检查重复 KW 和商品身份冲突 |
 | 赠品与干预单 | `agent/reconcile_pending_gifts.ps1`、`agent/intervention_record.ps1` | 写赠品、干预订单 | 赠品成本计入订单成本；缺成本保持待确认 |
 | 经营数据查询 | `agent/query_business_data.ps1` | 只读飞书 | 供 Codex 回答经营、库存和待确认问题，禁止写入 |

@@ -689,6 +689,12 @@ function Invoke-CodexAction($CodexAction, $Event, [int]$Index, [string]$Mode) {
     }
     foreach ($entry in $propertyMap.GetEnumerator()) {
         $value = Get-CodexActionValue $arguments $entry.Key
+        if ($actionName -eq 'SetOrderActuals' -and $entry.Key -eq 'delivery_fee' -and
+            ([string]$Event.content) -notmatch '配送费|运费|骑手|自配送|自己送|商家自配|自提|到店(?:取|拿)|没有.{0,6}配送') {
+            # 用户没有谈配送时，不能把模型查询到的旧值固化进待确认项。
+            # 执行器会在确认时读取该订单的当前配送费，避免等待期间同步更新后被旧值覆盖。
+            $value = $null
+        }
         if ($entry.Key -eq 'shelf_life_unit' -and $null -ne $value) {
             $unitText = ([string]$value).Trim()
             $value = if ($unitText -match '月') { '月' } elseif ($unitText -match '年') { '年' } elseif ($unitText -match '天|日') { '天' } else { $unitText }
@@ -1208,9 +1214,17 @@ function Format-ConfirmationPreview([string]$ChangeId, $Operations, [string]$Fal
             }
             'SetOrderActuals' {
                 $oldItemsText = @($details.old_items) -join '、'
+                $actualItemText = @($details.actual_items | ForEach-Object {
+                    $lineAmount = [math]::Round([double]$_.unit_price * [double]$_.quantity, 2)
+                    "$($_.goods_code)×$($_.quantity)（成交 ¥$lineAmount）"
+                }) -join '、'
+                $costSourceText = @($details.cost_details | ForEach-Object {
+                    "$($_.goods_code)：SKU成本主表第$($_.sku_master_row)行，成本 ¥$($_.unit_cost)"
+                }) -join '；'
                 $lines.Add("实际履约：$($details.daily_order_no)｜订单 $($details.order_no)｜订单汇总第$($details.order_summary_row)行")
                 $lines.Add("实收：¥$($details.old_income) → ¥$($details.new_income)；配送费：¥$($details.old_delivery_fee) → ¥$($details.new_delivery_fee)")
-                $lines.Add("实际商品：$oldItemsText → $($details.new_items)｜$($details.title)｜SKU成本主表第$($details.sku_master_row)行")
+                $lines.Add("实际商品：$oldItemsText → $actualItemText")
+                $lines.Add("成本依据：$costSourceText")
                 $lines.Add("预计货物成本 ¥$($details.expected_new_cost)；预计赚/亏 ¥$($details.expected_new_profit)；美团库存不修改。")
                 foreach ($sheet in @($details.affected_tables)) { if ($sheet) { $null = $impacts.Add([string]$sheet) } }
             }
