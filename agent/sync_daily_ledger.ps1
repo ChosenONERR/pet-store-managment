@@ -661,8 +661,19 @@ foreach ($monthSheet in $monthSheets) {
         $platformFee = Convert-ToNullableNumber (Get-CellValue $row 6)
         $deliveryFee = Convert-ToNullableNumber (Get-CellValue $row 7)
         $deliveryType = Get-CellValue $row 5
-        $platformAmount = if ($null -eq $platformFee) { 0.0 } else { [double]$platformFee }
-        $expenseEntries += [pscustomobject]@{date=$date;project='补单平台扣款';fee=$platformAmount;order_no=$orderNo;source='平台自动识别';note='不含商品进货成本';sort_order=1}
+        $platformAmount = if ($null -eq $platformFee) { $null } else { [double]$platformFee }
+        $platformSource = if ($null -eq $platformFee) { '待识别' } else { '平台自动识别' }
+        $platformNote = if ($null -eq $platformFee) { '平台扣款尚未识别；未知不等于0元' } else { '不含商品进货成本' }
+        if ($null -eq $platformAmount) {
+            $oldPlatformKey = "$orderNo|补单平台扣款"
+            $oldPlatform = if ($oldManagedExpenseByKey.ContainsKey($oldPlatformKey)) { $oldManagedExpenseByKey[$oldPlatformKey] } else { $null }
+            if ($null -ne $oldPlatform -and $null -ne $oldPlatform.fee -and [double]$oldPlatform.fee -gt 0) {
+                $platformAmount = [double]$oldPlatform.fee
+                $platformSource = '历史已确认'
+                $platformNote = '原始补单记录暂缺平台扣款，保留支出表已有已确认金额'
+            }
+        }
+        $expenseEntries += [pscustomobject]@{date=$date;project='补单平台扣款';fee=$platformAmount;order_no=$orderNo;source=$platformSource;note=$platformNote;sort_order=1}
         $autoExpenseCount++
 
         $deliveryTotal = if ($null -eq $deliveryFee) { 0.0 } else { [double]$deliveryFee }

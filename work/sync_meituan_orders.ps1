@@ -234,10 +234,10 @@ function New-InterventionBusinessRecord($Record) {
         daily_order_no = Convert-ToComparableText $Record.DailyOrderNo
         person = Convert-ToComparableText $Record.Person
         order_no = Convert-ToComparableText $Record.OrderNo
-        amount = Convert-ToComparableNumber $Record.Amount
+        amount = Convert-ToComparableNumber $Record.Amount $false
         delivery_type = Convert-ToComparableText $Record.DeliveryType
-        platform_fee = Convert-ToComparableNumber $Record.PlatformFee
-        delivery_fee = Convert-ToComparableNumber $Record.DeliveryFee
+        platform_fee = Convert-ToComparableNumber $Record.PlatformFee $false
+        delivery_fee = Convert-ToComparableNumber $Record.DeliveryFee $false
         restore_state = Convert-ToComparableText $Record.RestoreState
         reviewed = Convert-ToComparableText $Record.Reviewed
         contents = Convert-ToComparableText $Record.Contents
@@ -457,6 +457,7 @@ $orderActualByOrderNo = @{}
 foreach ($override in @(Get-OrderActualOverrides $projectRoot)) {
     $orderActualByOrderNo[[string]$override.order_no] = $override
 }
+$changedOrderNumbers = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 
 foreach ($order in @($extract.orders)) {
     $actualOverride = if ($orderActualByOrderNo.ContainsKey([string]$order.orderNo)) { $orderActualByOrderNo[[string]$order.orderNo] } else { $null }
@@ -509,7 +510,7 @@ foreach ($order in @($extract.orders)) {
         $actualOverrideNote = "实际履约覆盖：实收¥$(([double]$actualOverride.actual_income).ToString('0.00',[Globalization.CultureInfo]::InvariantCulture))；实际售出$actualItemsText；平台库存不由本系统修改"
         if ($actualOverride.note) { $actualOverrideNote += "；$($actualOverride.note)" }
     }
-    $summaryById[[string]$order.orderNo] = [pscustomobject]@{
+    $desiredSummary = [pscustomobject]@{
         OrderDate = [string]$order.orderDate
         Platform = '美团'
         OrderNo = [string]$order.orderNo
@@ -526,6 +527,10 @@ foreach ($order in @($extract.orders)) {
         DailyOrderNo = if ($order.dailyOrderNo) { "美团$($order.dailyOrderNo)号单" } else { $null }
         SortKey = "$($order.orderDate) $($order.orderTime)|$($order.orderNo)"
     }
+    $summaryById[[string]$order.orderNo] = $desiredSummary
+    $existingComparable = if ($null -ne $existingSummary) { ConvertTo-Json -InputObject (New-SummaryBusinessRecord $existingSummary) -Depth 6 -Compress } else { '' }
+    $desiredComparable = ConvertTo-Json -InputObject (New-SummaryBusinessRecord $desiredSummary) -Depth 6 -Compress
+    if ($existingComparable -ne $desiredComparable) { $null = $changedOrderNumbers.Add([string]$order.orderNo) }
 }
 
 $summaryRecords = @($summaryById.Values | Sort-Object SortKey)
@@ -546,6 +551,7 @@ $extractedIds = [Collections.Generic.HashSet[string]]::new([string[]]$extractedO
 $existingItemRows = Get-SheetRows '订单商品' 'A2:Q4001'
 $itemRecords = @()
 $existingItemBusinessRecords = [Collections.Generic.List[object]]::new()
+$existingItemBusinessByOrder = @{}
 $existingSequence = @{}
 $existingCostSnapshots = @{}
 $existingItemsLastRow = 1
@@ -564,12 +570,15 @@ for ($rowIndex = 0; $rowIndex -lt $existingItemRows.Count; $rowIndex++) {
     }
     Add-CostSnapshotToQueue $existingCostSnapshots $snapshotKey $costSnapshot
     if ($fallbackSnapshotKey -ne $snapshotKey) { Add-CostSnapshotToQueue $existingCostSnapshots $fallbackSnapshotKey $costSnapshot }
-    $existingItemBusinessRecords.Add((New-ItemBusinessRecord ([pscustomobject]@{
+    $existingItemBusinessRecord = New-ItemBusinessRecord ([pscustomobject]@{
         OrderDate=Get-CellValue $row 0;Platform=Get-CellValue $row 1;OrderNo=$orderNo;Status=Get-CellValue $row 3
         GoodsCode=Get-CellValue $row 5;Name=Get-CellValue $row 6;Spec=Get-CellValue $row 7;Quantity=Get-CellNumber $row 8
         UnitPrice=Get-CellNumber $row 9;UnitCost=Get-CellNumber $row 11;ItemCost=Get-CellNumber $row 12;Margin=Get-CellNumber $row 13
         ProductId=Get-CellValue $row 16
-    })))
+    })
+    $existingItemBusinessRecords.Add($existingItemBusinessRecord)
+    if (-not $existingItemBusinessByOrder.ContainsKey($orderNo)) { $existingItemBusinessByOrder[$orderNo] = @() }
+    $existingItemBusinessByOrder[$orderNo] += $existingItemBusinessRecord
     if ($extractedIds.Contains($orderNo)) { continue }
     if (-not $existingSequence.ContainsKey($orderNo)) { $existingSequence[$orderNo] = 0 }
     $existingSequence[$orderNo]++
@@ -620,6 +629,17 @@ foreach ($order in @($extract.orders)) {
 $itemRecords = @($itemRecords | Sort-Object SortKey)
 if ($itemRecords.Count -gt 4000) { throw '订单商品超过4000行容量' }
 $desiredItemBusinessRecords = @($itemRecords | ForEach-Object { New-ItemBusinessRecord $_ })
+$desiredItemBusinessByOrder = @{}
+foreach ($record in $desiredItemBusinessRecords) {
+    $orderNo = [string]$record.order_no
+    if (-not $desiredItemBusinessByOrder.ContainsKey($orderNo)) { $desiredItemBusinessByOrder[$orderNo] = @() }
+    $desiredItemBusinessByOrder[$orderNo] += $record
+}
+foreach ($orderNo in $extractedOrderNos) {
+    $existingFingerprint = Get-RecordsFingerprint $(if ($existingItemBusinessByOrder.ContainsKey($orderNo)) { @($existingItemBusinessByOrder[$orderNo]) } else { @() })
+    $desiredFingerprint = Get-RecordsFingerprint $(if ($desiredItemBusinessByOrder.ContainsKey($orderNo)) { @($desiredItemBusinessByOrder[$orderNo]) } else { @() })
+    if ($existingFingerprint -ne $desiredFingerprint) { $null = $changedOrderNumbers.Add([string]$orderNo) }
+}
 $itemsAD = @(); $itemsFJ = @(); $itemsLN = @(); $itemsO = @(); $itemsQ = @()
 foreach ($item in $itemRecords) {
     $itemsAD += ,@((New-ValueCell (Convert-DateDisplayToSerial $item.OrderDate)),(New-ValueCell $item.Platform),(New-ValueCell $item.OrderNo),(New-ValueCell $item.Status))
@@ -653,6 +673,8 @@ foreach ($id in $interventionIds) {
     }
 }
 $interventionUpdated = 0
+$interventionRepairs = [Collections.Generic.List[object]]::new()
+$interventionIssues = [Collections.Generic.List[object]]::new()
 foreach ($order in @($extract.orders)) {
     $id = [string]$order.orderNo
     if (-not $interventionSet.Contains($id)) { continue }
@@ -664,7 +686,7 @@ foreach ($order in @($extract.orders)) {
     $record.Contents = Format-InterventionContents $order.items
     if ($order.dailyOrderNo) { $record.DailyOrderNo = "美团$($order.dailyOrderNo)号单" }
     $record.Amount = $order.customerPay
-    $platformFee = if ($null -eq $order.platformFees) { 0.0 } else { [double]$order.platformFees }
+    $platformFee = if ($null -eq $order.platformFees) { $null } else { [double]$order.platformFees }
     $platformDeliveryFee = if ($null -eq $order.deliveryFee) { 0.0 } else { [double]$order.deliveryFee }
     $existingDeliveryFee = if ($null -eq $record.DeliveryFee) { 0.0 } else { [double]$record.DeliveryFee }
     $deliveryFee = if ($platformDeliveryFee -gt 0) { $platformDeliveryFee } else { $existingDeliveryFee }
@@ -677,13 +699,76 @@ foreach ($order in @($extract.orders)) {
     if ($order.status -eq '已取消' -and $record.RestoreState -eq '待恢复') { $record.RestoreState = '已恢复' }
     $interventionUpdated++
 }
+
+# A reported intervention may be registered after its original order fell out of
+# the current extraction date. Reconcile every intervention against the durable
+# order summary/items already in Feishu, instead of leaving known values blank or
+# converting them to a misleading zero in the monthly expense sheet.
+$itemsByOrder = @{}
+foreach ($itemRecord in $itemRecords) {
+    $itemOrderNo = [string]$itemRecord.OrderNo
+    if (-not $itemOrderNo) { continue }
+    if (-not $itemsByOrder.ContainsKey($itemOrderNo)) { $itemsByOrder[$itemOrderNo] = @() }
+    $itemsByOrder[$itemOrderNo] += $itemRecord
+}
+foreach ($record in $interventionRecords.Values) {
+    $orderNo = [string]$record.OrderNo
+    if (-not (Test-ActiveInterventionOrderNo $orderNo)) { continue }
+    $repairedFields = [Collections.Generic.List[string]]::new()
+    if ($summaryById.Contains($orderNo)) {
+        $summary = $summaryById[$orderNo]
+        if ($summary.OrderDate -and (Convert-ToComparableDate $record.DateTime) -ne (Convert-ToComparableDate $summary.OrderDate)) {
+            $record.DateTime = $summary.OrderDate
+            $repairedFields.Add('日期')
+        }
+        if ($summary.DailyOrderNo -and [string]$record.DailyOrderNo -ne [string]$summary.DailyOrderNo) {
+            $record.DailyOrderNo = $summary.DailyOrderNo
+            $repairedFields.Add('当日单号')
+        }
+        if ($null -ne $summary.CustomerPay -and ($null -eq $record.Amount -or [math]::Abs([double]$record.Amount - [double]$summary.CustomerPay) -gt 0.005)) {
+            $record.Amount = [double]$summary.CustomerPay
+            $repairedFields.Add('补单金额')
+        }
+        if ($null -ne $summary.PlatformFees -and ($null -eq $record.PlatformFee -or [math]::Abs([double]$record.PlatformFee - [double]$summary.PlatformFees) -gt 0.005)) {
+            $record.PlatformFee = [double]$summary.PlatformFees
+            $repairedFields.Add('平台费用')
+        }
+        if (-not $record.Contents -and $itemsByOrder.ContainsKey($orderNo)) {
+            $contents = Format-InterventionContents @($itemsByOrder[$orderNo])
+            if ($contents) {
+                $record.Contents = $contents
+                $repairedFields.Add('购买内容')
+            }
+        }
+    }
+    if ($repairedFields.Count -gt 0) {
+        $interventionRepairs.Add([pscustomobject]@{order_no=$orderNo;fields=@($repairedFields)})
+        $null = $changedOrderNumbers.Add($orderNo)
+    }
+
+    $missingFields = [Collections.Generic.List[string]]::new()
+    if (-not $summaryById.Contains($orderNo)) {
+        $missingFields.Add('订单汇总中找不到原订单')
+    } else {
+        $summary = $summaryById[$orderNo]
+        if (-not $record.DateTime) { $missingFields.Add('日期') }
+        if (-not $record.DailyOrderNo) { $missingFields.Add('当日单号') }
+        if ($null -eq $record.Amount) { $missingFields.Add('补单金额') }
+        if ($null -eq $record.PlatformFee) { $missingFields.Add('平台费用') }
+        if ([double]$summary.ItemCount -gt 0 -and -not $record.Contents) { $missingFields.Add('购买内容') }
+    }
+    if (-not $record.DeliveryType) { $missingFields.Add('配送方式/配送费确认') }
+    if ($missingFields.Count -gt 0) {
+        $interventionIssues.Add([pscustomobject]@{order_no=$orderNo;missing_fields=@($missingFields)})
+    }
+}
 $interventionCells = @()
 foreach ($record in $interventionRecords.Values) {
     $rowNumber = $interventionCells.Count + 2
     $interventionCells += ,@(
         (New-ValueCell $record.DateTime),(New-ValueCell $record.DailyOrderNo),(New-ValueCell $record.Person),(New-ValueCell $record.OrderNo),
-        (New-NumberCell $record.Amount),(New-ValueCell $record.DeliveryType),(New-NumberCell $record.PlatformFee),(New-NumberCell $record.DeliveryFee),
-        @{formula=('=IF(D{0}="","",IFERROR(G{0}*1,0)+IFERROR(H{0}*1,0))' -f $rowNumber);cell_styles=@{number_format='#,##0.00'}},
+        (New-NullableNumberCell $record.Amount),(New-ValueCell $record.DeliveryType),(New-NullableNumberCell $record.PlatformFee),(New-NullableNumberCell $record.DeliveryFee),
+        @{formula=('=IF(D{0}="","",IF(OR(G{0}="",H{0}=""),"",G{0}*1+H{0}*1))' -f $rowNumber);cell_styles=@{number_format='#,##0.00'}},
         (New-ValueCell $record.RestoreState),(New-ValueCell $record.Reviewed),(New-ValueCell $record.Contents),(New-ValueCell $record.Note)
     )
 }
@@ -693,6 +778,12 @@ $summaryChanged = (Get-RecordsFingerprint $existingSummaryBusinessRecords) -ne (
 $itemsChanged = (Get-RecordsFingerprint $existingItemBusinessRecords) -ne (Get-RecordsFingerprint $desiredItemBusinessRecords)
 $interventionsChanged = (Get-RecordsFingerprint $existingInterventionBusinessRecords) -ne (Get-RecordsFingerprint $desiredInterventionBusinessRecords)
 $dataChanged = [bool]$Initialize -or $summaryChanged -or $itemsChanged -or $interventionsChanged
+$affectedMonthKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($orderNo in $changedOrderNumbers) {
+    if (-not $summaryById.Contains($orderNo)) { continue }
+    $date = [datetime]::MinValue
+    if ([datetime]::TryParse([string]$summaryById[$orderNo].OrderDate,[ref]$date)) { $null = $affectedMonthKeys.Add($date.ToString('yyyy-MM')) }
+}
 
 if ($dataChanged) {
     Set-CellMatrix '订单汇总' "A2:D$summaryLastRow" $summaryAD
@@ -749,6 +840,10 @@ $finalResult = [pscustomobject]@{
     natural_orders = $naturalCount
     intervention_orders = $interventionCount
     intervention_updated = $interventionUpdated
+    intervention_repair_count = $interventionRepairs.Count
+    intervention_repairs = @($interventionRepairs)
+    intervention_issue_count = $interventionIssues.Count
+    intervention_issues = @($interventionIssues)
     total_orders_in_workbook = $summaryRecords.Count
     total_items_in_workbook = $itemRecords.Count
     completed_refunds = @($refundMerge.state.events | Where-Object { [string]$_.order_date -ge $StartDate -and [string]$_.order_date -le $EndDate }).Count
@@ -757,6 +852,8 @@ $finalResult = [pscustomobject]@{
     data_changed = [bool]$dataChanged
     writes_skipped = -not [bool]$dataChanged
     change_details = [ordered]@{summary=[bool]$summaryChanged;items=[bool]$itemsChanged;interventions=[bool]$interventionsChanged;initialize_forced=[bool]$Initialize}
+    changed_order_nos = @($changedOrderNumbers | Sort-Object)
+    affected_months = @($affectedMonthKeys | Sort-Object)
     new_item_order_nos = @($newItemOrderNumbers | Sort-Object)
     refund_orders = @($extract.orders | Where-Object { @($_.refunds).Count -gt 0 } | ForEach-Object { [string]$_.orderNo })
     pending_refund_details = @($refundMerge.state.events | Where-Object { [string]$_.order_no -in $extractedOrderNos } | ForEach-Object {

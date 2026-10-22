@@ -40,7 +40,7 @@ Windows 计划任务
   -> 美团只读提取 + 订单/成本/简账同步 + 完整性校验 + 飞书通知
 ```
 
-普通同步必须走轻量路径；夜间日结、退款、干预单、赠品变化、证据不完整或显式 `--full-rebuild` 才允许走重建路径。普通补货只更新补货记录和 SKU 当前成本，不能自动倒改历史订单和简账。
+同步采用三级路径：每小时只处理变化订单；每天 00:00 回看最近 7 天退款、核对全部有效补单，并只修相关订单/月份；每周一 00:00（周日晚结束后）先做全历史只读审计，只有审计失败或显式 `--full-rebuild` 才允许全量重建。证据不完整时停止写入并告警，不得自动扩大范围。普通补货只更新补货记录和 SKU 当前成本，不能自动倒改历史订单和简账。
 
 指定订单或月份刷新若发现旧版数据把正数人工配送费只保存在月度收入表、而订单汇总仍为 0，`agent/sync_daily_ledger.ps1` 会在同一经营事务内按完整订单号把金额回写到订单汇总并增加“人工确认配送费”来源标记，然后继续当前操作。无法唯一定位订单时仍停止；不得静默丢弃或改写存在金额冲突的配送费。
 
@@ -49,11 +49,11 @@ Windows 计划任务
 | 功能 | 主入口 | 读取/写入范围 | 使用说明 |
 |---|---|---|---|
 | 飞书对话记账 | `agent/lark_event_bridge.ps1`、`agent/codex_chat_bridge.py`、`agent/record_finance_event.ps1` | 读飞书消息；确认后写指定经营表 | 所有修改先预览，用户回复“确认”后原子执行 |
-| 美团订单同步 | `work/sync_meituan_orders.ps1`、`work/meituan_order_extract.mjs` | 美团只读；写订单汇总/商品/干预数据 | 绑定唯一 Chrome 店铺；不得修改美团订单或库存 |
+| 美团订单同步 | `work/sync_meituan_orders.ps1`、`work/meituan_order_extract.mjs` | 美团只读；写订单汇总/商品/干预数据 | 绑定唯一 Chrome 店铺；每次按完整订单号用已存订单汇总/商品自愈历史干预单自动字段；不得修改美团订单或库存 |
 | 美团库存同步 | `work/sync_meituan_inventory.ps1`、`work/meituan_inventory_export.mjs` | 美团只读导出；写库存相关飞书表 | 导出器默认字段保持稳定，附加字段通过环境变量请求 |
 | 成本与利润 | `agent/rebuild_cost_snapshots.ps1` | 写订单成本快照和公式结果 | 历史快照默认冻结；只有明确指定订单才改历史成本 |
-| 每日经营简账 | `agent/sync_daily_ledger.ps1` | 写月份收入/支出及驾驶舱来源数据；必要时把旧月表孤立的人工配送费原子归一到订单汇总 | 普通新增订单按月局部刷新；配送费来源分叉可安全自愈；无法唯一定位或金额冲突仍停止；风险场景全量校验 |
-| 推广费 | `agent/sync_promotion_expense.ps1`、`work/meituan_promotion_extract.mjs` | 美团只读；写经营支出 | 日结前读取当天累计消费；读取失败不得猜金额 |
+| 每日经营简账 | `agent/sync_daily_ledger.ps1` | 写月份收入/支出及驾驶舱来源数据；必要时把旧月表孤立的人工配送费原子归一到订单汇总 | 新单、退款、补单和赠品变化只刷新受影响月份；配送费来源分叉可安全自愈；补单平台扣款未知时留空并标记待识别，禁止写成0 |
+| 推广费 | `agent/sync_promotion_expense.ps1`、`work/meituan_promotion_extract.mjs` | 美团只读；写经营支出 | 日结前读取当天累计消费；尚未结算时标记待补并自动重试，不阻断订单同步，不得猜金额 |
 | 退款补偿 | `agent/refund_adjustments.ps1` | 写退款调整及对应成本 | 按退款记录 ID 幂等；退回库存只冲回实际退回商品成本 |
 | 实际履约修正 | `agent/order_actual_overrides.ps1` | 写本地实际商品/配送方式覆盖 | 不修改美团库存，店主手工恢复的平台库存不重复处理 |
 | SKU 主表维护 | `agent/sync_new_skus.ps1`、`agent/sync_sku_master_by_identity.ps1`、`agent/sku_master_schema.ps1` | 写 SKU 成本主表 | 写入前检查重复 KW 和商品身份冲突 |
@@ -101,7 +101,8 @@ Windows 计划任务
 | `agent/run_hidden_scheduled_job.vbs` | 无窗口运行计划任务并返回真实退出码 |
 | `agent/run_hidden_watchdog.vbs` | 无窗口运行消息桥看门狗 |
 | `agent/run_scheduled_job.ps1` | 计划任务统一入口 |
-| `agent/run_sync_and_notify.ps1` | 分阶段同步、事务、审计和飞书通知主编排 |
+| `agent/run_sync_and_notify.ps1` | 分阶段同步、事务、审计和飞书通知主编排；每小时轻量同步，00:00 复核补单/近期退款并仅刷新受影响月份 |
+| `agent/run_weekly_maintenance.ps1` | 每周全历史只读审计；仅审计失败时触发原子化全量重建；不可作为普通同步入口 |
 | `agent/runtime_paths.ps1` | 解析 Python、PowerShell、Lark CLI 等本机路径 |
 | `agent/sku_master_schema.ps1` | SKU 主表字段、规范化和安全访问函数 |
 | `agent/start_hidden_gateway.ps1` | 隐藏启动 Gateway 的 PowerShell 包装 |
@@ -116,7 +117,7 @@ Windows 计划任务
 
 | 文件 | 用途 |
 |---|---|
-| `work/audit_finance_integrity.ps1` | 审计订单、成本、月份简账和经营数据一致性 |
+| `work/audit_finance_integrity.ps1` | 审计订单、成本、月份简账、补单自动字段及经营数据一致性；支持指定月份的日结轻审计和无筛选的每周全历史审计 |
 | `work/audit_sku_master.ps1` | 全面审计 SKU 主表字段和成本状态 |
 | `work/audit_sku_master_duplicates.ps1` | 检查重复 KW、重复商品和冲突档案 |
 | `work/inspect_meituan_product_export_fields.mjs` | 只读查看美团商品导出可选字段 |

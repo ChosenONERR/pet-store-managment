@@ -106,16 +106,21 @@ try {
     $result | ConvertTo-Json -Depth 8
 } catch {
     $reason = $_.Exception.Message
+    $awaitingSettlement = [bool]($reason -match 'Promotion history row.+not settled yet|推广流水.+尚未结算')
     $failure = [ordered]@{
         ok=$false
         date=$dateText
         error=$reason
-        notification='deferred_to_night_sync'
+        status=$(if($awaitingSettlement){'awaiting_settlement'}else{'capture_failed'})
+        notification=$(if($awaitingSettlement){'retry_after_settlement'}else{'deferred_to_night_sync'})
         failed_at=[datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss')
     }
     if (-not $DryRun) {
         Write-AtomicJson (Join-Path $stateRoot 'promotion_expense_last_run.json') $failure
     }
     $failure | ConvertTo-Json -Depth 6
+    # 23:55 时美团尚未结算当天流水属于可预期状态，不把计划任务标成故障。
+    # 00:00 日结和 00:20/00:40 补偿任务仍会继续尝试；真正的抓取错误保持非零退出码。
+    if ($awaitingSettlement) { exit 0 }
     exit 1
 }

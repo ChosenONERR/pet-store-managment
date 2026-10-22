@@ -109,11 +109,13 @@ function Rollback-SyncFinanceTransaction([string]$Reason) {
     return $rollback
 }
 
-function Invoke-FinanceIntegrityAudit {
+function Invoke-FinanceIntegrityAudit([string[]]$MonthKeys = @()) {
     if (-not (Test-Path -LiteralPath $integrityAuditScript -PathType Leaf)) { throw '缺少经营账目一致性审计脚本' }
     $powershellExe = Get-PetstarWindowsPowerShell
     $global:LASTEXITCODE = 0
-    $raw = & $powershellExe -NoProfile -ExecutionPolicy Bypass -File $integrityAuditScript -ProjectRoot $projectRoot | Out-String
+    $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$integrityAuditScript,'-ProjectRoot',$projectRoot)
+    if (@($MonthKeys).Count -gt 0) { $arguments += @('-MonthFilter',(@($MonthKeys | Sort-Object -Unique) -join ',')) }
+    $raw = & $powershellExe @arguments | Out-String
     if ($LASTEXITCODE -ne 0) { throw "经营账目一致性审计执行失败：$($raw.Trim())" }
     try { $result = $raw | ConvertFrom-Json }
     catch { throw "经营账目一致性审计没有返回有效结果：$($_.Exception.Message)" }
@@ -122,6 +124,7 @@ function Invoke-FinanceIntegrityAudit {
         foreach ($spec in @(
             @('重复源订单','duplicate_source_orders'),@('重复收入订单','duplicate_income_orders'),
             @('收入与源表不一致','income_source_mismatches'),@('干预单混入收入','intervention_orders_in_income'),
+            @('补单数据异常','intervention_data_errors'),
             @('利润算术错误','profit_arithmetic_errors'),@('收入排序错误','income_sort_errors'),
             @('自然单缺失','missing_natural_orders'),@('干预支出配对错误','intervention_expense_pair_errors')
         )) {
@@ -148,16 +151,16 @@ function Get-PromotionCaptureState {
         $recoveryOutput = @(& $powershellExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $promotionCaptureScript -Date $dateText -ProjectRoot $projectRoot 2>&1 | ForEach-Object { [string]$_ })
         if ($LASTEXITCODE -ne 0) {
             $recoveryDetail = (($recoveryOutput | Where-Object { $_ -and $_.Trim() }) -join ' ').Trim()
-            throw "当天推广费凌晨补抓未成功：$dateText；$recoveryDetail；已停止日结，避免漏扣推广费"
+            throw "当天推广费凌晨补抓尚未完成：$dateText；$recoveryDetail；订单和本月账目继续核对，净利润暂不作为最终值，系统稍后自动重试"
         }
     }
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw "当天推广费自动读取未成功：$dateText；已停止日结，避免漏扣推广费"
+        throw "当天推广费自动读取尚未完成：$dateText；订单和本月账目继续核对，净利润暂不作为最终值，系统稍后自动重试"
     }
     try { $state = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8) | ConvertFrom-Json }
-    catch { throw "当天推广费状态文件无法读取：$dateText；已停止日结，避免错账" }
+    catch { throw "当天推广费状态文件无法读取：$dateText；订单和本月账目继续核对，净利润暂不作为最终值" }
     if (-not $state.ok -or [string]$state.date -ne $dateText -or $null -eq $state.amount) {
-        throw "当天推广费状态未通过校验：$dateText；已停止日结，避免漏扣推广费"
+        throw "当天推广费状态未通过校验：$dateText；订单和本月账目继续核对，净利润暂不作为最终值"
     }
     return $state
 }
@@ -614,10 +617,10 @@ function Invoke-JsonPowerShellScript([string]$Path, [hashtable]$Arguments) {
     return ($jsonLine | ConvertFrom-Json)
 }
 
-function Invoke-DailyLedgerSync([bool]$CurrentMonthOnly = $false) {
+function Invoke-DailyLedgerSync([string[]]$MonthKeys = @()) {
     $global:LASTEXITCODE = 0
     $ledgerArguments = @{ ThroughDate=$Date; ProjectRoot=$projectRoot }
-    if ($CurrentMonthOnly) { $ledgerArguments.MonthFilter = $Date.ToString('yyyy-MM') }
+    if (@($MonthKeys).Count -gt 0) { $ledgerArguments.MonthFilter = (@($MonthKeys | Sort-Object -Unique) -join ',') }
     $output = @(& $ledgerScript @ledgerArguments 2>&1 | ForEach-Object { [string]$_ })
     if ($LASTEXITCODE -ne 0) {
         $detail = (($output | Where-Object { $_ -and $_.Trim() }) -join ' ').Trim()
@@ -649,7 +652,7 @@ function Test-UseNoChangeFastPath(
     [bool]$WereOrdersSkipped,
     [bool]$ForceFullRebuild = $false
 ) {
-    if ($SyncMode -notin @('midday','reminder','manual') -or $WasSyncSkipped -or $WereOrdersSkipped -or $ForceFullRebuild) { return $false }
+    if ($SyncMode -notin @('midday','reminder','night','manual') -or $WasSyncSkipped -or $WereOrdersSkipped -or $ForceFullRebuild) { return $false }
     if ($null -eq $OrderSyncResult -or $null -eq $GiftSyncResult) { return $false }
     $orderOkProperty = $OrderSyncResult.PSObject.Properties['ok']
     $orderChangedProperty = $OrderSyncResult.PSObject.Properties['data_changed']
@@ -668,19 +671,54 @@ function Test-UseIncrementalChangePath(
     [bool]$WereOrdersSkipped,
     [bool]$ForceFullRebuild = $false
 ) {
-    if ($SyncMode -notin @('midday','reminder','manual') -or $WasSyncSkipped -or $WereOrdersSkipped -or $ForceFullRebuild) { return $false }
+    if ($SyncMode -notin @('midday','reminder','night','manual') -or $WasSyncSkipped -or $WereOrdersSkipped -or $ForceFullRebuild) { return $false }
     if ($null -eq $OrderSyncResult -or $null -eq $GiftSyncResult) { return $false }
-    foreach ($requiredProperty in @('ok','data_changed','change_details','new_item_order_nos','newly_detected_refunds','pending_refund_items','applied_refund_details')) {
+    foreach ($requiredProperty in @('ok','data_changed','change_details','new_item_order_nos','changed_order_nos','affected_months','newly_detected_refunds','pending_refund_items','applied_refund_details')) {
         if ($null -eq $OrderSyncResult.PSObject.Properties[$requiredProperty]) { return $false }
     }
     foreach ($requiredProperty in @('ok','updated_cells')) {
         if ($null -eq $GiftSyncResult.PSObject.Properties[$requiredProperty]) { return $false }
     }
-    if ($OrderSyncResult.ok -ne $true -or $GiftSyncResult.ok -ne $true -or $OrderSyncResult.data_changed -ne $true) { return $false }
-    if ([int]$GiftSyncResult.updated_cells -ne 0) { return $false }
-    if ([int]$OrderSyncResult.newly_detected_refunds -gt 0 -or [int]$OrderSyncResult.pending_refund_items -gt 0 -or @($OrderSyncResult.applied_refund_details).Count -gt 0) { return $false }
-    if ($null -eq $OrderSyncResult.change_details -or $OrderSyncResult.change_details.interventions -eq $true) { return $false }
-    return (@($OrderSyncResult.new_item_order_nos).Count -gt 0)
+    if ($OrderSyncResult.ok -ne $true -or $GiftSyncResult.ok -ne $true) { return $false }
+    if ($null -eq $OrderSyncResult.change_details) { return $false }
+    return ($OrderSyncResult.data_changed -eq $true -or [int]$GiftSyncResult.updated_cells -gt 0)
+}
+
+function Get-TargetedOrderNumbers($OrderSyncResult, $GiftSyncResult) {
+    $targets = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    if ($null -ne $OrderSyncResult) {
+        foreach ($orderNo in @($OrderSyncResult.changed_order_nos) + @($OrderSyncResult.new_item_order_nos) + @($OrderSyncResult.refund_orders)) {
+            if ($orderNo) { $null = $targets.Add([string]$orderNo) }
+        }
+        foreach ($repair in @($OrderSyncResult.intervention_repairs)) {
+            if ($repair.order_no) { $null = $targets.Add([string]$repair.order_no) }
+        }
+    }
+    if ($null -ne $GiftSyncResult) {
+        foreach ($orderNo in @($GiftSyncResult.matched_orders) + @($GiftSyncResult.cancelled_orders)) {
+            if ($orderNo) { $null = $targets.Add([string]$orderNo) }
+        }
+    }
+    return @($targets | Sort-Object)
+}
+
+function Get-TargetedMonthKeys($OrderSyncResult, [string[]]$OrderNumbers, [bool]$IncludeTargetMonth = $false) {
+    $months = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($monthKey in @($OrderSyncResult.affected_months)) {
+        if ($monthKey -match '^20\d{2}-(?:0[1-9]|1[0-2])$') { $null = $months.Add([string]$monthKey) }
+    }
+    if (@($OrderNumbers).Count -gt 0) {
+        $targetSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($orderNo in $OrderNumbers) { if ($orderNo) { $null = $targetSet.Add([string]$orderNo) } }
+        foreach ($row in (Get-SheetRows '订单汇总' 'A2:C2001')) {
+            $orderNo = Get-CellValue $row 2
+            if (-not $orderNo -or -not $targetSet.Contains($orderNo)) { continue }
+            $date = Convert-ToDateValue (Get-CellValue $row 0)
+            if ($null -ne $date) { $null = $months.Add($date.ToString('yyyy-MM')) }
+        }
+    }
+    if ($IncludeTargetMonth) { $null = $months.Add($Date.ToString('yyyy-MM')) }
+    return @($months | Sort-Object)
 }
 
 function Get-CurrentUserOpenId {
@@ -1367,12 +1405,26 @@ try {
         # confirmed writes even though this run cannot mutate valid data.
         Start-SyncFinanceTransaction
         if (-not $SkipOrders) {
-            $stage = Invoke-WithRetry 'order_sync' { Invoke-JsonPowerShellScript $orderScript @{ StartDate = $dateText; EndDate = $dateText } } 3
+            # 日结回看最近 7 天，补抓顾客对旧订单发起的退款；白天整点仍只读当天。
+            $orderStartDate = if ($Mode -eq 'night') { $Date.AddDays(-7).ToString('yyyy-MM-dd') } else { $dateText }
+            $stage = Invoke-WithRetry 'order_sync' { Invoke-JsonPowerShellScript $orderScript @{ StartDate = $orderStartDate; EndDate = $dateText } } 3
             $orderResult = $stage.value
             # A successful authenticated order read resolves the persistent login incident.
             Resolve-FailureNotification 'meituan-auth'
             Resolve-FailureNotification 'meituan-context'
             Resolve-FailureNotification 'meituan-cdp-auth'
+            if ([int]$orderResult.intervention_repair_count -gt 0 -and $Mode -eq 'night') {
+                $repairText = @($orderResult.intervention_repairs | Select-Object -First 8 | ForEach-Object {
+                    "$($_.order_no)（$(@($_.fields) -join '、')）"
+                }) -join '；'
+                $syncWarnings.Add("补单数据自动补救 $([int]$orderResult.intervention_repair_count) 单：$repairText。相关月份支出已随日结重新核对。")
+            }
+            if ([int]$orderResult.intervention_issue_count -gt 0) {
+                $operationalDegraded = $true
+                foreach ($issue in @($orderResult.intervention_issues | Select-Object -First 12)) {
+                    $syncWarnings.Add("补单数据待处理：订单 $($issue.order_no) 缺少 $(@($issue.missing_fields) -join '、')。系统未把未知金额当作0元。")
+                }
+            }
             foreach ($pendingRefund in @($orderResult.pending_refund_details)) {
                 $syncWarnings.Add("退款待确认：订单 $($pendingRefund.order_no)｜$($pendingRefund.goods_code)×$($pendingRefund.quantity)｜顾客退款 ¥$($pendingRefund.refund_amount)；收入已扣减，货物成本暂保留。请告诉经营管家商品是‘已退回入库’、‘未退货’还是‘退回报损’。")
             }
@@ -1416,22 +1468,14 @@ try {
     }
     $useNoChangeFastPath = Test-UseNoChangeFastPath $Mode $orderResult $giftReconcileResult ([bool]$SkipSync) ([bool]$SkipOrders) ([bool]$FullRebuild)
     $useIncrementalChangePath = Test-UseIncrementalChangePath $Mode $orderResult $giftReconcileResult ([bool]$SkipSync) ([bool]$SkipOrders) ([bool]$FullRebuild)
-    if ($useNoChangeFastPath) {
-        $executionPath = 'no_change'
-        $executionPathReason = '订单与赠品数据无变化'
-        foreach ($skippedStage in @('cost_snapshot','formula_verification','daily_ledger','integrity_audit')) {
-            $stageTelemetry[$skippedStage] = [ordered]@{seconds=0.0;attempts=0;skipped=$true;reason='订单与赠品数据无变化'}
-        }
-    } else {
-        $eligibleCostOrders = if ($null -ne $orderResult) { @($orderResult.new_item_order_nos) } else { @() }
-        if ($useIncrementalChangePath) {
-            $executionPath = 'incremental'
-            $executionPathReason = '仅发现新订单，无退款、干预或赠品变更'
-        } else {
-            $executionPath = 'full'
-            $executionPathReason = if ($FullRebuild) { '人工强制完整重建' } elseif ($Mode -eq 'night') { '夜间日结执行完整校验' } else { '存在退款、干预、赠品变更或变更证据不完整' }
-        }
-        $stage = Invoke-WithRetry 'cost_snapshot' { Invoke-CostSnapshotRebuild $eligibleCostOrders $useIncrementalChangePath } 3
+    $summaryOnlyNoSync = [bool]$SkipSync -and -not [bool]$FullRebuild
+    $targetedOrderNumbers = @(Get-TargetedOrderNumbers $orderResult $giftReconcileResult)
+    $targetedMonthKeys = @(Get-TargetedMonthKeys $orderResult $targetedOrderNumbers ($Mode -eq 'night'))
+    if ($targetedMonthKeys.Count -eq 0) { $targetedMonthKeys = @($Date.ToString('yyyy-MM')) }
+    if ($FullRebuild) {
+        $executionPath = 'full'
+        $executionPathReason = '每周全历史审计发现系统性问题，或人工明确要求完整重建'
+        $stage = Invoke-WithRetry 'cost_snapshot' { Invoke-CostSnapshotRebuild @() $false } 3
         $costResult = $stage.value
         $null = Invoke-WithRetry 'formula_verification' {
             Assert-FormulaRange '订单汇总' 'E2:E2001,K2:L2001'
@@ -1441,13 +1485,63 @@ try {
             Assert-FormulaRange '驾驶舱' 'C2:C19'
             return 'success'
         } 3
-
-        $stage = Invoke-WithRetry 'daily_ledger' { Invoke-DailyLedgerSync $useIncrementalChangePath } 3
+        $stage = Invoke-WithRetry 'daily_ledger' { Invoke-DailyLedgerSync @() } 3
         $ledgerResult = $stage.value
-        # 飞书不提供跨工作簿原生事务，因此在提交前做一次全账交叉核对。
-        # 任一重复、漏单、干预单泄漏、配送费丢失或利润算术错误都会触发整批回滚。
-        $stage = Invoke-WithRetry 'integrity_audit' { Invoke-FinanceIntegrityAudit } 2
+        $stage = Invoke-WithRetry 'integrity_audit' { Invoke-FinanceIntegrityAudit @() } 2
         $integrityAuditResult = $stage.value
+    } elseif ($summaryOnlyNoSync) {
+        $executionPath = 'summary_only'
+        $executionPathReason = '仅重新读取并发送现有经营结果'
+        foreach ($skippedStage in @('cost_snapshot','formula_verification','daily_ledger','integrity_audit')) {
+            $stageTelemetry[$skippedStage] = [ordered]@{seconds=0.0;attempts=0;skipped=$true;reason='本次明确跳过同步'}
+        }
+    } elseif ($useNoChangeFastPath) {
+        $executionPath = 'no_change'
+        $executionPathReason = '订单与赠品数据无变化'
+        foreach ($skippedStage in @('cost_snapshot','formula_verification','daily_ledger')) {
+            $stageTelemetry[$skippedStage] = [ordered]@{seconds=0.0;attempts=0;skipped=$true;reason='订单与赠品数据无变化'}
+        }
+        if ($Mode -eq 'night') {
+            # 每日只审计目标月份。发现派生账表不一致时，仅重建该月，不升级为全历史重建。
+            try {
+                $stage = Invoke-WithRetry 'integrity_audit' { Invoke-FinanceIntegrityAudit $targetedMonthKeys } 1
+                $integrityAuditResult = $stage.value
+            } catch {
+                $syncWarnings.Add("本月账表审计发现不一致，已仅刷新 $($targetedMonthKeys -join '、') 后重新核对。")
+                $stage = Invoke-WithRetry 'daily_ledger' { Invoke-DailyLedgerSync $targetedMonthKeys } 2
+                $ledgerResult = $stage.value
+                $stage = Invoke-WithRetry 'integrity_audit' { Invoke-FinanceIntegrityAudit $targetedMonthKeys } 2
+                $integrityAuditResult = $stage.value
+                $executionPath = 'targeted_repair'
+                $executionPathReason = "日结只修复异常月份：$($targetedMonthKeys -join '、')"
+                $useNoChangeFastPath = $false
+            }
+        } else {
+            $stageTelemetry['integrity_audit'] = [ordered]@{seconds=0.0;attempts=0;skipped=$true;reason='白天无变化轻量同步'}
+        }
+    } elseif ($useIncrementalChangePath) {
+        $executionPath = 'targeted'
+        $executionPathReason = "只处理变化订单及相关月份：$($targetedMonthKeys -join '、')"
+        if ($targetedOrderNumbers.Count -gt 0) {
+            $stage = Invoke-WithRetry 'cost_snapshot' { Invoke-CostSnapshotRebuild $targetedOrderNumbers $true } 3
+            $costResult = $stage.value
+        } else {
+            $stageTelemetry['cost_snapshot'] = [ordered]@{seconds=0.0;attempts=0;skipped=$true;reason='变化不涉及订单成本'}
+        }
+        $null = Invoke-WithRetry 'formula_verification' {
+            Assert-FormulaRange '订单汇总' 'E2:E2001,K2:L2001'
+            Assert-FormulaRange '订单商品' 'E2:E4001,K2:K4001,P2:P4001'
+            Assert-FormulaRange '库存快照' 'H2:I2000,K2:K2000,M2:M2000'
+            Assert-FormulaRange '补货记录' 'D2:E1001,G2:G1001'
+            Assert-FormulaRange '驾驶舱' 'C2:C19'
+            return 'success'
+        } 3
+        $stage = Invoke-WithRetry 'daily_ledger' { Invoke-DailyLedgerSync $targetedMonthKeys } 3
+        $ledgerResult = $stage.value
+        $stage = Invoke-WithRetry 'integrity_audit' { Invoke-FinanceIntegrityAudit $targetedMonthKeys } 2
+        $integrityAuditResult = $stage.value
+    } else {
+        throw '同步检测到变化，但无法确定受影响订单或月份；已停止本次写入并保留原账，不自动升级为全历史重建'
     }
     # 当日利润与推广费是账目提交条件；通知卡片中的库存、临期和提醒信息不是。
     # 先完成关键财务回读，避免纯通知读取故障把已通过完整性审计的整套账目回滚。
@@ -1503,14 +1597,14 @@ try {
         mode = $Mode
         fast_path = [ordered]@{
             used = [bool]$useNoChangeFastPath
-            reason = if ($useNoChangeFastPath) { '订单与赠品数据无变化，已跳过成本重建、全量公式校验、每日简账刷新和完整性全量审计' } else { $null }
-            skipped_stages = if ($useNoChangeFastPath) { @('cost_snapshot','formula_verification','daily_ledger','integrity_audit') } else { @() }
+            reason = if ($useNoChangeFastPath) { '订单与赠品数据无变化；白天直接结束，00:00 仅执行本月只读审计' } else { $null }
+            skipped_stages = if ($useNoChangeFastPath) { @('cost_snapshot','formula_verification','daily_ledger') } else { @() }
         }
         execution_path = [ordered]@{
             type = $executionPath
             reason = $executionPathReason
             full_rebuild_requested = [bool]$FullRebuild
-            ledger_scope = if ($useIncrementalChangePath) { $Date.ToString('yyyy-MM') } elseif ($useNoChangeFastPath) { 'skipped' } else { 'all_months' }
+            ledger_scope = if ($FullRebuild) { 'all_months' } elseif ($null -ne $ledgerResult) { @($targetedMonthKeys) } else { 'skipped' }
         }
         sent = [bool]$sendResult.sent
         dry_run = [bool]$sendResult.dry_run

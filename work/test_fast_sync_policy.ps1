@@ -16,11 +16,14 @@ $incrementalFunctionAst = @($ast.FindAll({ param($node) $node -is [Management.Au
 if ($incrementalFunctionAst.Count -ne 1) { throw 'Expected exactly one Test-UseIncrementalChangePath function' }
 Invoke-Expression $incrementalFunctionAst[0].Extent.Text
 
-$unchangedOrder = [pscustomobject]@{ok=$true;data_changed=$false}
+$unchangedOrder = [pscustomobject]@{
+    ok=$true;data_changed=$false;change_details=[pscustomobject]@{summary=$false;items=$false;interventions=$false}
+    new_item_order_nos=@();changed_order_nos=@();affected_months=@();newly_detected_refunds=0;pending_refund_items=0;applied_refund_details=@()
+}
 $changedOrder = [pscustomobject]@{
     ok=$true;data_changed=$true
     change_details=[pscustomobject]@{summary=$true;items=$true;interventions=$false}
-    new_item_order_nos=@('1001');newly_detected_refunds=0;pending_refund_items=0;applied_refund_details=@()
+    new_item_order_nos=@('1001');changed_order_nos=@('1001');affected_months=@('2026-10');newly_detected_refunds=0;pending_refund_items=0;applied_refund_details=@()
 }
 $unchangedGift = [pscustomobject]@{ok=$true;updated_cells=0}
 $changedGift = [pscustomobject]@{ok=$true;updated_cells=2}
@@ -31,8 +34,8 @@ if (-not (Test-UseNoChangeFastPath 'midday' $unchangedOrder $unchangedGift $fals
 if (-not (Test-UseNoChangeFastPath 'reminder' $unchangedOrder $unchangedGift $false $false)) {
     throw 'reminder unchanged data should use the fast path'
 }
-if (Test-UseNoChangeFastPath 'night' $unchangedOrder $unchangedGift $false $false) {
-    throw 'night sync must retain the full flow'
+if (-not (Test-UseNoChangeFastPath 'night' $unchangedOrder $unchangedGift $false $false)) {
+    throw 'night sync without changes should use the light audit path'
 }
 if (-not (Test-UseNoChangeFastPath 'manual' $unchangedOrder $unchangedGift $false $false)) {
     throw 'manual unchanged data should use the fast path unless full rebuild is requested'
@@ -68,26 +71,26 @@ if (-not (Test-UseIncrementalChangePath 'midday' $changedOrder $unchangedGift $f
 if (-not (Test-UseIncrementalChangePath 'manual' $changedOrder $unchangedGift $false $false)) {
     throw 'manual order recovery should use the incremental path'
 }
-if (Test-UseIncrementalChangePath 'night' $changedOrder $unchangedGift $false $false) {
-    throw 'night sync must retain the full flow'
+if (-not (Test-UseIncrementalChangePath 'night' $changedOrder $unchangedGift $false $false)) {
+    throw 'night changes should stay scoped to affected orders and months'
 }
 if (Test-UseIncrementalChangePath 'manual' $changedOrder $unchangedGift $false $false $true) {
     throw 'explicit full rebuild must not use the incremental path'
 }
 $refundOrder = $changedOrder.PSObject.Copy(); $refundOrder.newly_detected_refunds = 1
-if (Test-UseIncrementalChangePath 'midday' $refundOrder $unchangedGift $false $false) {
-    throw 'refund changes must retain the full flow'
+if (-not (Test-UseIncrementalChangePath 'midday' $refundOrder $unchangedGift $false $false)) {
+    throw 'refund changes should use the targeted path'
 }
 $interventionOrder = $changedOrder.PSObject.Copy(); $interventionOrder.change_details = [pscustomobject]@{summary=$true;items=$true;interventions=$true}
-if (Test-UseIncrementalChangePath 'midday' $interventionOrder $unchangedGift $false $false) {
-    throw 'intervention changes must retain the full flow'
+if (-not (Test-UseIncrementalChangePath 'midday' $interventionOrder $unchangedGift $false $false)) {
+    throw 'intervention changes should use the targeted path'
 }
-if (Test-UseIncrementalChangePath 'midday' $changedOrder $changedGift $false $false) {
-    throw 'gift changes must retain the full flow'
+if (-not (Test-UseIncrementalChangePath 'midday' $changedOrder $changedGift $false $false)) {
+    throw 'gift changes should use the targeted path'
 }
 $existingOrderChange = $changedOrder.PSObject.Copy(); $existingOrderChange.new_item_order_nos = @()
-if (Test-UseIncrementalChangePath 'midday' $existingOrderChange $unchangedGift $false $false) {
-    throw 'existing-order changes without new cost targets must retain the full flow'
+if (-not (Test-UseIncrementalChangePath 'midday' $existingOrderChange $unchangedGift $false $false)) {
+    throw 'existing-order changes should use the targeted path'
 }
 
 $orderTokens = $null
@@ -141,5 +144,5 @@ if ($cliSource -notmatch '--full-rebuild' -or $cliSource -notmatch '\("FullRebui
 [ordered]@{
     ok = $true
     cases = 27
-    covered = @('midday_no_change_skips','reminder_no_change_skips','night_does_not_skip','manual_no_change_skips','explicit_full_does_not_skip','order_change_does_not_skip','gift_change_does_not_skip','missing_evidence_does_not_skip','order_missing_ok_does_not_skip','order_ok_false_does_not_skip','gift_missing_ok_does_not_skip','gift_ok_false_does_not_skip','new_order_uses_incremental','manual_recovery_uses_incremental','night_retains_full','explicit_full_retains_full','refund_retains_full','intervention_retains_full','gift_change_retains_full','existing_order_change_retains_full','same_data_same_fingerprint','changed_data_different_fingerprint','all_order_domains_compared','writes_guarded_by_change','incremental_cost_writes_are_targeted','full_cost_repair_is_preserved','cli_full_rebuild_escape_hatch')
+    covered = @('midday_no_change_skips','reminder_no_change_skips','night_no_change_uses_light_audit','manual_no_change_skips','explicit_full_does_not_skip','order_change_is_targeted','gift_change_is_targeted','missing_evidence_does_not_skip','order_missing_ok_does_not_skip','order_ok_false_does_not_skip','gift_missing_ok_does_not_skip','gift_ok_false_does_not_skip','new_order_uses_incremental','manual_recovery_uses_incremental','night_change_is_targeted','explicit_full_retains_full','refund_is_targeted','intervention_is_targeted','gift_is_targeted','existing_order_change_is_targeted','same_data_same_fingerprint','changed_data_different_fingerprint','all_order_domains_compared','writes_guarded_by_change','incremental_cost_writes_are_targeted','full_cost_repair_is_preserved','cli_full_rebuild_escape_hatch')
 } | ConvertTo-Json -Depth 4

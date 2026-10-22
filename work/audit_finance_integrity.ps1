@@ -1,4 +1,7 @@
-﻿param([string]$ProjectRoot = (Split-Path $PSScriptRoot -Parent))
+﻿param(
+    [string]$ProjectRoot = (Split-Path $PSScriptRoot -Parent),
+    [string]$MonthFilter
+)
 
 $ErrorActionPreference = 'Stop'
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -46,6 +49,19 @@ function Get-LedgerMonth([string]$SheetName) {
     return $null
 }
 
+$selectedMonthKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+if ($MonthFilter) {
+    foreach ($monthKey in @($MonthFilter -split '[,，;；\s]+' | Where-Object { $_ })) {
+        if ($monthKey -notmatch '^20\d{2}-(?:0[1-9]|1[0-2])$') { throw "月份筛选格式无效：$monthKey（应为 yyyy-MM）" }
+        $null = $selectedMonthKeys.Add($monthKey)
+    }
+}
+function Test-DateInScope($Value) {
+    if ($selectedMonthKeys.Count -eq 0) { return $true }
+    $date = To-Date $Value
+    return ($null -ne $date -and $selectedMonthKeys.Contains($date.ToString('yyyy-MM')))
+}
+
 $sourceRows = (Get-Rows $sourceToken '订单汇总' 'A2:Q2001').rows
 $orderItemRows = (Get-Rows $sourceToken '订单商品' 'A2:Q4001').rows
 $interventionRows = (Get-Rows $sourceToken '干预订单' 'A2:M1001').rows
@@ -55,7 +71,9 @@ $info = $infoRaw | ConvertFrom-Json
 $monthSheets = @($info.data.sheets | ForEach-Object {
     $month = Get-LedgerMonth ([string]$_.sheet_name)
     if ($null -ne $month -and $month -ge [datetime]'2026-08-01' -and $month -le [datetime]::Today.Date) {
-        [pscustomobject]@{name=[string]$_.sheet_name;month=$month}
+        if ($selectedMonthKeys.Count -eq 0 -or $selectedMonthKeys.Contains($month.ToString('yyyy-MM'))) {
+            [pscustomobject]@{name=[string]$_.sheet_name;month=$month}
+        }
     }
 } | Sort-Object month,name)
 $incomeSheets = @($monthSheets | Where-Object { $_.name.EndsWith('收入') })
@@ -69,6 +87,7 @@ foreach ($sheet in $expenseSheets) { foreach ($row in (Get-Rows $ledgerToken $sh
 $sourceByOrder = @{}
 $duplicateSourceOrders = @()
 foreach ($row in $sourceRows) {
+    if (-not (Test-DateInScope (Get-CellValue $row 0))) { continue }
     $orderNo = Get-CellValue $row 2
     if (-not $orderNo) { continue }
     if ($sourceByOrder.ContainsKey($orderNo)) { $duplicateSourceOrders += $orderNo; continue }
@@ -76,6 +95,7 @@ foreach ($row in $sourceRows) {
 }
 $itemQuantityByOrder = @{}
 foreach ($row in $orderItemRows) {
+    if (-not (Test-DateInScope (Get-CellValue $row 0))) { continue }
     $orderNo = Get-CellValue $row 2
     if (-not $orderNo) { continue }
     $quantity = To-Number (Get-CellValue $row 8)
@@ -93,9 +113,14 @@ foreach ($orderNo in $sourceByOrder.Keys) {
     }
 }
 $interventionSet = @{}
+$interventionByOrder = @{}
 foreach ($row in $interventionRows) {
+    if (-not (Test-DateInScope (Get-CellValue $row 0))) { continue }
     $orderNo = Get-CellValue $row 3
-    if (Test-ActiveInterventionOrderNo $orderNo) { $interventionSet[$orderNo] = $true }
+    if (Test-ActiveInterventionOrderNo $orderNo) {
+        $interventionSet[$orderNo] = $true
+        $interventionByOrder[$orderNo] = $row
+    }
 }
 
 $incomeByOrder = @{}
@@ -151,10 +176,18 @@ foreach ($orderNo in $sourceByOrder.Keys) {
     $row = $sourceByOrder[$orderNo]
     $date = To-Date (Get-CellValue $row 0)
     if ($null -eq $date -or $date -lt [datetime]'2026-08-24' -or $date -gt [datetime]::Today) { continue }
-    if ((Get-CellValue $row 3) -ne '已取消' -and (Get-CellValue $row 4) -eq '自然' -and -not $incomeByOrder.ContainsKey($orderNo)) { $missingNaturalOrders += $orderNo }
+    # 干预订单在订单汇总里仍可能保留“自然”类型，但会从月度收入表移出，
+    # 改由干预订单及对应支出记录核算。不能把这类订单误报为自然订单漏账。
+    if ((Get-CellValue $row 3) -ne '已取消' -and
+        (Get-CellValue $row 4) -eq '自然' -and
+        -not $interventionSet.ContainsKey($orderNo) -and
+        -not $incomeByOrder.ContainsKey($orderNo)) {
+        $missingNaturalOrders += $orderNo
+    }
 }
 
 $expensePairCounts = @{}
+$expenseByKey = @{}
 foreach ($row in $expenseRows) {
     $project = Get-CellValue $row 1
     $orderNo = Get-CellValue $row 3
@@ -162,6 +195,7 @@ foreach ($row in $expenseRows) {
     $key = "$orderNo|$project"
     if (-not $expensePairCounts.ContainsKey($key)) { $expensePairCounts[$key] = 0 }
     $expensePairCounts[$key]++
+    $expenseByKey[$key] = $row
 }
 $expensePairErrors = @()
 foreach ($orderNo in $interventionSet.Keys) {
@@ -172,8 +206,47 @@ foreach ($orderNo in $interventionSet.Keys) {
     }
 }
 
+$interventionDataErrors = @()
+foreach ($orderNo in $interventionSet.Keys) {
+    $intervention = $interventionByOrder[$orderNo]
+    if (-not $sourceByOrder.ContainsKey($orderNo)) {
+        $interventionDataErrors += "$orderNo|missing_order_summary"
+        continue
+    }
+    $source = $sourceByOrder[$orderNo]
+    $sourceDate = To-Date (Get-CellValue $source 0)
+    $interventionDate = To-Date (Get-CellValue $intervention 0)
+    if ($null -eq $interventionDate -or $interventionDate -ne $sourceDate) {
+        $interventionDataErrors += "$orderNo|date|$interventionDate|$sourceDate"
+    }
+    if (-not (Get-CellValue $intervention 1)) { $interventionDataErrors += "$orderNo|missing_daily_order_no" }
+    $sourceAmount = To-Number (Get-CellValue $source 6)
+    $interventionAmount = To-Number (Get-CellValue $intervention 4)
+    if ($null -eq $interventionAmount -or $null -eq $sourceAmount -or [math]::Abs($interventionAmount-$sourceAmount) -gt 0.02) {
+        $interventionDataErrors += "$orderNo|amount|$interventionAmount|$sourceAmount"
+    }
+    $sourcePlatformFee = To-Number (Get-CellValue $source 8)
+    $interventionPlatformFee = To-Number (Get-CellValue $intervention 6)
+    if ($null -eq $interventionPlatformFee -or $null -eq $sourcePlatformFee -or [math]::Abs($interventionPlatformFee-$sourcePlatformFee) -gt 0.02) {
+        $interventionDataErrors += "$orderNo|platform_fee|$interventionPlatformFee|$sourcePlatformFee"
+    }
+    $sourceItemCount = To-Number (Get-CellValue $source 12)
+    if ($null -ne $sourceItemCount -and $sourceItemCount -gt 0 -and -not (Get-CellValue $intervention 11)) {
+        $interventionDataErrors += "$orderNo|missing_contents"
+    }
+    $expenseKey = "$orderNo|补单平台扣款"
+    if ($expenseByKey.ContainsKey($expenseKey)) {
+        $expensePlatformFee = To-Number (Get-CellValue $expenseByKey[$expenseKey] 2)
+        if ($null -eq $expensePlatformFee -or $null -eq $sourcePlatformFee -or [math]::Abs($expensePlatformFee-$sourcePlatformFee) -gt 0.02) {
+            $interventionDataErrors += "$orderNo|expense_platform_fee|$expensePlatformFee|$sourcePlatformFee"
+        }
+    }
+}
+
 [ordered]@{
-    ok = ($duplicateSourceOrders.Count -eq 0 -and $duplicateIncomeOrders.Count -eq 0 -and $incomeSourceMismatch.Count -eq 0 -and $unmigratedManualDelivery.Count -eq 0 -and $interventionLeak.Count -eq 0 -and $arithmeticErrors.Count -eq 0 -and $sortErrors.Count -eq 0 -and $missingNaturalOrders.Count -eq 0 -and $expensePairErrors.Count -eq 0 -and $orderItemQuantityMismatches.Count -eq 0)
+    ok = ($duplicateSourceOrders.Count -eq 0 -and $duplicateIncomeOrders.Count -eq 0 -and $incomeSourceMismatch.Count -eq 0 -and $unmigratedManualDelivery.Count -eq 0 -and $interventionLeak.Count -eq 0 -and $arithmeticErrors.Count -eq 0 -and $sortErrors.Count -eq 0 -and $missingNaturalOrders.Count -eq 0 -and $expensePairErrors.Count -eq 0 -and $orderItemQuantityMismatches.Count -eq 0 -and $interventionDataErrors.Count -eq 0)
+    scope = $(if ($selectedMonthKeys.Count -gt 0) { 'selected_months' } else { 'all_history' })
+    month_filter = @($selectedMonthKeys | Sort-Object)
     source_orders = $sourceByOrder.Count
     income_orders = $incomeByOrder.Count
     intervention_orders = $interventionSet.Count
@@ -188,5 +261,6 @@ foreach ($orderNo in $interventionSet.Keys) {
     income_sort_errors = $sortErrors
     missing_natural_orders = $missingNaturalOrders
     intervention_expense_pair_errors = $expensePairErrors
+    intervention_data_errors = $interventionDataErrors
     order_item_quantity_mismatches = $orderItemQuantityMismatches
 } | ConvertTo-Json -Depth 8

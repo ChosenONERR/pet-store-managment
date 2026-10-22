@@ -14,12 +14,13 @@ if (-not (Test-Path -LiteralPath $watchdogLauncher -PathType Leaf)) { throw "Wat
 if (-not (Test-Path -LiteralPath $wscript -PathType Leaf)) { throw "Windows Script Host not found: $wscript" }
 
 $specs = @(
-    [ordered]@{Name='Petstar-Hourly-Sync';Job='Hourly';At='09:00-22:00 hourly'},
-    [ordered]@{Name='Petstar-Input-Reminder';Job='Reminder';At='23:00'},
-    [ordered]@{Name='Petstar-Promotion-Expense';Job='Promotion';At='23:55'},
-    [ordered]@{Name='Petstar-Night-Sync';Job='Night';At='00:00'},
-    [ordered]@{Name='Petstar-Night-Recovery-0020';Job='NightRecovery';At='00:20'},
-    [ordered]@{Name='Petstar-Night-Recovery-0040';Job='NightRecovery';At='00:40'}
+    [ordered]@{Name='Petstar-Hourly-Sync';Job='Hourly';At='09:00-22:00 hourly';Schedule='Hourly'},
+    [ordered]@{Name='Petstar-Input-Reminder';Job='Reminder';At='23:00';Schedule='Daily'},
+    [ordered]@{Name='Petstar-Promotion-Expense';Job='Promotion';At='23:55';Schedule='Daily'},
+    [ordered]@{Name='Petstar-Night-Sync';Job='Night';At='00:00';Schedule='Weekly';Days=@('Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday')},
+    [ordered]@{Name='Petstar-Weekly-Audit';Job='Weekly';At='00:00';Schedule='Weekly';Days=@('Monday')},
+    [ordered]@{Name='Petstar-Night-Recovery-0020';Job='NightRecovery';At='00:20';Schedule='Daily'},
+    [ordered]@{Name='Petstar-Night-Recovery-0040';Job='NightRecovery';At='00:40';Schedule='Daily'}
 )
 
 if (-not $Apply) {
@@ -27,7 +28,7 @@ if (-not $Apply) {
     exit 0
 }
 
-$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 60) -MultipleInstances IgnoreNew
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 90) -MultipleInstances IgnoreNew
 $installed = [Collections.Generic.List[object]]::new()
 $watchdogAction = New-ScheduledTaskAction -Execute $wscript -Argument ('//B //Nologo "{0}"' -f $watchdogLauncher)
 $watchdogTrigger = New-ScheduledTaskTrigger -Once -At ([datetime]::Now.AddMinutes(1)) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
@@ -36,8 +37,10 @@ $watchdogTask = Get-ScheduledTask -TaskName 'Petstar-Lark-Event-Watchdog' -Error
 $installed.Add([ordered]@{name='Petstar-Lark-Event-Watchdog';state=[string]$watchdogTask.State;job='Watchdog';at='every 5 minutes'})
 foreach ($spec in $specs) {
     $action = New-ScheduledTaskAction -Execute $wscript -Argument ('//B //Nologo "{0}" {1}' -f $launcher,$spec.Job)
-    if ($spec.Job -eq 'Hourly') {
+    if ($spec.Schedule -eq 'Hourly') {
         $trigger = @(9..22 | ForEach-Object { New-ScheduledTaskTrigger -Daily -At ('{0:D2}:00' -f $_) })
+    } elseif ($spec.Schedule -eq 'Weekly') {
+        $trigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek $spec.Days -At $spec.At
     } else {
         $trigger = New-ScheduledTaskTrigger -Daily -At $spec.At
     }
