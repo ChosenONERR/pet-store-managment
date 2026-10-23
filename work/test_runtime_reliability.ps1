@@ -77,6 +77,8 @@ $contracts = [ordered]@{
     watchdog_repairs_orphan_consumers = ($watchdog -match 'function Repair-OrphanEventConsumers' -and $watchdog -match 'consumer_pids')
     replenishment_remote_idempotency = ($financeEvent -match "eventBatchId" -and $financeEvent -match "T\$\{rowNumber\}:T\$\{rowNumber\}" -and $financeEvent -match 'existingEventIndex' -and $financeEvent -match 'existingAfterQuantity')
     replenishment_duplicate_sku_guard = ($financeEvent -match 'Get-SkuCodeCandidates' -and $financeEvent -match '已停止补货写入，避免新增重复档案')
+    batch_sku_json_array_is_flattened_for_windows_powershell = ($financeEvent -match 'Windows PowerShell 5\.1 preserves a top-level JSON array' -and $financeEvent -match '\$item -is \[Array\]' -and $financeEvent -match 'Write-Output -NoEnumerate \$operation' -and $financeEvent -match '\$beforeInventoryValue = if' -and $financeEvent -match '\$cell -is \[Collections\.IDictionary\]')
+    replenishment_duplicate_code_uses_only_unique_active_platform_identity = ($financeEvent -match '\$activeMatches\.Count -ne 1' -and $financeEvent -match "\$candidateStatus -eq '售卖中'" -and $financeEvent -match 'matched_unique_active_platform_sku' -and $bridge -match '未删除或修改其他同号行')
     sku_sync_prewrite_duplicate_guard = ($skuSync -match 'duplicateNewKw' -and $skuSync -match '已在写入前停止')
     recovery_cooldown = ($watchdog -match 'Test-NightRecoveryCooldown' -and $watchdog -match 'night_recovery_attempt\.json')
     noexit_cli_wrapper = ($wrapper -notmatch '(?m)^\s*exit\s+' -and $wrapper -match 'node')

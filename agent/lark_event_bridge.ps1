@@ -1248,6 +1248,7 @@ function Format-ConfirmationPreview([string]$ChangeId, $Operations, [string]$Fal
                 $lines.Add("SKU当前移动平均成本：$afterCostText；不会重算历史订单、收入、利润或经营简账。")
                 if ($details.sku_status -eq 'will_create_pending_profile') { $lines.Add('SKU主表尚无该货号；确认后会先建立待平台同步档案。') }
                 if ($details.sku_status -eq 'will_attach_kw_by_csx') { $lines.Add("已通过 $($details.transition_code) 唯一找到 SKU主表第$($details.sku_master_row)行；确认后绑定当前KW为 $($details.goods_code)。") }
+                if ($details.sku_status -eq 'matched_unique_active_platform_sku') { $lines.Add("主表存在旧的同号档案；本次已按唯一在售商品ID定位到第$($details.sku_master_row)行，未删除或修改其他同号行。") }
                 $null = $impacts.Add('补货记录及SKU成本主表')
             }
             'SetSkuBatchDate' {

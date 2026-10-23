@@ -147,6 +147,10 @@ function Get-CellValue($Row, [int]$Index) {
     if ($null -eq $Row -or $Index -ge @($Row).Count) { return $null }
     $cell = @($Row)[$Index]
     if ($null -eq $cell) { return $null }
+    if ($cell -is [Collections.IDictionary]) {
+        if (-not $cell.Contains('value') -or $null -eq $cell['value']) { return $null }
+        return [string]$cell['value']
+    }
     $valueProperty = $cell.PSObject.Properties['value']
     if ($null -eq $valueProperty -or $null -eq $valueProperty.Value) { return $null }
     return [string]$valueProperty.Value
@@ -795,9 +799,28 @@ function Get-BatchOperationsPayload {
         $json = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $OperationsPath).Path,[Text.Encoding]::UTF8)
     }
     if (-not $json) { throw '批量 SKU 维护必须提供 operations JSON' }
-    try { $operations = @($json | ConvertFrom-Json) } catch { throw "批量 SKU 维护参数不是有效 JSON：$($_.Exception.Message)" }
+    try { $parsed = $json | ConvertFrom-Json } catch { throw "批量 SKU 维护参数不是有效 JSON：$($_.Exception.Message)" }
+
+    # Windows PowerShell 5.1 preserves a top-level JSON array as one nested
+    # Object[] pipeline item. Flatten it explicitly so a two-operation batch is
+    # never passed to Invoke-BatchSkuMaintenance as one action-less wrapper.
+    $operations = [Collections.Generic.List[object]]::new()
+    foreach ($item in @($parsed)) {
+        if ($item -is [Array]) {
+            foreach ($nestedItem in $item) { $operations.Add($nestedItem) }
+        } else {
+            $operations.Add($item)
+        }
+    }
     if ($operations.Count -eq 0) { throw '批量 SKU 维护没有可执行项目' }
-    return $operations
+    for ($index = 0; $index -lt $operations.Count; $index++) {
+        $operationAction = [string](Get-BatchArgument $operations[$index] 'action')
+        $operationArguments = Get-BatchArgument $operations[$index] 'arguments'
+        if (-not $operationAction -or $null -eq $operationArguments) {
+            throw "批量 SKU 维护第$($index+1)项缺少 action 或 arguments"
+        }
+    }
+    foreach ($operation in $operations) { Write-Output -NoEnumerate $operation }
 }
 
 function Test-NullableNumberEqual($Actual, $Expected) {
@@ -885,9 +908,25 @@ function Invoke-BatchSkuMaintenance([object[]]$Operations) {
         $requestedKw = if ($normalizedCode -match '^kw') { $normalizedCode } else { $null }
         $requestedCsx = if ($normalizedTransition) { $normalizedTransition } elseif ($normalizedCode -match '^csx') { $normalizedCode } else { $null }
         $candidateRows = @{}
+        $duplicateResolutionRows = [Collections.Generic.HashSet[int]]::new()
         foreach ($lookupCode in @($normalizedCode,$normalizedTransition | Where-Object { $_ } | Select-Object -Unique)) {
             $matches = @(Get-SkuCodeCandidates $skuRows $lookupCode)
-            if ($matches.Count -gt 1) { throw "SKU成本主表中的货号 $lookupCode 重复出现在第 $(@($matches|ForEach-Object{$_.row_number}) -join '、') 行；批量补货未写入" }
+            if ($matches.Count -gt 1) {
+                $activeMatches = @($matches | Where-Object {
+                    $candidateCells = $_.cells
+                    $candidateProductId = [string](Get-CellValue $candidateCells $skuSchema.ProductId.Index)
+                    $candidateStatus = [string](Get-CellValue $candidateCells $skuSchema.PlatformStatus.Index)
+                    $candidateProductId -and $candidateStatus -eq '售卖中'
+                })
+                if ($activeMatches.Count -ne 1) {
+                    throw "SKU成本主表中的货号 $lookupCode 重复出现在第 $(@($matches|ForEach-Object{$_.row_number}) -join '、') 行，且无法唯一确定在售平台商品；批量补货未写入"
+                }
+                $selectedRow = [int]$activeMatches[0].row_number
+                foreach ($duplicateMatch in $matches) {
+                    if ([int]$duplicateMatch.row_number -ne $selectedRow) { $null = $duplicateResolutionRows.Add([int]$duplicateMatch.row_number) }
+                }
+                $matches = @($activeMatches[0])
+            }
             if ($matches.Count -eq 1) { $candidateRows[[string]$matches[0].row_number] = $matches[0] }
         }
         if ($candidateRows.Count -gt 1) { throw "第$($operationIndex+1)项提供的 KW/CSX 指向不同 SKU 行；批量操作未写入" }
@@ -927,7 +966,8 @@ function Invoke-BatchSkuMaintenance([object[]]$Operations) {
         $beforeQuantity = if ($newSku) { 0.0 } else { Convert-ToNullableNumber (Get-CellValue $cells $skuSchema.CostBookQuantity.Index) }; if ($null -eq $beforeQuantity) { $beforeQuantity = 0.0 }
         $beforeAverage = if ($newSku) { $null } else { Convert-ToNullableNumber (Get-CellValue $cells $skuSchema.MovingAverageCost.Index) }
         $afterQuantity = [double]$beforeQuantity + $salesQuantity
-        $afterAverage = if ($null -eq $beforeAverage -and [double]$beforeQuantity -gt 0) { $null } else { ((if($null-eq$beforeAverage){0.0}else{[double]$beforeAverage*[double]$beforeQuantity}) + [double]$purchaseAmountValue) / $afterQuantity }
+        $beforeInventoryValue = if ($null -eq $beforeAverage) { 0.0 } else { [double]$beforeAverage * [double]$beforeQuantity }
+        $afterAverage = if ($null -eq $beforeAverage -and [double]$beforeQuantity -gt 0) { $null } else { ($beforeInventoryValue + [double]$purchaseAmountValue) / $afterQuantity }
         $noteValue = [string](Get-BatchArgument $arguments 'note')
         if ($newSku) {
             $zeroCost = [double]$purchaseAmountValue -eq 0
@@ -963,7 +1003,7 @@ function Invoke-BatchSkuMaintenance([object[]]$Operations) {
         $matrix=@();$matrix+=,$rowCells;$writes.Add(@{shortcut='+cells-set';input=@{sheet_name='补货记录';range="A${rowNumber}:T${rowNumber}";cells=$matrix}})
         $expectedSku[[string]$skuRowNumber]=[pscustomobject]@{baseline=Convert-ToNullableNumber (Get-CellValue $cells $skuSchema.BaselineUnitCost.Index);moving=$afterAverage;quantity=$afterQuantity;status=Get-CellValue $cells $skuSchema.CostStatus.Index}
         $expectedReplenishment[[string]$rowNumber]=[pscustomobject]@{goods_code=$displayCode;quantity=[double]$quantityValue;purchase_amount=[double]$purchaseAmountValue;batch_id=$batchId;after_quantity=$afterQuantity;after_average=$afterAverage};$null=$formulaRows.Add($rowNumber)
-        $results.Add([pscustomobject]@{row=$rowNumber;sku_master_row=$skuRowNumber;goods_code=$displayCode;transition_code=$requestedCsx;product_id=$productId;package_quantity=[double]$quantityValue;sales_unit_quantity=$salesQuantity;purchase_amount=[double]$purchaseAmountValue;payment_amount=$paymentAmountValue;unit_cost=$incomingUnitCost;before_quantity=$beforeQuantity;before_average_cost=$beforeAverage;after_quantity=$afterQuantity;after_average_cost=$afterAverage;production_date=$(if($productionDateValue){$productionDateValue.ToString('yyyy-MM-dd')}else{$null});expiry_date=$(if($expiry){$expiry.ToString('yyyy-MM-dd')}else{$null});sku_status=$(if($newSku){$(if($DryRun){'will_create_pending_profile'}else{'created_pending_profile'})}elseif($mappingUpdate){$(if($DryRun){'will_attach_kw_by_csx'}else{'attached_kw_by_csx'})}else{'matched'});affected_tables=@('补货记录','SKU成本主表');remote_replay=$false})
+        $results.Add([pscustomobject]@{row=$rowNumber;sku_master_row=$skuRowNumber;goods_code=$displayCode;transition_code=$requestedCsx;product_id=$productId;package_quantity=[double]$quantityValue;sales_unit_quantity=$salesQuantity;purchase_amount=[double]$purchaseAmountValue;payment_amount=$paymentAmountValue;unit_cost=$incomingUnitCost;before_quantity=$beforeQuantity;before_average_cost=$beforeAverage;after_quantity=$afterQuantity;after_average_cost=$afterAverage;production_date=$(if($productionDateValue){$productionDateValue.ToString('yyyy-MM-dd')}else{$null});expiry_date=$(if($expiry){$expiry.ToString('yyyy-MM-dd')}else{$null});sku_status=$(if($newSku){$(if($DryRun){'will_create_pending_profile'}else{'created_pending_profile'})}elseif($mappingUpdate){$(if($DryRun){'will_attach_kw_by_csx'}else{'attached_kw_by_csx'})}elseif($duplicateResolutionRows.Count-gt0){'matched_unique_active_platform_sku'}else{'matched'});duplicate_rows_ignored=@($duplicateResolutionRows|Sort-Object);affected_tables=@('补货记录','SKU成本主表');remote_replay=$false})
     }
 
     if ($DryRun) {
