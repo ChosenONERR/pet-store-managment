@@ -20,6 +20,7 @@ with tempfile.TemporaryDirectory(prefix="petstar-codex-test-") as temp_dir:
     bridge.SESSION_STATE = state_root / "state.json"
     bridge.EVENT_CACHE = state_root / "cache.json"
     bridge.LOCK_PATH = state_root / "bridge.lock"
+    bridge.RATE_LIMIT_STATE_PATH = state_root / "rate-limit.json"
     calls: list[dict[str, str]] = []
 
     def fake_invoke(prompt: str, session_id: str = ""):
@@ -60,6 +61,11 @@ with tempfile.TemporaryDirectory(prefix="petstar-codex-test-") as temp_dir:
     assert "不能说“看不到表格”" in calls[0]["prompt"]
     assert "当前 KW（没有则显示过渡货号）" in calls[0]["prompt"]
     assert "SKU成本主表行号" in calls[0]["prompt"]
+    bridge.cache_response("stale-message", "normal", {"reply": "old", "needs_information": False, "actions": []})
+    bridge.cache_response("stale-message", "preview", {"reply": "old preview", "needs_information": False, "actions": []})
+    assert bridge.invalidate_event_cache("stale-message") == 2
+    assert bridge.get_cached_response("stale-message", "normal") is None
+    assert bridge.get_cached_response("stale-message", "preview") is None
 
 runtime = bridge.check_runtime()
 assert runtime["query_tool_exists"], "经营数据只读查询工具未就绪"
@@ -111,6 +117,7 @@ with tempfile.TemporaryDirectory(prefix="petstar-codex-tool-loop-") as temp_dir:
     bridge.SESSION_STATE = state_root / "state.json"
     bridge.EVENT_CACHE = state_root / "cache.json"
     bridge.LOCK_PATH = state_root / "bridge.lock"
+    bridge.RATE_LIMIT_STATE_PATH = state_root / "rate-limit.json"
     invoke_calls: list[str] = []
     query_calls: list[list[dict]] = []
 
@@ -165,6 +172,7 @@ with tempfile.TemporaryDirectory(prefix="petstar-codex-repeat-guard-") as temp_d
     bridge.SESSION_STATE = state_root / "state.json"
     bridge.EVENT_CACHE = state_root / "cache.json"
     bridge.LOCK_PATH = state_root / "bridge.lock"
+    bridge.RATE_LIMIT_STATE_PATH = state_root / "rate-limit.json"
     repeat_calls: list[str] = []
     repeat_query_calls: list[list[dict]] = []
 
@@ -190,3 +198,40 @@ with tempfile.TemporaryDirectory(prefix="petstar-codex-repeat-guard-") as temp_d
     assert "相同数据" in repeat_calls[-1], "重复查询熔断后没有要求 Codex 整理现有证据"
 
 print("Codex bounded tool loop contract OK")
+
+
+with tempfile.TemporaryDirectory(prefix="petstar-codex-rate-limit-") as temp_dir:
+    state_root = pathlib.Path(temp_dir)
+    bridge.STATE_ROOT = state_root
+    bridge.SESSION_STATE = state_root / "state.json"
+    bridge.EVENT_CACHE = state_root / "cache.json"
+    bridge.LOCK_PATH = state_root / "bridge.lock"
+    bridge.RATE_LIMIT_STATE_PATH = state_root / "rate-limit.json"
+    rate_limit_calls: list[str] = []
+
+    def fake_rate_limited_invoke(prompt: str, session_id: str = ""):
+        rate_limit_calls.append(prompt)
+        raise RuntimeError('exceeded retry limit, last status: 429 Too Many Requests')
+
+    bridge.invoke_codex = fake_rate_limited_invoke
+    limited = bridge.process_message("查询经营情况", "rate-limit-1", "normal")
+    limited_during_cooldown = bridge.process_message("再查询一次", "rate-limit-2", "normal")
+    assert not limited["ok"] and limited["retryable"]
+    assert limited["retry_after_seconds"] >= bridge.RATE_LIMIT_BASE_SECONDS
+    assert not limited_during_cooldown["ok"] and limited_during_cooldown["retryable"]
+    assert len(rate_limit_calls) == 1, "429 后仍立即重复调用 Codex"
+
+    state = bridge.load_json(bridge.RATE_LIMIT_STATE_PATH, {})
+    state["retry_at_epoch"] = 0
+    bridge.save_json(bridge.RATE_LIMIT_STATE_PATH, state)
+
+    def fake_recovered_invoke(prompt: str, session_id: str = ""):
+        rate_limit_calls.append(prompt)
+        return ({"reply": "已恢复。", "needs_information": False, "queries": [], "actions": []}, "recovered-session")
+
+    bridge.invoke_codex = fake_recovered_invoke
+    recovered = bridge.process_message("恢复后重试", "rate-limit-3", "normal")
+    assert recovered["ok"] and recovered["reply"] == "已恢复。"
+    assert not bridge.RATE_LIMIT_STATE_PATH.exists(), "成功调用后没有清除 429 冷却状态"
+
+print("Codex rate-limit cooldown/recovery contract OK")

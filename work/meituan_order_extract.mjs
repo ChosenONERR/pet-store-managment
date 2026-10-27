@@ -1,3 +1,4 @@
+import { pathToFileURL } from 'node:url';
 import { openPetstarMerchantTab, releasePetstarMerchantTab } from './meituan_browser_context.mjs';
 
 const PROXY = 'http://localhost:3456';
@@ -6,6 +7,55 @@ const ORDER_URL = 'https://shangoue.meituan.com/#/page/orderbusiness#/order/hist
 // Thirty seconds produced repeated false failures even though the next hourly
 // run succeeded, so allow one slow render before the outer retry opens a new tab.
 const PROXY_TIMEOUT_MS = Number(process.env.MEITUAN_PROXY_TIMEOUT_MS || 60000);
+
+export function classifyRefundGroup(group = []) {
+  const statusTexts = [];
+  const seen = new Set();
+  const collect = (value, depth = 0) => {
+    if (depth > 5 || value == null) return;
+    if (typeof value === 'string') {
+      const text = value.trim();
+      if (text && !seen.has(text)) {
+        seen.add(text);
+        statusTexts.push(text);
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) collect(item, depth + 1);
+      return;
+    }
+    if (typeof value === 'object') {
+      for (const [key, child] of Object.entries(value)) {
+        if (/title|status|state|text|desc|label|result|progress|reason|message/i.test(key)) {
+          collect(child, depth + 1);
+        }
+      }
+    }
+  };
+  collect(group);
+  const combined = statusTexts.join('｜').replace(/\s+/g, '');
+  const explicitCompleted = group.some((record) => record?.completed === true
+    || record?.isCompleted === true
+    || record?.refundSuccess === true);
+  const negatedCompletion = /(?:未|没有|尚未)(?:退款)?(?:完成|成功)|退款失败/.test(combined);
+  const completed = !negatedCompletion && (explicitCompleted
+    || /退款(?:成功|完成|已完成|到账)|已退款|(?:同意|已同意|通过|已通过)(?:退货)?退款|退货退款(?:成功|完成)|售后完成/.test(combined));
+  const closed = /退款(?:已)?(?:关闭|取消|撤销|拒绝|驳回)|(?:关闭|取消|撤销|拒绝|驳回)(?:退货)?退款/.test(combined);
+  const pending = /申请(?:退货)?退款|(?:退货)?退款(?:处理中|待处理|审核中|协商中|申请中)|等待.*(?:退货)?退款|售后处理中/.test(combined);
+  const state = completed ? 'completed' : closed ? 'closed' : pending ? 'pending' : 'unknown';
+  return {
+    state,
+    evidence: statusTexts.find((text) => {
+      const compact = text.replace(/\s+/g, '');
+      if (state === 'completed') return /退款|售后完成/.test(compact);
+      if (state === 'closed') return /退款/.test(compact);
+      if (state === 'pending') return /退款|售后/.test(compact);
+      return false;
+    }) || statusTexts[0] || '',
+    statusTexts,
+  };
+}
 
 function parseArgs(argv) {
   const result = {};
@@ -333,6 +383,32 @@ async function selectDateRange(targetId, start, end) {
   })()`);
 }
 
+async function resetOrderPagination(targetId) {
+  const state = await evaluate(targetId, `(() => {
+    const root = document.querySelector('#hashframe')?.contentDocument;
+    if (!root) throw new Error('Meituan order iframe not found');
+    const pagination = root.querySelector('.roo-pagination');
+    const activePage = Number(pagination?.querySelector('li.active > a')?.textContent.trim() || 1);
+    if (!pagination || activePage <= 1) return { changed: false, activePage };
+    const firstPage = [...pagination.querySelectorAll('li > a')]
+      .find((link) => !link.getAttribute('aria-label') && link.textContent.trim() === '1');
+    if (!firstPage) throw new Error('First order page button not found from page ' + activePage);
+    firstPage.dispatchEvent(new MouseEvent('click', {
+      bubbles: true,
+      cancelable: true,
+      view: root.defaultView,
+    }));
+    return { changed: true, activePage };
+  })()`);
+  if (!state?.changed) return;
+  await waitFor(targetId, `(() => {
+    const root = document.querySelector('#hashframe')?.contentDocument;
+    const pagination = root?.querySelector('.roo-pagination');
+    const activePage = Number(pagination?.querySelector('li.active > a')?.textContent.trim() || 1);
+    return activePage === 1 && Boolean(root?.querySelector('[class^="order-card_"]'));
+  })()`);
+}
+
 const extractPageExpression = `(() => {
   const root = document.querySelector('#hashframe')?.contentDocument;
   if (!root) throw new Error('Meituan order iframe not found');
@@ -349,6 +425,7 @@ const extractPageExpression = `(() => {
     .replace(/\s*[\(（][^\(（\)）]*[\)）]\s*$/, '')
     .replace(/[\s\p{P}\p{S}]+/gu, '')
     .toLowerCase();
+  ${classifyRefundGroup.toString()}
   const getOrderModel = (card) => {
     const anchor = card.querySelector('.order-card-refund-info-container') || card;
     const fiberKey = Object.keys(anchor).find((key) => key.startsWith('__reactFiber'));
@@ -361,7 +438,9 @@ const extractPageExpression = `(() => {
     return null;
   };
   const extractRefunds = (orderModel) => {
-    const records = orderModel?.refundInfo?.refundInfoList || [];
+    const records = orderModel?.refundInfo?.refundInfoList
+      || orderModel?.refundInfo?.refundGoodsInfoList
+      || [];
     if (!records.length) return [];
     const foodRows = (orderModel?.foodInfo?.foodDetails || [])
       .flatMap((group) => group?.details || []);
@@ -372,13 +451,22 @@ const extractPageExpression = `(() => {
       grouped.get(String(record.recordId)).push(record);
     }
     return [...grouped.entries()].map(([recordId, group]) => {
-      const completedRecord = group.find((record) => /(?:同意|完成|成功).*退款|退款.*(?:完成|成功)/.test(record.title || ''));
+      const classification = classifyRefundGroup(group);
+      const completedRecord = classification.state === 'completed'
+        ? group.find((record) => /(?:同意|通过|完成|成功|到账|已退款|售后完成)/.test(record.title || record.statusText || ''))
+        : null;
       const requestRecord = group.find((record) => record.moneyVO || record.refundFoodInfo)
-        || group.find((record) => /申请.*退款/.test(record.title || ''));
+        || group.find((record) => /申请.*(?:退款|退货)/.test(record.title || ''));
+      const isFullReturn = group.some((record) => /全部退货|整单退货/.test(record.title || ''));
       const refundItems = requestRecord?.refundFoodInfo?.refundFoodItemInfoList || [];
-      const items = refundItems.map((refundItem) => {
+      const items = (refundItems.length ? refundItems : (isFullReturn ? foodRows.map((food) => ({
+        foodName: food.foodName,
+        foodRefundCount: food.count,
+        foodRefundTotalPriceText: '',
+        matchedFood: food,
+      })) : [])).map((refundItem) => {
         const refundName = normalizeProductName(refundItem.foodName);
-        const matches = foodRows.filter((food) => {
+        const matches = refundItem.matchedFood ? [refundItem.matchedFood] : foodRows.filter((food) => {
           const foodName = normalizeProductName(food.foodName);
           return foodName === refundName || foodName.startsWith(refundName) || refundName.startsWith(foodName);
         });
@@ -394,16 +482,20 @@ const extractPageExpression = `(() => {
       });
       return {
         recordId,
-        completed: Boolean(completedRecord),
+        state: classification.state,
+        statusText: classification.evidence,
+        statusTexts: classification.statusTexts,
+        completed: classification.state === 'completed',
         refundType: /部分退款/.test(completedRecord?.title || requestRecord?.title || '') ? '部分退款' : '退款',
         completedAt: completedRecord?.timeFormat || null,
         requestedAt: requestRecord?.timeFormat || null,
         amount: money(requestRecord?.moneyVO?.moneyText || '')
-          ?? items.reduce((total, item) => total + item.refundAmount, 0),
+          ?? (items.reduce((total, item) => total + item.refundAmount, 0) || null)
+          ?? (isFullReturn ? Number(orderModel?.chargeInfo?.userPayTotalAmount || 0) : 0),
         reason: requestRecord?.reasonVO?.reason || '',
         items,
       };
-    }).filter((refund) => refund.completed && refund.amount > 0);
+    });
   };
   const selectedYear = (root.querySelector('#range input')?.value || '').slice(0, 4) || String(new Date().getFullYear());
   const cards = [...root.querySelectorAll('[class^="order-card_"]')];
@@ -438,6 +530,7 @@ const extractPageExpression = `(() => {
     });
     const rawStatus = card.querySelector('[class^="baseInfoRight_"]')?.innerText.trim() || '';
     const expectedItemCount = Number(((card.querySelector('[class^="productCardTitle_"]')?.innerText || text).match(/(\\d+)件商品/) || [])[1] || 0);
+    const refundRecords = extractRefunds(orderModel);
     return {
       orderNo,
       dailyOrderNo,
@@ -452,12 +545,15 @@ const extractPageExpression = `(() => {
       deliveryFee: money((text.match(/运费实付[￥¥]\\s*\\d+(?:\\.\\d+)?/) || [])[0]),
       expectedItemCount,
       items,
-      refunds: extractRefunds(orderModel),
+      refunds: refundRecords.filter((refund) => refund.state === 'completed' && refund.amount > 0),
+      refundObservations: refundRecords.filter((refund) => refund.state !== 'closed'
+        && !(refund.state === 'completed' && refund.amount > 0)),
     };
   }).filter((order) => order.orderNo);
   const totalText = root.body.innerText.match(/共\\s*(\\d+)\\s*单/);
-  const next = root.querySelector('a[aria-label="Next"]');
-  const activePage = Number(root.querySelector('li.active > a')?.textContent.trim() || 1);
+  const pagination = root.querySelector('.roo-pagination');
+  const next = pagination?.querySelector('a[aria-label="Next"]');
+  const activePage = Number(pagination?.querySelector('li.active > a')?.textContent.trim() || 1);
   return {
     total: totalText ? Number(totalText[1]) : orders.length,
     orders,
@@ -483,6 +579,10 @@ async function main() {
   try {
     await waitForOrderPageReady(targetId);
     await new Promise((resolve) => setTimeout(resolve, 1800));
+    // Previous runs leave the shared tab on their final page. Reset before
+    // changing dates, otherwise Meituan may reuse that stale page number for
+    // the new query and render “暂无相关订单” beside a positive total.
+    await resetOrderPagination(targetId);
     await selectDateRange(targetId, args.start, args.end);
     const selectedDates = await evaluate(targetId, `(() => {
       const root = document.querySelector('#hashframe')?.contentDocument;
@@ -494,9 +594,17 @@ async function main() {
     await waitFor(targetId, `(() => {
       const root = document.querySelector('#hashframe')?.contentDocument;
       const inputs = root ? [...root.querySelectorAll('#range input')].map((node) => node.value) : [];
+      const hasTotal = /共\\s*\\d+\\s*单/.test(root?.body?.innerText || '');
+      return inputs[0] === '${args.start}' && inputs[1] === '${args.end}' && hasTotal;
+    })()`);
+    // A failed attempt may leave the shared merchant tab on the last page.
+    // Always restart at page 1 so retries collect the complete date range.
+    await resetOrderPagination(targetId);
+    await waitFor(targetId, `(() => {
+      const root = document.querySelector('#hashframe')?.contentDocument;
       const hasOrders = Boolean(root?.querySelector('[class^="order-card_"]'));
       const isEmpty = /共\\s*0\\s*单/.test(root?.body?.innerText || '');
-      return inputs[0] === '${args.start}' && inputs[1] === '${args.end}' && (hasOrders || isEmpty);
+      return hasOrders || isEmpty;
     })()`);
 
     const allOrders = [];
@@ -514,7 +622,7 @@ async function main() {
       if (data.nextDisabled || allOrders.length >= expectedTotal) break;
       await evaluate(targetId, `(() => {
         const root = document.querySelector('#hashframe').contentDocument;
-        const next = root.querySelector('a[aria-label="Next"]');
+        const next = root.querySelector('.roo-pagination a[aria-label="Next"]');
         if (!next) throw new Error('Next page button not found');
         next.scrollIntoView({ block: 'center' });
         next.dispatchEvent(new MouseEvent('click', {
@@ -531,7 +639,7 @@ async function main() {
           .map((node) => (node.innerText.match(/\\d{18,20}/) || [])[0] || '')
           .filter(Boolean);
         const signature = ids.join('|');
-        const activePage = Number(root.querySelector('li.active > a')?.textContent.trim() || 1);
+        const activePage = Number(root.querySelector('.roo-pagination li.active > a')?.textContent.trim() || 1);
         return ids.length > 0
           && (signature !== ${JSON.stringify(pageSignature)} || activePage !== ${Number(data.activePage || page)});
       })()`);
@@ -553,7 +661,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error.stack || error.message}\n`);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
+    process.stderr.write(`${error.stack || error.message}\n`);
+    process.exit(1);
+  });
+}

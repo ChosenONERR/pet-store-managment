@@ -482,7 +482,11 @@ foreach ($order in @($extract.orders)) {
         } elseif ($null -ne $effectiveExpectedIncome) {
             $effectiveExpectedIncome = [math]::Max([double]0.0, [double][math]::Round(([double]$effectiveExpectedIncome - [double]$refundAccounting.income_adjustment),2))
         }
-        $refundStatus = if ($refundEvents.Count -gt 0) { '已完成（部分退款）' } else { [string]$order.status }
+        $refundStatus = if ($null -ne $effectiveExpectedIncome -and [double]$effectiveExpectedIncome -le 0.004999) {
+            '已完成（全额退款）'
+        } else {
+            '已完成（部分退款）'
+        }
         foreach ($event in $refundEvents) {
             $itemText = @($event.items | ForEach-Object {
                 $dispositionText = switch ([string]$_.disposition) {
@@ -821,8 +825,9 @@ $naturalCount = $extract.total - $interventionCount
 
 $verifyTargets = if ($dataChanged) { @(
     @{Sheet='干预订单';Range='I2:I1001'},
-    @{Sheet='订单汇总';Range='E2:E2001,K2:L2001'},
-    @{Sheet='订单商品';Range='E2:E4001,K2:N4001,P2:P4001'},
+    # Lark CLI 1.0.98 accepts one continuous A1 area per formula-verify call.
+    @{Sheet='订单汇总';Range='E2:L2001'},
+    @{Sheet='订单商品';Range='E2:P4001'},
     @{Sheet='库存快照';Range='M2:M2000'},
     @{Sheet='驾驶舱';Range='C2:C19'}
 ) } else { @() }
@@ -830,6 +835,22 @@ foreach ($target in $verifyTargets) {
     $verify = Invoke-LarkJson { lark-cli sheets +formula-verify --as user --spreadsheet-token $spreadsheetToken --sheet-name $target.Sheet --range $target.Range --format json --exit-on-error } "公式校验调用失败：$($target.Sheet)"
     if ($verify.data.status -ne 'success') { throw "公式存在错误：$($target.Sheet)" }
 }
+
+$refundObservationDetails = @($extract.orders | ForEach-Object {
+    $order = $_
+    foreach ($observation in @($order.refundObservations)) {
+        [pscustomobject]@{
+            order_no = [string]$order.orderNo
+            daily_order_no = $order.dailyOrderNo
+            record_id = [string]$observation.recordId
+            state = [string]$observation.state
+            status_text = [string]$observation.statusText
+            refund_amount = if ($null -eq $observation.amount) { 0.0 } else { [double]$observation.amount }
+            item_count = @($observation.items).Count
+            requested_at = $observation.requestedAt
+        }
+    }
+})
 
 $finalResult = [pscustomobject]@{
     ok = $true
@@ -849,6 +870,8 @@ $finalResult = [pscustomobject]@{
     completed_refunds = @($refundMerge.state.events | Where-Object { [string]$_.order_date -ge $StartDate -and [string]$_.order_date -le $EndDate }).Count
     newly_detected_refunds = @($refundMerge.newly_detected).Count
     pending_refund_items = @($refundMerge.state.events | ForEach-Object { @($_.items) } | Where-Object { $_.disposition -eq 'pending' }).Count
+    refund_observation_count = $refundObservationDetails.Count
+    refund_observation_details = $refundObservationDetails
     data_changed = [bool]$dataChanged
     writes_skipped = -not [bool]$dataChanged
     change_details = [ordered]@{summary=[bool]$summaryChanged;items=[bool]$itemsChanged;interventions=[bool]$interventionsChanged;initialize_forced=[bool]$Initialize}

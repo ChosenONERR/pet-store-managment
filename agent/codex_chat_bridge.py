@@ -34,6 +34,7 @@ LOCK_PATH = STATE_ROOT / "codex_chat_bridge.lock"
 RUNTIME_START_LOCK_PATH = STATE_ROOT / "codex_runtime_start.lock"
 RUNTIME_STATE_PATH = STATE_ROOT / "codex_runtime_state.json"
 PERFORMANCE_LOG_PATH = STATE_ROOT / "codex_performance.ndjson"
+RATE_LIMIT_STATE_PATH = STATE_ROOT / "codex_rate_limit.json"
 SCHEMA_PATH = PROJECT_ROOT / "agent" / "codex_response_schema.json"
 QUERY_TOOL_PATH = PROJECT_ROOT / "agent" / "query_business_data.ps1"
 WINDOWS_POWERSHELL = pathlib.Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
@@ -45,7 +46,10 @@ QUERY_SECONDS = 60
 MAX_QUERY_ROUNDS = 8
 MAX_TOTAL_QUERIES = 30
 QUERY_CACHE_SECONDS = 30
-RUNTIME_VERSION = "2026-10-09.1"
+RATE_LIMIT_BASE_SECONDS = 60
+RATE_LIMIT_MAX_SECONDS = 15 * 60
+RATE_LIMIT_RESET_SECONDS = 60 * 60
+RUNTIME_VERSION = "2026-10-27.1"
 RUNTIME_PIPE = rf"\\.\pipe\petstar_codex_runtime_{hashlib.sha256(str(PROJECT_ROOT).encode('utf-8')).hexdigest()[:16]}"
 RUNTIME_AUTHKEY = hashlib.sha256((str(PROJECT_ROOT) + "|petstar-codex-runtime-v1").encode("utf-8")).digest()
 QUERY_DATASETS = {
@@ -104,6 +108,20 @@ def is_authentication_error(error: BaseException) -> bool:
         )
     )
 
+
+def is_rate_limit_error(error: BaseException) -> bool:
+    text = str(error).lower()
+    return any(
+        marker in text
+        for marker in (
+            "429",
+            "too many requests",
+            "exceeded retry limit",
+            "responsetoomanyfailedattempts",
+            "rate limit",
+        )
+    )
+
 ACTION_GUIDE = """
 可返回的动作（只填店主明确提供或能无歧义推导的参数）：
 - AddIntervention: date, order_no, person, note
@@ -115,7 +133,7 @@ ACTION_GUIDE = """
 - SetOrderActuals: order_no, amount（最终实际收入）, items（最终实际交付的KW/CSX×数量）, delivery_fee, note。用于线上订单私下退款、漏送退款、到店换货、实际成交商品变化或最终改价；漏送/退回的商品不得写入 items；该动作不修改平台库存
 - OfflineSale: date, items(KW/CSX×数量), amount, delivery_fee, receipt_status, platform, note。receipt_status 只填“已到账”或“未到账”；platform 只填“美团”“淘宝闪购”“京东到家”“线下”（用户说“京东外卖”时填“京东到家”）
 - AddOrderGift: date, order_no或daily_order_no, items, note
-- Replenishment: date, goods_code, transition_code（消息同时给出CSX时填写）, quantity, purchase_amount, payment_amount, payment_date, production_date, shelf_life_value, shelf_life_unit, note。该动作只新增补货记录并更新SKU当前成本，不重算历史订单、收入、利润或经营简账
+- Replenishment: date, goods_code, transition_code（消息同时给出CSX时填写）, quantity, purchase_amount, payment_amount, payment_date, production_date, shelf_life_value, shelf_life_unit, note。店主没有明确说赊账、挂账、未付款或以后付款时，默认当天已全额付款，payment_amount 填 purchase_amount，payment_date 填 date；明确未付款时 payment_amount/payment_date 留空，并在 note 保留原话。该动作只新增补货记录并更新SKU当前成本，不重算历史订单、收入、利润或经营简账
 - CashExpense / OperatingExpense / OwnerWithdrawal / OwnerLabor / MarketRent / BeginningCash / ActualReceipt / AssetAmortization: date, amount, note。ActualReceipt 只表示平台资金实际打入收款账户的月度现金到账，不得用于修正某一订单的收入、退款或利润，也不得携带 order_no
 - SetSkuExpiry: goods_code, expiry_date；明确无到期日时 clear_expiry=true
 - SetSkuBatchDate: goods_code, production_date, shelf_life_value, shelf_life_unit
@@ -134,6 +152,7 @@ BASE_GUIDANCE = """
 
 当问题涉及本店已经保存的订单、干预单、收入、支出、库存、SKU、补货、成本或同步状态时，必须先在 queries 中声明需要的数据集和过滤条件，不能凭对话猜测，也不能说“看不到表格”或要求店主重新提供系统已有的数据。可用 dataset：overview、orders、order_items、pending_costs、interventions、sku、inventory、replenishments、income、expenses、profit、status。日期使用 yyyy-MM-dd；尽量用最小 limit。外层只读工具会读取数据并再次交给你，你可以根据结果继续调用另一个只读工具，证据充分后才回答。你自己不得启动 PowerShell、lark-cli、经营脚本或网页自动化。查询失败时要说明是哪个数据域读取失败，不得编造结果。
 精确订单商品明细使用 order_items；成本未知、历史订单成本修正或用户说“这一单未知成本的商品”时使用 pending_costs，并优先按完整订单号过滤；指定时间盈利使用 profit。pending_costs 会给出 current_kw、transition_code、action_code、标题、数量、主表行号和成本状态：能唯一得到 action_code 时，用户明确给出单位成本后可生成 SetSkuCost；没有 action_code 时才追问当前 KW/CSX。只有店主明确要求更新该历史订单的成本或利润时，SetSkuCost 才携带查询得到的完整 order_no；只说“修改某SKU成本”时只改主表，绝不能联动历史订单或简账。只要待核成本查询有结果，回复或待确认预览必须逐项展示：当前 KW（没有则显示过渡货号）、商品标题、该订单数量、SKU成本主表行号、当前成本/状态、新单位成本，以及是否联动该订单；不得只列货号和行号。
+sku 查询的每一行也会返回 action_code。只要查询结果提供 action_code，SetSkuCost 的 goods_code 以及 OfflineSale 的 items 必须逐字使用它，禁止自行改写成裸商品ID、重复KW或猜测的CSX；`sku_ref:主表行号:商品ID` 是内部安全定位符，回复给店主时仍显示当前KW、标题和主表行号，不展示内部定位符。
 纯查询直接给结论且 actions 为空；查询和修改混在同一条消息时，先基于查询结果回答，再清楚预览准备修改的内容。列表尽量使用短项目符号，金额与统计口径要写清楚。
 
 当前消息是唯一的新行动来源。历史对话仅帮助理解“这单、昨天、刚才那个”等指代，禁止重放历史动作，禁止把旧待办当成当前请求。
@@ -147,6 +166,7 @@ BASE_GUIDANCE = """
 店主明确说试吃装、赠送、免费或成本为0时，Replenishment 的 purchase_amount 可以是0，并在 note 保留零成本原因。新KW尚未存在于SKU成本主表时也照常生成 Replenishment，由执行层建立待平台同步档案，不能改成 SetSkuBatchDate 或直接报无法处理。
 “补货”既可能是已有商品再次采购，也可能是第一次上新的入库，不能要求店主换一种固定说法。消息同时给出 KW 和 CSX 时，goods_code 填 KW、transition_code 填 CSX；只有 CSX 时 goods_code 填 CSX。执行层会优先用任一编号唯一匹配 SKU 主表，并在无冲突时把新 KW 绑定到该 CSX 所在档案。
 补货只更新补货记录和该SKU当前成本；即使一次有多条补货，也不得生成 RefreshLedger，不得声称会修改库存批次、现金流、历史订单、收入、利润或经营简账。
+补货付款默认口径：消息给出补货数量和采购金额，且没有明确说赊账、挂账、未付款或以后付款时，视为当天已全额付款；只有明确未付款时才把付款金额和付款日期留空。
 店主要求修改、补充或纠正某个 KW/CSX 的成本价时，使用 SetSkuCost。amount 是该商品每个“销售单位”的成本，不是整箱金额；若无法判断整箱与单件换算，只追问每箱包含多少销售单位，不能猜。默认只修改SKU成本主表；只有店主明确指定历史订单并要求联动该单时才填写 order_no，且只允许更新该订单，不得扩展为全量历史重算。
 
 回复必须简洁、自然，像一个懂店铺的同事，不输出推理、JSON、脚本、字段清单、内部路径、技术校验或英文内部状态。通常不超过4行、220个汉字。无论成功理解、需要追问还是失败，都必须给 reply。
@@ -221,6 +241,57 @@ def redact_error(value: str) -> str:
     return "；".join(lines[-5:])[:1000]
 
 
+def get_rate_limit_wait_seconds() -> int:
+    state = load_json(RATE_LIMIT_STATE_PATH, {})
+    try:
+        retry_at = float(state.get("retry_at_epoch") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, int(retry_at - time.time() + 0.999))
+
+
+def note_rate_limit_failure(error: BaseException) -> int:
+    now = time.time()
+    state = load_json(RATE_LIMIT_STATE_PATH, {})
+    try:
+        previous_at = float(state.get("last_failure_epoch") or 0)
+        previous_failures = int(state.get("consecutive_failures") or 0)
+    except (TypeError, ValueError):
+        previous_at = 0
+        previous_failures = 0
+    if now - previous_at > RATE_LIMIT_RESET_SECONDS:
+        previous_failures = 0
+    failures = min(previous_failures + 1, 8)
+    delay = min(RATE_LIMIT_BASE_SECONDS * (2 ** (failures - 1)), RATE_LIMIT_MAX_SECONDS)
+    save_json(
+        RATE_LIMIT_STATE_PATH,
+        {
+            "consecutive_failures": failures,
+            "last_failure_epoch": now,
+            "retry_at_epoch": now + delay,
+            "updated_at": now_iso(),
+            "last_error": redact_error(str(error))[:500],
+        },
+    )
+    return int(delay)
+
+
+def clear_rate_limit_state() -> None:
+    try:
+        RATE_LIMIT_STATE_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def rate_limit_response(wait_seconds: int, stage: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "retryable": True,
+        "retry_after_seconds": max(1, int(wait_seconds)),
+        "error": f"Codex 当前请求较多，{stage}已延后；系统会自动重试，无需重发。",
+    }
+
+
 def event_cache_key(event_key: str, mode: str) -> str:
     return hashlib.sha256(f"{mode}:{event_key}".encode("utf-8")).hexdigest()
 
@@ -246,6 +317,20 @@ def cache_response(event_key: str, mode: str, result: dict[str, Any]) -> None:
         reverse=True,
     )[:300]
     save_json(EVENT_CACHE, dict(ordered))
+
+
+def invalidate_event_cache(event_key: str) -> int:
+    """Remove only one Feishu message's cached interpretations across all modes."""
+    cache = load_json(EVENT_CACHE, {})
+    removed = 0
+    for mode in ("normal", "preview", "execute"):
+        key = event_cache_key(event_key, mode)
+        if key in cache:
+            del cache[key]
+            removed += 1
+    if removed:
+        save_json(EVENT_CACHE, cache)
+    return removed
 
 
 class ProcessLock:
@@ -770,6 +855,10 @@ def process_message(prompt: str, event_key: str, mode: str = "normal") -> dict[s
         append_performance(event_key, mode, True, timings)
         return {"ok": True, "cached": True, **cached, "_timings": timings}
 
+    wait_seconds = get_rate_limit_wait_seconds()
+    if wait_seconds > 0:
+        return rate_limit_response(wait_seconds, "本条消息")
+
     lock_started_at = time.perf_counter()
     with ProcessLock(LOCK_PATH):
         lock_wait_seconds = time.perf_counter() - lock_started_at
@@ -782,6 +871,9 @@ def process_message(prompt: str, event_key: str, mode: str = "normal") -> dict[s
             }
             append_performance(event_key, mode, True, timings)
             return {"ok": True, "cached": True, **cached, "_timings": timings}
+        wait_seconds = get_rate_limit_wait_seconds()
+        if wait_seconds > 0:
+            return rate_limit_response(wait_seconds, "本条消息")
         session_state = load_json(SESSION_STATE, {})
         recent_turns = session_state.get("recent_turns") or []
         if not isinstance(recent_turns, list):
@@ -799,7 +891,9 @@ def process_message(prompt: str, event_key: str, mode: str = "normal") -> dict[s
             nonlocal model_seconds
             model_started_at = time.perf_counter()
             try:
-                return invoke_codex(text, current_session_id)
+                response = invoke_codex(text, current_session_id)
+                clear_rate_limit_state()
+                return response
             finally:
                 model_seconds += time.perf_counter() - model_started_at
 
@@ -808,11 +902,15 @@ def process_message(prompt: str, event_key: str, mode: str = "normal") -> dict[s
         except subprocess.TimeoutExpired:
             return {"ok": False, "error": "本机 Codex 处理超过4分钟，已停止本次请求，请稍后重发。"}
         except Exception as first_error:
+            if is_rate_limit_error(first_error):
+                return rate_limit_response(note_rate_limit_failure(first_error), "本条消息")
             try:
                 result, next_session_id = timed_invoke(guided_prompt, "")
             except subprocess.TimeoutExpired:
                 return {"ok": False, "error": "本机 Codex 处理超过4分钟，已停止本次请求，请稍后重发。"}
             except Exception as retry_error:
+                if is_rate_limit_error(retry_error):
+                    return rate_limit_response(note_rate_limit_failure(retry_error), "本条消息")
                 return {
                     "ok": False,
                     "error": f"本机 Codex 调用失败：{redact_error(str(retry_error))}",
@@ -862,6 +960,8 @@ def process_message(prompt: str, event_key: str, mode: str = "normal") -> dict[s
             except subprocess.TimeoutExpired:
                 return {"ok": False, "error": "经营数据已读取，但本机 Codex 汇总超过4分钟，请稍后重发。"}
             except Exception as query_answer_error:
+                if is_rate_limit_error(query_answer_error):
+                    return rate_limit_response(note_rate_limit_failure(query_answer_error), "经营数据汇总")
                 return {"ok": False, "error": f"经营数据已读取，但本机 Codex 汇总失败：{redact_error(str(query_answer_error))}"}
 
         if result.get("queries"):
@@ -884,6 +984,8 @@ def process_message(prompt: str, event_key: str, mode: str = "normal") -> dict[s
                         "actions": [],
                     }
             except Exception as final_error:
+                if is_rate_limit_error(final_error):
+                    return rate_limit_response(note_rate_limit_failure(final_error), "最终整理")
                 return {"ok": False, "error": f"经营数据已读取，但最终整理失败：{redact_error(str(final_error))}"}
 
         next_turns = (
@@ -1042,6 +1144,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--serve", action="store_true")
     parser.add_argument("--ensure-runtime", action="store_true")
     parser.add_argument("--invalidate-cache", action="store_true")
+    parser.add_argument("--invalidate-event-key")
     parser.add_argument("--prompt-base64")
     parser.add_argument("--event-key")
     parser.add_argument("--mode", choices=["normal", "preview", "execute"], default="normal")
@@ -1070,6 +1173,8 @@ def main() -> int:
             return output(_runtime_client({"op": "invalidate_cache"}, 5))
         except Exception as exc:
             return output({"ok": False, "error": redact_error(str(exc))})
+    if args.invalidate_event_key:
+        return output({"ok": True, "removed": invalidate_event_cache(args.invalidate_event_key)})
     if not args.prompt_base64 or not args.event_key:
         return output({"ok": False, "error": "缺少消息内容或事件标识"})
     try:

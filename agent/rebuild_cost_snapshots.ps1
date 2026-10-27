@@ -120,10 +120,14 @@ function Clear-Range([string]$Range) {
     if ($LASTEXITCODE -ne 0 -or -not (($raw | ConvertFrom-Json).ok)) { throw "清理范围失败：$Range" }
 }
 function Assert-FormulaRange([string]$SheetName, [string]$Range) {
-    $raw = & $larkCli sheets +formula-verify --as user --spreadsheet-token $token --sheet-name $SheetName --range $Range --format json --exit-on-error | Out-String
-    if ($LASTEXITCODE -ne 0) { throw "公式校验失败：$SheetName $Range" }
-    $result = $raw | ConvertFrom-Json
-    if ($result.data.status -ne 'success') { throw "公式存在错误：$SheetName $Range" }
+    # Lark CLI 1.0.98 only accepts one continuous A1 range per formula-verify call.
+    # Keep callers concise, but verify comma-delimited areas one by one.
+    foreach ($area in @($Range -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+        $raw = & $larkCli sheets +formula-verify --as user --spreadsheet-token $token --sheet-name $SheetName --range $area --format json --exit-on-error 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) { throw "公式校验失败：$SheetName $area；$($raw.Trim())" }
+        $result = $raw | ConvertFrom-Json
+        if ($result.data.status -ne 'success') { throw "公式存在错误：$SheetName $area" }
+    }
 }
 
 $masterRows = Get-SheetRows 'SKU成本主表' 'A2:Z3000'

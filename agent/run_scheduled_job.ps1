@@ -10,6 +10,21 @@ $OutputEncoding = [Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 if (-not $ProjectRoot) { $ProjectRoot = Split-Path $PSScriptRoot -Parent }
 $ProjectRoot = (Resolve-Path -LiteralPath $ProjectRoot).Path
+
+# Lark CLI 1.0.98 isolates credentials by host workspace. A scheduled task can
+# inherit HERMES_HOME from the desktop agent even though this job must use the
+# owner's normal user authorization. Remove every host-routing marker in this
+# child only, then pin the local config root; never copy or expose OAuth tokens.
+foreach ($variableName in @(
+    'HERMES_HOME','HERMES_QUIET','HERMES_EXEC_ASK','HERMES_GATEWAY_TOKEN','HERMES_SESSION_KEY',
+    'OPENCLAW_CLI','OPENCLAW_HOME','OPENCLAW_STATE_DIR','OPENCLAW_CONFIG_PATH',
+    'OPENCLAW_SERVICE_MARKER','OPENCLAW_SERVICE_VERSION','OPENCLAW_GATEWAY_PORT','OPENCLAW_SHELL',
+    'LARK_CHANNEL'
+)) {
+    Remove-Item -LiteralPath "Env:$variableName" -ErrorAction SilentlyContinue
+}
+$env:LARKSUITE_CLI_CONFIG_DIR = Join-Path $env:USERPROFILE '.lark-cli'
+
 . (Join-Path $PSScriptRoot 'runtime_paths.ps1')
 $powershellExe = Get-PetstarWindowsPowerShell
 $syncScript = Join-Path $PSScriptRoot 'run_sync_and_notify.ps1'

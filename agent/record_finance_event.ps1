@@ -291,10 +291,12 @@ function Set-AtomicCellOperations([object[]]$Operations) {
     if (-not $result.ok) { throw '飞书原子批量写入失败' }
 }
 function Assert-FormulaRange([string]$SheetName, [string]$Range) {
-    $raw = & $larkCli sheets +formula-verify --as user --spreadsheet-token $spreadsheetToken --sheet-name $SheetName --range $Range --format json --exit-on-error | Out-String
-    if ($LASTEXITCODE -ne 0) { throw "公式校验失败：$SheetName" }
-    $result = $raw | ConvertFrom-Json
-    if ($result.data.status -ne 'success') { throw "公式存在错误：$SheetName" }
+    foreach ($area in @($Range -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+        $raw = & $larkCli sheets +formula-verify --as user --spreadsheet-token $spreadsheetToken --sheet-name $SheetName --range $area --format json --exit-on-error 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) { throw "公式校验失败：$SheetName $area；$($raw.Trim())" }
+        $result = $raw | ConvertFrom-Json
+        if ($result.data.status -ne 'success') { throw "公式存在错误：$SheetName $area" }
+    }
 }
 function Assert-Positive([Nullable[double]]$Value, [string]$Name) {
     if ($null -eq $Value -or [double]$Value -le 0) { throw "$Name 必须大于0" }
@@ -369,6 +371,18 @@ function Get-SkuCodeCandidates($Rows, [string]$RequestedCode) {
 function Resolve-UniqueSkuReference($Rows, [string]$RequestedCode) {
     $rowList = @($Rows)
     $normalizedCode = $RequestedCode.Trim().ToLowerInvariant()
+    if ($normalizedCode -match '^sku_ref:(\d+):([^:]+)$') {
+        $requestedRow = [int]$Matches[1]
+        $requestedProductId = [string]$Matches[2]
+        $rowIndex = $requestedRow - 2
+        if ($rowIndex -lt 0 -or $rowIndex -ge $rowList.Count) { throw "SKU成本主表安全定位已失效：第 $requestedRow 行不存在，请重新查询后再试" }
+        $row = $rowList[$rowIndex]
+        $actualProductId = ([string](Get-CellValue $row $skuSchema.ProductId.Index)).Trim().ToLowerInvariant()
+        if (-not $actualProductId -or $actualProductId -ne $requestedProductId) {
+            throw "SKU成本主表安全定位已失效：第 $requestedRow 行的商品ID已变化，请重新查询后再试"
+        }
+        return [pscustomobject]@{row_number=$requestedRow;cells=$row}
+    }
     $matches = [Collections.Generic.List[object]]::new()
     for ($i = 0; $i -lt $rowList.Count; $i++) {
         $row = $rowList[$i]
@@ -897,10 +911,16 @@ function Invoke-BatchSkuMaintenance([object[]]$Operations) {
         $quantityValue = Convert-ToNullableNumber (Get-BatchArgument $arguments 'quantity')
         $purchaseAmountValue = Convert-ToNullableNumber (Get-BatchArgument $arguments 'purchase_amount')
         $paymentAmountValue = Convert-ToNullableNumber (Get-BatchArgument $arguments 'payment_amount')
+        $noteValue = [string](Get-BatchArgument $arguments 'note')
         if (-not $goodsCode -or $goodsCode -notmatch '(?i)^(?:kw|csx)\d+$') { throw "第$($operationIndex+1)项补货必须提供有效的 KW 或 CSX 货号" }
         if ($transitionCode -and $transitionCode -notmatch '(?i)^csx\d+$') { throw "第$($operationIndex+1)项补货关联的过渡货号无效" }
         Assert-Positive $quantityValue "第$($operationIndex+1)项补货数量"
         Assert-NonNegative $purchaseAmountValue "第$($operationIndex+1)项实际采购金额"
+        $paymentSignalText = [regex]::Replace($noteValue,'(?i)(未说明|没有说明|未提及|没有提及)(?:未付款|未支付|赊账|挂账|欠款|稍后付款|以后付款)','')
+        $explicitlyUnpaid = $paymentSignalText -match '(?i)(未付款|未支付|赊账|挂账|欠款|稍后付款|以后付款)'
+        if ($null -eq $paymentAmountValue -and -not $explicitlyUnpaid) {
+            $paymentAmountValue = [double]$purchaseAmountValue
+        }
         if ($null -ne $paymentAmountValue) { Assert-NonNegative $paymentAmountValue "第$($operationIndex+1)项付款金额" }
         $operationDate = Convert-BatchDate (Get-BatchArgument $arguments 'date') $Date '补货日期'
         $normalizedCode = $goodsCode.Trim().ToLowerInvariant()
@@ -968,7 +988,6 @@ function Invoke-BatchSkuMaintenance([object[]]$Operations) {
         $afterQuantity = [double]$beforeQuantity + $salesQuantity
         $beforeInventoryValue = if ($null -eq $beforeAverage) { 0.0 } else { [double]$beforeAverage * [double]$beforeQuantity }
         $afterAverage = if ($null -eq $beforeAverage -and [double]$beforeQuantity -gt 0) { $null } else { ($beforeInventoryValue + [double]$purchaseAmountValue) / $afterQuantity }
-        $noteValue = [string](Get-BatchArgument $arguments 'note')
         if ($newSku) {
             $zeroCost = [double]$purchaseAmountValue -eq 0
             $cells[$skuSchema.CurrentKw.Index] = New-ValueCell $requestedKw; $cells[$skuSchema.TransitionCode.Index] = New-ValueCell $requestedCsx
@@ -1524,21 +1543,10 @@ switch ($Action) {
     'OfflineSale' {
         Assert-Positive $Amount '线下销售实收金额'
         if (-not $Items) { throw '线下销售必须提供售出货品，例如 kw1001×2、kw2001×1' }
-        $matches = @([regex]::Matches($Items, '(?i)\b((?:kw|csx)\d+)\s*[×xX*]\s*(\d+(?:\.\d+)?)'))
+        $matches = @([regex]::Matches($Items, '(?i)\b((?:(?:kw|csx)\d+|sku_ref:\d+:[a-z0-9_-]+))\s*[×xX*]\s*(\d+(?:\.\d+)?)'))
         if ($matches.Count -eq 0) { throw '没有识别到“货号×数量”，例如 kw1001×2' }
 
         $skuRows = Get-SheetRows 'SKU成本主表' 'A2:Z3000'
-        $skuByCode = @{}
-        foreach ($skuRow in $skuRows) {
-            $kw = Get-CellValue $skuRow 0
-            $aliases = Get-CellValue $skuRow 1
-            if ($kw) { $skuByCode[$kw.ToLowerInvariant()] = $skuRow }
-            if ($aliases) {
-                foreach ($alias in ([regex]::Split($aliases, '[/,，;；\s]+') | Where-Object { $_ })) {
-                    $skuByCode[$alias.ToLowerInvariant()] = $skuRow
-                }
-            }
-        }
         $quantityByCode = [ordered]@{}
         foreach ($match in $matches) {
             $code = $match.Groups[1].Value.ToLowerInvariant()
@@ -1553,8 +1561,13 @@ switch ($Action) {
             $rawCode = [string]$entry.Key
             $displayCode = $rawCode
             $quantityValue = [double]$entry.Value
-            if ($skuByCode.ContainsKey($rawCode)) {
-                $skuRow = $skuByCode[$rawCode]
+            $skuTarget = $null
+            try { $skuTarget = Resolve-UniqueSkuReference $skuRows $rawCode }
+            catch {
+                if ([string]$_.Exception.Message -notmatch '找不到货号') { throw }
+            }
+            if ($skuTarget) {
+                $skuRow = $skuTarget.cells
                 $kw = Get-CellValue $skuRow 0
                 if ($kw) { $displayCode = $kw.ToLowerInvariant() }
                 $status = Get-CellValue $skuRow $skuSchema.CostStatus.Index
@@ -1795,8 +1808,10 @@ switch ($Action) {
         }
         $rowNumber = if ($existingEventIndex -ge 0) { 2 + $existingEventIndex } else { Get-FirstEmptyRow $rows 1 2 1001 }
         $quantityValue = [double]$Quantity
-        $paymentDateValue = if ($null -ne $PaymentAmount) { Convert-ToExcelSerial $(if ($null -ne $PaymentDate) { [datetime]$PaymentDate } else { $Date }) } else { $null }
-        $paymentAmountValue = if ($null -ne $PaymentAmount) { [double]$PaymentAmount } else { $null }
+        $paymentSignalText = [regex]::Replace([string]$Note,'(?i)(未说明|没有说明|未提及|没有提及)(?:未付款|未支付|赊账|挂账|欠款|稍后付款|以后付款)','')
+        $explicitlyUnpaid = $paymentSignalText -match '(?i)(未付款|未支付|赊账|挂账|欠款|稍后付款|以后付款)'
+        $paymentAmountValue = if ($null -ne $PaymentAmount) { [double]$PaymentAmount } elseif (-not $explicitlyUnpaid) { $purchaseAmountValue } else { $null }
+        $paymentDateValue = if ($null -ne $paymentAmountValue) { Convert-ToExcelSerial $(if ($null -ne $PaymentDate) { [datetime]$PaymentDate } else { $Date }) } else { $null }
         $batchId = if ($eventBatchId) { $eventBatchId } elseif ($computedExpiry) { "BATCH-$($Date.ToString('yyyyMMdd'))-$('{0:D4}' -f $rowNumber)" } else { $null }
         $existingBeforeQuantity = if ($existingEventIndex -ge 0) { Convert-ToNullableNumber (Get-CellValue $rows[$existingEventIndex] 7) } else { $null }
         $existingBeforeAverage = if ($existingEventIndex -ge 0) { Convert-ToNullableNumber (Get-CellValue $rows[$existingEventIndex] 8) } else { $null }
@@ -1820,7 +1835,7 @@ switch ($Action) {
             }
         }
         if ($DryRun) {
-            [ordered]@{ok=$true;dry_run=$true;action=$Action;result=[ordered]@{row=$rowNumber;sku_master_row=[int]$skuTarget.row_number;goods_code=$displayCode;transition_code=$requestedCsx;product_id=$productId;package_quantity=$quantityValue;sales_unit_quantity=$salesUnitQuantity;purchase_amount=$purchaseAmountValue;unit_cost=$incomingUnitCost;before_quantity=$beforeQuantity;before_average_cost=$beforeAverage;after_quantity=$afterQuantity;after_average_cost=$afterAverage;production_date=$(if($ProductionDate){([datetime]$ProductionDate).ToString('yyyy-MM-dd')}else{$null});expiry_date=$(if($computedExpiry){$computedExpiry.ToString('yyyy-MM-dd')}else{$null});sku_status=$(if($newSkuPending){'will_create_pending_profile'}elseif($mappingUpdate){'will_attach_kw_by_csx'}else{'matched'});mapping_update=$mappingUpdate;affected_tables=@('补货记录','SKU成本主表');remote_replay=($existingEventIndex -ge 0)};message='预演成功，未写入飞书'} | ConvertTo-Json -Depth 8
+            [ordered]@{ok=$true;dry_run=$true;action=$Action;result=[ordered]@{row=$rowNumber;sku_master_row=[int]$skuTarget.row_number;goods_code=$displayCode;transition_code=$requestedCsx;product_id=$productId;package_quantity=$quantityValue;sales_unit_quantity=$salesUnitQuantity;purchase_amount=$purchaseAmountValue;payment_date=$(if($null-ne$paymentAmountValue){$(if($null-ne$PaymentDate){([datetime]$PaymentDate).ToString('yyyy-MM-dd')}else{$Date.ToString('yyyy-MM-dd')})}else{$null});payment_amount=$paymentAmountValue;unit_cost=$incomingUnitCost;before_quantity=$beforeQuantity;before_average_cost=$beforeAverage;after_quantity=$afterQuantity;after_average_cost=$afterAverage;production_date=$(if($ProductionDate){([datetime]$ProductionDate).ToString('yyyy-MM-dd')}else{$null});expiry_date=$(if($computedExpiry){$computedExpiry.ToString('yyyy-MM-dd')}else{$null});sku_status=$(if($newSkuPending){'will_create_pending_profile'}elseif($mappingUpdate){'will_attach_kw_by_csx'}else{'matched'});mapping_update=$mappingUpdate;affected_tables=@('补货记录','SKU成本主表');remote_replay=($existingEventIndex -ge 0)};message='预演成功，未写入飞书'} | ConvertTo-Json -Depth 8
             Complete-CurrentFinanceTransaction
             exit 0
         }

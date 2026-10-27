@@ -14,6 +14,7 @@ $runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\s
 $runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\sync_meituan_inventory.ps1')
 $runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\reconcile_manual_delivery_fees.ps1')
 $runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\repair_dashboard_offline_formulas.ps1')
+$runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\repair_dashboard_and_replenishment_payments_20261025.ps1')
 $runtimePowerShellFiles += @(Get-ChildItem -LiteralPath (Join-Path $projectRoot 'work') -Filter 'test_*.ps1' -File)
 
 $parseFailures = [Collections.Generic.List[string]]::new()
@@ -33,6 +34,8 @@ $watchdog = [IO.File]::ReadAllText($watchdogPath,[Text.Encoding]::UTF8)
 $wrapper = [IO.File]::ReadAllText($wrapperPath,[Text.Encoding]::UTF8)
 $hiddenWatchdog = [IO.File]::ReadAllText($hiddenWatchdogPath,[Text.Encoding]::UTF8)
 $hiddenScheduledJob = [IO.File]::ReadAllText((Join-Path $agentRoot 'run_hidden_scheduled_job.vbs'),[Text.Encoding]::UTF8)
+$scheduledJob = [IO.File]::ReadAllText((Join-Path $agentRoot 'run_scheduled_job.ps1'),[Text.Encoding]::UTF8)
+$desktopLarkAuth = [IO.File]::ReadAllText((Join-Path $agentRoot 'authorize_lark_desktop.ps1'),[Text.Encoding]::UTF8)
 $scheduledTaskInstaller = [IO.File]::ReadAllText((Join-Path $agentRoot 'configure_petstar_scheduled_tasks.ps1'),[Text.Encoding]::UTF8)
 $weeklyMaintenance = [IO.File]::ReadAllText((Join-Path $agentRoot 'run_weekly_maintenance.ps1'),[Text.Encoding]::UTF8)
 $petstarCli = [IO.File]::ReadAllText($petstarCliPath,[Text.Encoding]::UTF8)
@@ -51,6 +54,8 @@ $runtimePaths = [IO.File]::ReadAllText((Join-Path $agentRoot 'runtime_paths.ps1'
 $browserPreflight = [IO.File]::ReadAllText((Join-Path $agentRoot 'check_meituan_browser.mjs'),[Text.Encoding]::UTF8)
 $deliveryReconciliation = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\reconcile_manual_delivery_fees.ps1'),[Text.Encoding]::UTF8)
 $dashboardFormulaRepair = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\repair_dashboard_offline_formulas.ps1'),[Text.Encoding]::UTF8)
+$dashboardPaymentRepair = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\repair_dashboard_and_replenishment_payments_20261025.ps1'),[Text.Encoding]::UTF8)
+$simpleFinanceBuilder = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\create_simple_finance.ps1'),[Text.Encoding]::UTF8)
 $orderExtractor = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\meituan_order_extract.mjs'),[Text.Encoding]::UTF8)
 $orderSync = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\sync_meituan_orders.ps1'),[Text.Encoding]::UTF8)
 $refundAdjustments = [IO.File]::ReadAllText((Join-Path $agentRoot 'refund_adjustments.ps1'),[Text.Encoding]::UTF8)
@@ -85,6 +90,19 @@ $contracts = [ordered]@{
     powershell_file_entry_preserves_script_root = ($petstarCli -match '"-File"' -and $petstarCli -notmatch 'ScriptBlock|EncodedCommand')
     hidden_watchdog_launcher = ($hiddenWatchdog -match 'shell\.Run\(command, 0, True\)' -and $hiddenWatchdog -match 'WScript\.Quit exitCode')
     hidden_scheduled_jobs_report_real_exit_code = ($hiddenScheduledJob -match 'shell\.Run\(command, 0, True\)' -and $hiddenScheduledJob -match 'WScript\.Quit exitCode' -and $scheduledTaskInstaller -match 'New-TimeSpan -Minutes 90')
+    scheduled_jobs_use_local_lark_credentials = (
+        $scheduledJob -match "'HERMES_HOME'.+'HERMES_GATEWAY_TOKEN'.+'HERMES_SESSION_KEY'" -and
+        $scheduledJob -match "'OPENCLAW_CLI'.+'OPENCLAW_HOME'" -and
+        $scheduledJob -match "'LARK_CHANNEL'" -and
+        $scheduledJob -match 'Remove-Item -LiteralPath "Env:\$variableName"' -and
+        $scheduledJob.Contains("`$env:LARKSUITE_CLI_CONFIG_DIR = Join-Path `$env:USERPROFILE '.lark-cli'")
+    )
+    desktop_lark_auth_uses_local_workspace_without_persisting_tokens = (
+        $desktopLarkAuth -match 'auth login --recommend --no-wait --json' -and
+        $desktopLarkAuth -match 'auth login --device-code \$deviceCode --json' -and
+        $desktopLarkAuth -match 'LARKSUITE_CLI_CONFIG_DIR' -and
+        $desktopLarkAuth -notmatch 'accessToken|refreshToken'
+    )
     one_global_mutation_mutex = ($financeTransaction -match 'Local\\PetstarFinanceMutationV2')
     durable_before_images = ($financeTransaction -match 'Register-FinanceRangeBeforeImage' -and $financeTransaction -match 'status = ''rollback_pending''')
     processed_event_after_commit = ($financeEvent -match 'Register-FinanceProcessedEvent' -and $financeEvent -notmatch 'Register-FinanceProcessedEvent[^\r\n]+\r?\n\s*\[ordered\].+Add-Content')
@@ -109,8 +127,18 @@ $contracts = [ordered]@{
     singleton_pending_cost_is_array_safe = ($ledgerSync -match '@\(\$missingCodes\)\.Count')
     duplicate_before_images_are_skipped = ($financeTransaction -match 'alreadyCaptured' -and $financeTransaction -match 'if \(\$alreadyCaptured\) \{ return \}')
     preflight_checks_state_drive = ($scheduledSync -match 'stateDriveRoot' -and $scheduledSync -match 'AvailableFreeSpace -lt 1GB')
+    scheduled_sync_refreshes_auth_before_guarded_sku_schema_read = (
+        $scheduledSync -match '\$skuSchema = \$null' -and
+        $scheduledSync.Contains("Invoke-WithRetry 'sku_schema' { Get-SkuMasterSchema -SpreadsheetToken `$spreadsheetToken } 4") -and
+        $scheduledSync.IndexOf("Invoke-WithRetry 'preflight'") -lt $scheduledSync.IndexOf("Invoke-WithRetry 'sku_schema'") -and
+        $scheduledSync.IndexOf("Invoke-WithRetry 'sku_schema'") -gt $scheduledSync.IndexOf("try {", $scheduledSync.IndexOf('$operationalDegraded = $false'))
+    )
+    scheduled_sync_diagnoses_windows_lark_credential_store = ($scheduledSync -match 'HKEY_CURRENT_USER\\Software\\LarkCli\\keychain\\lark-cli' -and $scheduledSync -match 'lark_registry_value_count')
     pending_repair_skips_full_committed_journals = ($financeTransaction -match 'Get-FinanceTransactionStatusFast' -and $financeTransaction.Contains("if (`$status -notin @('active','rollback_pending')) { continue }"))
     order_cards_expand_before_extraction = ($orderExtractor -match 'await expandOrderCards\(targetId\)[\s\S]{0,120}extractPageExpression')
+    order_retries_restart_from_first_page = ($orderExtractor -match 'function resetOrderPagination' -and $orderExtractor -match 'await resetOrderPagination\(targetId\)' -and $orderExtractor -match "querySelector\('\.roo-pagination'\)")
+    lark_1_0_98_formula_verify_uses_continuous_ranges = ($orderSync -match "Range='E2:L2001'" -and $orderSync -match "Range='E2:P4001'" -and $inventorySync -match "--range 'H2:M2000'" -and $orderSync -notmatch "Range='[^']*,[^']*'" -and $scheduledSync -match "\$Range -split ','" -and $scheduledSync -match '--range \$continuousRange' -and $costRebuild -match "\$Range -split ','" -and $costRebuild -match '--range \$area' -and $ledgerSync -match "\$Range -split ','" -and $ledgerSync -match '--range \$area' -and $financeEvent -match "\$Range -split ','" -and $financeEvent -match '--range \$area')
+    cost_rebuild_preserves_error_detail = ($scheduledSync -match '成本快照刷新失败：\$detail' -and $scheduledSync -match '\$costScript @costArguments 2>&1')
     order_page_reloads_once_before_failure = ($orderExtractor -match 'function waitForOrderPageReady' -and $orderExtractor -match '/navigate\?target=' -and $orderExtractor -match 'not ready after one safe reload')
     meituan_login_is_detected_without_slow_retry = ($orderExtractor -match 'function waitForOrderReadyOrAuth' -and $orderExtractor -match 'MEITUAN_AUTH_REQUIRED' -and $orderExtractor -match 'login_gw' -and $scheduledSync -match '\$nonRetryable[\s\S]{0,500}MEITUAN_AUTH_REQUIRED')
     meituan_login_alert_is_persistent_and_self_resolving = ($scheduledSync -match "return 'meituan-auth'" -and $scheduledSync -match 'active-meituan-auth\.json|active-\$safeCategory\.json' -and $scheduledSync -match "Resolve-FailureNotification 'meituan-auth'" -and $scheduledSync -match 'authenticated_order_read_succeeded')
@@ -141,7 +169,10 @@ $contracts = [ordered]@{
     oversized_sheet_reads_are_split = ($scheduledSync -match 'data\.has_more' -and $scheduledSync -match '\$leftRange' -and $scheduledSync -match '\$rightRange' -and $scheduledSync -match '飞书单行读取仍不完整')
     summary_failure_cannot_rollback_valid_ledger = ($scheduledSync.LastIndexOf("`n    Complete-SyncFinanceTransaction") -gt $scheduledSync.LastIndexOf("Invoke-WithRetry 'integrity_audit'") -and $scheduledSync.LastIndexOf("`n    Complete-SyncFinanceTransaction") -lt $scheduledSync.LastIndexOf("Invoke-WithRetry 'summary_readback' { Build-Snapshot }"))
     completed_refunds_are_keyed_by_record_id = ($orderExtractor -match 'recordId' -and $refundAdjustments -match 'meituan:\$\(\$order\.orderNo\):\$\(\$refund\.recordId\)')
+    platform_refunds_preserve_pending_and_unknown_states = ($orderExtractor -match 'classifyRefundGroup' -and $orderExtractor -match "state !== 'closed'" -and $orderSync -match 'refund_observation_details' -and $scheduledSync -match '退款状态观察' -and $scheduledSync -match 'refund_observation_alert')
+    meituan_return_goods_refunds_use_new_structure = ($orderExtractor -match 'refundGoodsInfoList' -and $orderExtractor -match '全部退货\|整单退货' -and $orderExtractor -match 'chargeInfo\?\.userPayTotalAmount')
     refund_income_preserves_cents = ($orderSync.Contains('[math]::Max([double]0.0, [double][math]::Round'))
+    zero_income_refunds_are_labeled_full_refund = ($orderSync -match 'effectiveExpectedIncome.+-le 0\.004999' -and $orderSync -match '已完成（全额退款）' -and $orderSync -match '已完成（部分退款）')
     returned_inventory_reverses_only_returned_cost = ($costRebuild -match 'returned_restocked' -and $costRebuild -match 'effective_quantity')
     optional_sheet_cells_and_order_fields_are_safe = ($orderSync -match "PSObject\.Properties\['value'\]" -and $ledgerSync -match "PSObject\.Properties\['is_offline'\]")
     actual_fulfillment_override_is_durable = ($orderActualOverrides -match 'order_actual_overrides\.json' -and $orderSync -match 'Get-OrderActualOverrides' -and $financeEvent -match "'SetOrderActuals'")
@@ -168,6 +199,7 @@ $contracts = [ordered]@{
     codex_persistent_runtime_follows_account_switches = ($codexBridge -match 'get_auth_fingerprint' -and $codexBridge -match 'ensure_current_auth' -and $codexBridge -match 'auth_reloaded')
     meituan_automation_binds_verified_store_context = ($meituanBrowserContext -match '宠速星宠物用品店' -and $meituanBrowserContext -match 'authenticatedStore' -and $orderExtractor -match 'openPetstarMerchantTab' -and $inventoryExporter -match 'openPetstarMerchantTab' -and $promotionExtractor -match 'openPetstarMerchantTab')
     meituan_automation_uses_only_bound_chrome_profile = ($meituanBrowserContext -match 'loadBinding' -and $meituanBrowserContext -match 'profile_directory' -and $meituanBrowserContext -match 'resolveBoundContext' -and $meituanBrowserContext -match 'boundPages' -and $meituanBrowserContext -match 'MEITUAN_AUTH_REQUIRED')
+    bound_online_chrome_opens_merchant_tab_without_profile_probe = ($meituanBrowserContext -match '/new\?url=' -and $meituanBrowserContext -match 'target\.browserContextId !== resolved\.browserContextId' -and $meituanBrowserContext -match 'if \(!target\) \{[\s\S]{0,500}/new\?url=')
     meituan_inventory_export_supports_explicit_extra_fields = ($inventoryExporter -match 'MEITUAN_EXPORT_EXTRA_FIELDS' -and $inventoryExporter -match '\.\.\.extraFields')
     meituan_product_field_inspector_is_read_only = ((Test-Path -LiteralPath $productExportFieldInspectorPath) -and $productExportFieldInspector -match 'openPetstarMerchantTab' -and $productExportFieldInspector -match 'releasePetstarMerchantTab' -and $productExportFieldInspector -notmatch 'createExport|clickCreateExport|修改库存')
     business_queries_are_parallel_and_bounded = ($codexBridge -match 'ThreadPoolExecutor' -and $codexBridge -match 'max_workers=min\(3')
@@ -175,6 +207,7 @@ $contracts = [ordered]@{
     message_latency_has_stage_telemetry = ($codexBridge -match 'codex_performance\.ndjson' -and $codexBridge -match 'model_seconds' -and $codexBridge -match 'query_seconds' -and $bridge -match 'message timing')
     order_local_ledger_rebuild_is_month_scoped = ($ledgerSync -match '\[string\]\$MonthFilter' -and $ledgerSync -match 'selected_months' -and $financeEvent -match 'monthLocalActions')
     replenishment_updates_only_local_cost_state = ($replenishmentBlock -match 'afterAverage' -and $replenishmentBlock -match "affected_tables=@\('补货记录','SKU成本主表'\)" -and $replenishmentBlock -notmatch 'Invoke-CostSnapshotRebuild|Invoke-DailyLedgerSync|库存批次')
+    replenishment_defaults_to_same_day_full_payment = ($financeEvent -match 'explicitlyUnpaid' -and $financeEvent -match '未付款\|未支付\|赊账\|挂账\|欠款' -and $financeEvent -match '\$paymentAmountValue = if \(\$null -ne \$PaymentAmount\).+\$purchaseAmountValue' -and $codexBridge -match '默认当天已全额付款')
     plain_sku_cost_does_not_rebuild_history = ($setSkuCostBlock -notmatch 'Invoke-CostSnapshotRebuild' -and $setSkuCostBlock -match 'affectedTables = if \(\$OrderNo\)' -and $setSkuCostBlock -match "else \{ @\('SKU成本主表'\) \}")
     targeted_sku_cost_requires_order_and_month_scope = ($setSkuCostBlock -match '订单 \$OrderNo 中找不到' -and $financeEvent -match '\$Action -eq ''SetSkuCost'' -and \$null -ne \$explicitHistoricalOrderDate' -and $financeEvent -match 'Invoke-DailyLedgerSync \$explicitHistoricalOrderDate')
     order_sync_moves_cost_snapshot_with_item_identity = ($orderSync -match 'Get-OrderItemSnapshotKey' -and $orderSync -match 'Take-CostSnapshotFromQueue' -and $orderSync -match 'Set-CellMatrix ''订单商品'' "L2:N\$itemsLastRow"')
@@ -198,6 +231,7 @@ $contracts = [ordered]@{
     nightly_intervention_reconciliation_repairs_and_alerts = ($orderSync -match 'intervention_repair_count' -and $orderSync -match '订单汇总中找不到原订单' -and $orderSync -match 'New-NullableNumberCell \$record\.PlatformFee' -and $scheduledSync -match '补单数据自动补救' -and $scheduledSync -match '补单数据待处理' -and $ledgerSync -match '平台扣款尚未识别；未知不等于0元' -and $integrityAudit -match 'intervention_data_errors' -and $integrityAudit -match '-not \$interventionSet\.ContainsKey\(\$orderNo\)')
     manual_delivery_repair_is_atomic_and_read_back = ($deliveryReconciliation -match 'New-FinanceTransaction' -and $deliveryReconciliation -match 'Register-FinanceRangeBeforeImage' -and $deliveryReconciliation -match 'Invoke-FinanceTransactionRollback' -and $deliveryReconciliation -match '配送费回读订单数量不一致')
     dashboard_includes_offline_orders_and_matches_ledger = ($dashboardFormulaRepair -match "''线下订单''" -and $dashboardFormulaRepair -match 'dashboard_gross_profit' -and $dashboardFormulaRepair -match 'ledger_profit' -and $dashboardFormulaRepair -match 'Invoke-FinanceTransactionRollback')
+    dashboard_uses_current_cost_inventory_and_compact_metrics = ($simpleFinanceBuilder -match '\(D\{r\}\+IFERROR\(M\{r\}\*1,0\)\)\*H\{r\}' -and $simpleFinanceBuilder -match 'SKU成本主表.+G.2.+G.3000' -and $simpleFinanceBuilder -notmatch '本月经济利润.+\$null' -and $dashboardPaymentRepair -match 'october_purchase_amount' -and $dashboardPaymentRepair -match 'Invoke-FinanceTransactionRollback')
     confirmed_writes_wait_for_running_sync = ($financeTransaction -match 'LockTimeoutSeconds' -and $bridge -match 'Invoke-StoredConfirmationOperations \$pending \$executeEvent 5' -and $bridge -match "Mode', 'RetryPending'" -and $bridge -match 'Invoke-StoredConfirmationOperations \$pending \$executeEvent 2700')
     codex_mutation_preview_reuses_first_parse = ($bridge -match 'function New-ConfirmationDraftFromCodexResult' -and $bridge -match 'Reuse them[\s\S]{0,240}New-ConfirmationDraftFromCodexResult')
 }
@@ -221,6 +255,7 @@ if (-not (Test-Path -LiteralPath $python)) { throw 'Project Python runtime was n
 if ($LASTEXITCODE -ne 0) { throw 'Python entry-point compile check failed' }
 $nodeFiles = @(
     (Join-Path $projectRoot 'work\meituan_order_extract.mjs'),
+    (Join-Path $projectRoot 'work\test_meituan_refund_extraction.mjs'),
     (Join-Path $projectRoot 'work\meituan_inventory_export.mjs'),
     (Join-Path $projectRoot 'work\inspect_meituan_product_export_fields.mjs'),
     (Join-Path $projectRoot 'work\meituan_promotion_extract.mjs')
@@ -231,6 +266,8 @@ foreach ($nodeFile in $nodeFiles) {
     & node --check $nodeFile
     if ($LASTEXITCODE -ne 0) { throw "Node entry-point syntax check failed: $nodeFile" }
 }
+& node (Join-Path $projectRoot 'work\test_meituan_refund_extraction.mjs') | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Meituan refund-state classification test failed' }
 
 $resolvedWindowsPowerShell = Get-PetstarWindowsPowerShell
 if (-not (Test-Path -LiteralPath $resolvedWindowsPowerShell -PathType Leaf)) { throw 'Windows PowerShell resolver returned a missing file' }

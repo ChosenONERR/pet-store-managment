@@ -164,10 +164,12 @@ function Clear-SheetData([string]$SheetName, [string]$LastColumn) {
 }
 
 function Assert-FormulaRange([string]$SheetName, [string]$Range) {
-    $raw = & $larkCli sheets +formula-verify --as user --spreadsheet-token $ledgerToken --sheet-name $SheetName --range $Range --format json --exit-on-error | Out-String
-    if ($LASTEXITCODE -ne 0) { throw "公式校验失败：$SheetName $Range" }
-    $result = $raw | ConvertFrom-Json
-    if ($result.data.status -ne 'success') { throw "公式存在错误：$SheetName $Range" }
+    foreach ($area in @($Range -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+        $raw = & $larkCli sheets +formula-verify --as user --spreadsheet-token $ledgerToken --sheet-name $SheetName --range $area --format json --exit-on-error 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) { throw "公式校验失败：$SheetName $area；$($raw.Trim())" }
+        $result = $raw | ConvertFrom-Json
+        if ($result.data.status -ne 'success') { throw "公式存在错误：$SheetName $area" }
+    }
 }
 
 function Get-MonthSheetPrefix([datetime]$Month) {

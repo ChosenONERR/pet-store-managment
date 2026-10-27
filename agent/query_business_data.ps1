@@ -279,6 +279,12 @@ switch ($Dataset) {
             $codeMatch = -not $Code -or [string](Get-PropertyValue $_ '当前KW') -ieq $Code -or [string](Get-PropertyValue $_ 'CSX/过渡货号') -ieq $Code
             $codeMatch -and (Test-Search $_)
         })
+        foreach ($row in $rows) {
+            $rowNumber = [int](Get-PropertyValue $row '_row')
+            $productId = ([string](Get-PropertyValue $row '商品ID（美团SKU ID）')).Trim().ToLowerInvariant()
+            $actionCode = if ($rowNumber -ge 2 -and $productId) { "sku_ref:${rowNumber}:$productId" } else { $null }
+            $row | Add-Member -NotePropertyName 'action_code' -NotePropertyValue $actionCode -Force
+        }
         $payload = [ordered]@{ count=$rows.Count; rows=(Limit-Rows $rows) }
     }
     'inventory' {

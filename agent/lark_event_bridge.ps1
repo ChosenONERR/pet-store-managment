@@ -424,10 +424,20 @@ function Invoke-CodexAndReply($Event, [string]$AuthorizedOpenId, [string]$Messag
     $codexMode = if ($script:previewMode) { 'preview' } elseif ($script:confirmedExecution) { 'execute' } else { 'normal' }
     $codexResult = Invoke-PetstarCodex $MessageText ([string]$Event.message_id) $codexMode
     if (-not $codexResult.ok) {
-        $errorReply = '宠速星经营管家暂时无法处理这条消息。' + [Environment]::NewLine + [string]$codexResult.error
-        Send-Acknowledgement $AuthorizedOpenId $errorReply ([string]$Event.message_id) 'error'
-        Write-BridgeLog "codex failed error=$([string]$codexResult.error)"
+        $retryable = $null -ne $codexResult.PSObject.Properties['retryable'] -and [bool]$codexResult.retryable
+        $retryAfterSeconds = if ($null -ne $codexResult.PSObject.Properties['retry_after_seconds']) { [int]$codexResult.retry_after_seconds } else { 60 }
         $script:lastProcessFailure = [string]$codexResult.error
+        $script:lastProcessRetryable = $retryable
+        $script:lastProcessRetryAfterSeconds = $retryAfterSeconds
+        if ($retryable) {
+            $retryAfterMinutes = [math]::Max(1,[math]::Ceiling($retryAfterSeconds / 60.0))
+            $errorReply = "Codex 当前请求较多，这条消息已安全保留。系统会在约 $retryAfterMinutes 分钟后自动重试，你不需要重发；重试成功后会正常回复，本次没有修改任何经营数据。"
+            $null = Send-Acknowledgement $AuthorizedOpenId $errorReply ([string]$Event.message_id) 'deferred'
+        } else {
+            $errorReply = '宠速星经营管家暂时无法处理这条消息。' + [Environment]::NewLine + [string]$codexResult.error
+            $null = Send-Acknowledgement $AuthorizedOpenId $errorReply ([string]$Event.message_id) 'error'
+        }
+        Write-BridgeLog "codex failed error=$([string]$codexResult.error)"
         return $false
     }
 
@@ -442,18 +452,18 @@ function Invoke-CodexAndReply($Event, [string]$AuthorizedOpenId, [string]$Messag
         $draft = New-ConfirmationDraftFromCodexResult $Event $MessageText $codexResult
         if ([int]$draft.mutation_count -eq 0) {
             $reply = if ($draft.needs_information) { [string]$draft.preview } else { '我理解到你想修改数据，但这次没有生成明确的修改项，所以没有写表。请补充要改的对象和新值。' }
-            Send-Acknowledgement $AuthorizedOpenId $reply ([string]$Event.message_id) 'clarify'
+            $null = Send-Acknowledgement $AuthorizedOpenId $reply ([string]$Event.message_id) 'clarify'
             return $true
         }
         $queued = Add-PendingConfirmation $draft
         if ($queued.duplicate) {
             $existing = $queued.existing
             $queueText = "相同修改已经在待确认队列中，没有重复新增。`n`n$([string]$existing.preview)"
-            Send-Acknowledgement $AuthorizedOpenId $queueText ([string]$Event.message_id) 'preview-duplicate'
+            $null = Send-Acknowledgement $AuthorizedOpenId $queueText ([string]$Event.message_id) 'preview-duplicate'
             Write-BridgeLog "codex mutation deduplicated requested_change_id=$($draft.change_id) existing_change_id=$($existing.change_id)"
         } else {
             $queueText = Format-QueuedConfirmationReply $draft $queued.position $queued.active
-            Send-Acknowledgement $AuthorizedOpenId $queueText ([string]$Event.message_id) 'preview'
+            $null = Send-Acknowledgement $AuthorizedOpenId $queueText ([string]$Event.message_id) 'preview'
             Write-BridgeLog "codex promoted mutation to confirmation change_id=$($draft.change_id)"
         }
         return $true
@@ -472,11 +482,11 @@ function Invoke-CodexAndReply($Event, [string]$AuthorizedOpenId, [string]$Messag
         } else {
             Format-NonExecutableCodexReply ([string]$codexResult.reply)
         }
-        Send-Acknowledgement $AuthorizedOpenId $reply ([string]$Event.message_id)
+        $null = Send-Acknowledgement $AuthorizedOpenId $reply ([string]$Event.message_id)
     } elseif ($executedOperations.Count -gt 0) {
-        Send-Acknowledgement $AuthorizedOpenId (Format-CodexExecutionReply @($executedOperations)) ([string]$Event.message_id)
+        $null = Send-Acknowledgement $AuthorizedOpenId (Format-CodexExecutionReply @($executedOperations)) ([string]$Event.message_id)
     } else {
-        Send-Acknowledgement $AuthorizedOpenId (Format-NonExecutableCodexReply ([string]$codexResult.reply)) ([string]$Event.message_id)
+        $null = Send-Acknowledgement $AuthorizedOpenId (Format-NonExecutableCodexReply ([string]$codexResult.reply)) ([string]$Event.message_id)
     }
     Write-BridgeLog "codex processed message_hash=$((Get-MessageHash ([string]$Event.message_id)).Substring(0,12)) cached=$($codexResult.cached) actions=$($actions.Count)"
     return $true
@@ -736,6 +746,7 @@ function Invoke-CodexAction($CodexAction, $Event, [int]$Index, [string]$Mode) {
 function Invoke-CodexActionsInOrder($Actions, $Event, [string]$Mode) {
     $actionList = @($Actions)
     $operations = [Collections.Generic.List[object]]::new()
+    $previewSkuCostOverrides = @{}
     $index = 0
     while ($index -lt $actionList.Count) {
         if ($Mode -eq 'preview' -and (Test-BatchCompatibleSkuOperation $actionList[$index])) {
@@ -755,7 +766,37 @@ function Invoke-CodexActionsInOrder($Actions, $Event, [string]$Mode) {
             }
         }
         $operation = Invoke-CodexAction $actionList[$index] $Event $index $Mode
-        if ($null -ne $operation) { $operations.Add($operation) }
+        if ($null -ne $operation) {
+            if ($Mode -eq 'preview' -and [string]$operation.action -eq 'SetSkuCost') {
+                $reference = ([string]$operation.arguments.goods_code).Trim().ToLowerInvariant()
+                if ($reference) {
+                    $oldCost = if ($null -ne $operation.result.old_moving_average_cost -and [string]$operation.result.old_moving_average_cost -ne '') { [double]$operation.result.old_moving_average_cost } elseif ($null -ne $operation.result.old_baseline_cost -and [string]$operation.result.old_baseline_cost -ne '') { [double]$operation.result.old_baseline_cost } else { $null }
+                    $previewSkuCostOverrides[$reference] = [pscustomobject]@{old_cost=$oldCost;new_cost=[double]$operation.arguments.amount}
+                }
+            }
+            if ($Mode -eq 'preview' -and [string]$operation.action -eq 'OfflineSale' -and $previewSkuCostOverrides.Count -gt 0) {
+                $itemMatches = @([regex]::Matches([string]$operation.arguments.items, '(?i)\b((?:(?:kw|csx)\d+|sku_ref:\d+:[a-z0-9_-]+))\s*[×xX*]\s*(\d+(?:\.\d+)?)'))
+                $allOverridden = $itemMatches.Count -gt 0
+                $plannedCost = 0.0
+                $delta = 0.0
+                foreach ($itemMatch in $itemMatches) {
+                    $itemCode = ([string]$itemMatch.Groups[1].Value).ToLowerInvariant()
+                    $quantity = [double]::Parse([string]$itemMatch.Groups[2].Value,[Globalization.CultureInfo]::InvariantCulture)
+                    if (-not $previewSkuCostOverrides.ContainsKey($itemCode)) { $allOverridden = $false; continue }
+                    $override = $previewSkuCostOverrides[$itemCode]
+                    $plannedCost += [double]$override.new_cost * $quantity
+                    if ($null -ne $override.old_cost) { $delta += ([double]$override.new_cost - [double]$override.old_cost) * $quantity }
+                }
+                if ($allOverridden) {
+                    $operation.result.product_cost = [math]::Round($plannedCost,2)
+                    if ($null -ne $operation.result.PSObject.Properties['pending_cost_codes']) { $operation.result.pending_cost_codes = @() }
+                    else { $operation.result | Add-Member -NotePropertyName 'pending_cost_codes' -NotePropertyValue @() }
+                } elseif ($null -ne $operation.result.product_cost -and [string]$operation.result.product_cost -ne '') {
+                    $operation.result.product_cost = [math]::Round(([double]$operation.result.product_cost + $delta),2)
+                }
+            }
+            $operations.Add($operation)
+        }
         $index++
     }
     return $operations.ToArray()
@@ -1559,30 +1600,38 @@ function Invoke-StoredConfirmationOperations($Pending, $ExecuteEvent, [int]$Lock
 
 function Invoke-ConfirmationFlow($Event, [string]$AuthorizedOpenId, [string]$MessageText) {
     $pending = Get-ActivePendingConfirmation $Event
+    # 旧版本可能把“仍需核对”的说明性回复误存成零操作待确认项。
+    # 这种空计划既不能执行，也会吞掉用户后续补充；先清除，再让本条消息正常重建预览。
+    if ($pending -and ([int]$pending.mutation_count -le 0 -or @($pending.operations).Count -eq 0)) {
+        $staleChangeId = [string]$pending.change_id
+        $null = Clear-PendingConfirmation
+        $pending = $null
+        Write-BridgeLog "discarded empty pending confirmation change_id=$staleChangeId"
+    }
     if (Test-CancellationText $MessageText) {
         if ($pending) {
             $next = Clear-PendingConfirmation
             $reply = "已取消待确认变更：$($pending.change_id)。没有修改表格。"
             if ($next) { $reply += "`n`n下一项：`n$($next.preview)" }
-            Send-Acknowledgement $AuthorizedOpenId $reply ([string]$Event.message_id) 'cancel'
+            $null = Send-Acknowledgement $AuthorizedOpenId $reply ([string]$Event.message_id) 'cancel'
         } else {
-            Send-Acknowledgement $AuthorizedOpenId '当前没有待确认的经营数据变更。' ([string]$Event.message_id) 'cancel'
+            $null = Send-Acknowledgement $AuthorizedOpenId '当前没有待确认的经营数据变更。' ([string]$Event.message_id) 'cancel'
         }
         return [pscustomobject]@{handled=$true;result=$true}
     }
 
     if (Test-ConfirmationText $MessageText) {
         if (-not $pending) {
-            Send-Acknowledgement $AuthorizedOpenId '当前没有待确认的经营数据变更。' ([string]$Event.message_id) 'confirm'
+            $null = Send-Acknowledgement $AuthorizedOpenId '当前没有待确认的经营数据变更。' ([string]$Event.message_id) 'confirm'
             return [pscustomobject]@{handled=$true;result=$true}
         }
         $requestedChangeId = Get-RequestedConfirmationId $MessageText
         if ($requestedChangeId -and $requestedChangeId -ne ([string]$pending.change_id).ToUpperInvariant()) {
-            Send-Acknowledgement $AuthorizedOpenId "你指定的是待确认项 $requestedChangeId，但当前待确认项是 $($pending.change_id)。为避免执行错账，本次没有修改表格；请回复“确认 $($pending.change_id)”执行当前项。" ([string]$Event.message_id) 'confirm-mismatch'
+            $null = Send-Acknowledgement $AuthorizedOpenId "你指定的是待确认项 $requestedChangeId，但当前待确认项是 $($pending.change_id)。为避免执行错账，本次没有修改表格；请回复“确认 $($pending.change_id)”执行当前项。" ([string]$Event.message_id) 'confirm-mismatch'
             return [pscustomobject]@{handled=$true;result=$true}
         }
         if ($pending.needs_information) {
-            Send-Acknowledgement $AuthorizedOpenId "这项还缺关键信息，暂时不能执行。`n请直接补充缺少的内容，我会重新给你确认。" ([string]$Event.message_id) 'confirm'
+            $null = Send-Acknowledgement $AuthorizedOpenId "这项还缺关键信息，暂时不能执行。`n请直接补充缺少的内容，我会重新给你确认。" ([string]$Event.message_id) 'confirm'
             return [pscustomobject]@{handled=$true;result=$true}
         }
 
@@ -1644,8 +1693,15 @@ function Invoke-ConfirmationFlow($Event, [string]$AuthorizedOpenId, [string]$Mes
         $amendEvent.create_time = [string]$pending.original_create_time
         $refreshed = New-ConfirmationDraft $amendEvent $AuthorizedOpenId $effectiveMessage ([string]$pending.change_id)
         $refreshed.original_message = [string]$pending.original_message
+        if ([int]$refreshed.mutation_count -eq 0) {
+            # 补充说明没有形成可执行动作时，只回复说明，保留原计划，避免把有效待确认项覆盖为空壳。
+            $clarification = if ([string]$refreshed.preview) { [string]$refreshed.preview } else { '这次补充还没有形成明确修改，原待确认项已保留。' }
+            $null = Send-Acknowledgement $AuthorizedOpenId $clarification ([string]$Event.message_id) 'clarify'
+            Write-BridgeLog "pending amendment produced no mutations; original retained change_id=$($pending.change_id)"
+            return [pscustomobject]@{handled=$true;result=$true}
+        }
         Write-PendingConfirmation $refreshed
-        Send-Acknowledgement $AuthorizedOpenId ([string]$refreshed.preview) ([string]$Event.message_id) 'amend'
+        $null = Send-Acknowledgement $AuthorizedOpenId ([string]$refreshed.preview) ([string]$Event.message_id) 'amend'
         return [pscustomobject]@{handled=$true;result=$true}
     }
 
@@ -1653,7 +1709,7 @@ function Invoke-ConfirmationFlow($Event, [string]$AuthorizedOpenId, [string]$Mes
         $draft = New-ConfirmationDraft $Event $AuthorizedOpenId $MessageText
         if ([int]$draft.mutation_count -eq 0) {
             if ($draft.needs_information) {
-                Send-Acknowledgement $AuthorizedOpenId ([string]$draft.preview) ([string]$Event.message_id) 'clarify'
+                $null = Send-Acknowledgement $AuthorizedOpenId ([string]$draft.preview) ([string]$Event.message_id) 'clarify'
                 return [pscustomobject]@{handled=$true;result=$true}
             }
             return [pscustomobject]@{handled=$true;result=(Invoke-CodexAndReply $Event $AuthorizedOpenId $MessageText)}
@@ -1662,10 +1718,10 @@ function Invoke-ConfirmationFlow($Event, [string]$AuthorizedOpenId, [string]$Mes
         if ($queued.duplicate) {
             $existing = $queued.existing
             $duplicateReply = "相同修改已经在待确认队列中，没有重复新增。`n`n$([string]$existing.preview)"
-            Send-Acknowledgement $AuthorizedOpenId $duplicateReply ([string]$Event.message_id) 'preview-duplicate'
+            $null = Send-Acknowledgement $AuthorizedOpenId $duplicateReply ([string]$Event.message_id) 'preview-duplicate'
             Write-BridgeLog "pending confirmation deduplicated requested_change_id=$($draft.change_id) existing_change_id=$($existing.change_id)"
         } else {
-            Send-Acknowledgement $AuthorizedOpenId (Format-QueuedConfirmationReply $draft $queued.position $queued.active) ([string]$Event.message_id) 'preview'
+            $null = Send-Acknowledgement $AuthorizedOpenId (Format-QueuedConfirmationReply $draft $queued.position $queued.active) ([string]$Event.message_id) 'preview'
             Write-BridgeLog "pending confirmation created change_id=$($draft.change_id)"
         }
         return [pscustomobject]@{handled=$true;result=$true}
@@ -1736,6 +1792,8 @@ function Invoke-PendingConfirmationRetry([string]$AuthorizedOpenId, [string]$Cha
 
 function Process-Event([string]$Line, [string]$AuthorizedOpenId, [switch]$BypassConfirmation) {
     $script:lastProcessFailure = $null
+    $script:lastProcessRetryable = $false
+    $script:lastProcessRetryAfterSeconds = 0
     if (-not $Line.Trim().StartsWith('{')) { return $false }
     try { $event = $Line | ConvertFrom-Json } catch { return $false }
     if ($event.sender_type -ne 'user' -or $event.sender_id -ne $AuthorizedOpenId) { return $false }
@@ -2038,6 +2096,13 @@ function Process-EventWithLedger([string]$Line, [string]$AuthorizedOpenId, [stri
         $errorText = [string]$_.Exception.Message
         Write-BridgeLog "message processing failed message_hash=$($hash.Substring(0,12)) error=$errorText"
         try {
+            if ($script:lastProcessFailure -and $script:lastProcessRetryable) {
+                $retryAfterMinutes = [math]::Max(1,[math]::Ceiling([int]$script:lastProcessRetryAfterSeconds / 60.0))
+                $deferredReply = "Codex 当前请求较多，这条消息已安全保留。系统会在约 $retryAfterMinutes 分钟后自动重试，你不需要重发；重试成功后会正常生成待确认项，本次没有修改任何经营数据。"
+                $null = Send-Acknowledgement $AuthorizedOpenId $deferredReply $messageId 'deferred'
+                Add-HandledMessageRecord $messageId 'failed_retryable' $Source ([string]$event.create_time)
+                return 'failed_retryable'
+            }
             $messageSummary = ([regex]::Replace([string]$event.content, '\s+', ' ')).Trim()
             if ($messageSummary.Length -gt 160) { $messageSummary = $messageSummary.Substring(0,157) + '...' }
             $failureReply = @(
@@ -2047,7 +2112,7 @@ function Process-EventWithLedger([string]$Line, [string]$AuthorizedOpenId, [stri
                 "原因：$errorText"
                 '处理状态：没有标记为完成；请按原因补充信息，或直接重发原话。'
             ) -join "`n"
-            Send-Acknowledgement $AuthorizedOpenId $failureReply $messageId 'error'
+            $null = Send-Acknowledgement $AuthorizedOpenId $failureReply $messageId 'error'
             Add-HandledMessageRecord $messageId 'failed_retryable' $Source ([string]$event.create_time)
             return 'failed_retryable'
         } catch {

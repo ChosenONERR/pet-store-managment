@@ -8,6 +8,32 @@ if ($source -notmatch "lark_cli_noexit\.ps1" -or $source -notmatch "不会.*结�
 if ($source -notmatch '经营事件执行失败：\$detail') {
     throw '经营事件底层错误透传未启用'
 }
+$codexReplyStart = $source.IndexOf('function Invoke-CodexAndReply')
+$codexReplyEnd = $source.IndexOf('function Convert-PetstarArgumentsToMap',$codexReplyStart)
+if ($codexReplyStart -lt 0 -or $codexReplyEnd -le $codexReplyStart) { throw '无法定位 Codex 回执函数' }
+$codexReplyBlock = $source.Substring($codexReplyStart,$codexReplyEnd-$codexReplyStart)
+if ($codexReplyBlock -match '(?m)^\s*Send-Acknowledgement\s') {
+    throw 'Codex 回执结果未被抑制，可能污染布尔处理状态并把失败消息误记为完成'
+}
+$financeSourcePath = Join-Path $projectRoot 'agent\record_finance_event.ps1'
+$financeSource = Get-Content -LiteralPath $financeSourcePath -Raw -Encoding UTF8
+$resolverStart = $financeSource.IndexOf('function Resolve-UniqueSkuReference')
+$resolverEnd = $financeSource.IndexOf('function Resolve-OrderForGift',$resolverStart)
+if ($resolverStart -lt 0 -or $resolverEnd -le $resolverStart) { throw '无法定位 SKU 安全引用解析器' }
+function Get-CellValue($Row, [int]$Index) { if ($null -eq $Row -or $Index -ge $Row.Count) { return $null }; return $Row[$Index] }
+$skuSchema = [pscustomobject]@{ProductId=[pscustomobject]@{Index=2}}
+Invoke-Expression $financeSource.Substring($resolverStart,$resolverEnd-$resolverStart)
+$resolverRows = @(@('kw1113','csx-old','pid-shared'),@('kw1113','csx-new','pid-shared'))
+$safeReference = Resolve-UniqueSkuReference $resolverRows 'sku_ref:3:pid-shared'
+if ($safeReference.row_number -ne 3 -or $safeReference.cells[1] -ne 'csx-new') { throw 'SKU安全引用没有精确定位指定主表行' }
+$staleReferenceRejected = $false
+try { $null = Resolve-UniqueSkuReference $resolverRows 'sku_ref:3:wrong-id' } catch { $staleReferenceRejected = [string]$_.Exception.Message -match '安全定位已失效' }
+if (-not $staleReferenceRejected) { throw 'SKU安全引用没有在商品ID变化时安全停止' }
+if ($financeSource -notmatch 'sku_ref:\\d\+:\[a-z0-9_-\]\+') { throw '线下单解析器未接受 SKU 安全引用' }
+$querySource = Get-Content -LiteralPath (Join-Path $projectRoot 'agent\query_business_data.ps1') -Raw -Encoding UTF8
+if ($querySource -notmatch 'sku_ref:\$\{rowNumber\}:\$productId') { throw 'SKU查询没有返回安全 action_code' }
+$codexSource = Get-Content -LiteralPath (Join-Path $projectRoot 'agent\codex_chat_bridge.py') -Raw -Encoding UTF8
+if ($codexSource -notmatch '必须逐字使用它' -or $codexSource -notmatch '禁止自行改写成裸商品ID') { throw 'Codex 未被约束使用 SKU 查询返回的安全 action_code' }
 $start = $source.IndexOf('$ErrorActionPreference')
 $marker = "`n`$script:handledMessageHashes = Get-HandledMessageHashes"
 $cut = $source.LastIndexOf($marker)
@@ -60,6 +86,7 @@ $pendingConfirmationsPath = Join-Path $testStateRoot 'pending.json'
 $pendingAcknowledgementsPath = Join-Path $testStateRoot 'pending_ack.json'
 $handledMessagesLog = Join-Path $testStateRoot 'handled.ndjson'
 $runtimeLog = Join-Path $testStateRoot 'bridge.log'
+$interactivePriorityPath = Join-Path $testStateRoot 'interactive_priority.json'
 $script:testAckNowShouldFail = $true
 $script:testAckNowCalls = 0
 function Send-AcknowledgementNow([string]$OpenId, [string]$Text, [string]$IdempotencyKey) {
@@ -79,12 +106,15 @@ $script:failNextAction = ''
 $script:testCostRebuildCalls = 0
 $script:previewMode = $false
 $script:confirmedExecution = $false
+$script:handledMessageHashes = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 
 function Send-Acknowledgement([string]$OpenId, [string]$Text, [string]$MessageId, [string]$Purpose = 'ack') {
     if ($script:previewMode) { $script:previewAcknowledgement = $Text; return }
     $script:testAcks.Add($Text)
 }
 function Write-BridgeLog([string]$Message) {}
+function Add-ProcessingReaction([string]$MessageId) { return $null }
+function Remove-ProcessingReaction([string]$MessageId, [string]$ReactionId) {}
 function Invoke-DailyLedgerSync([datetime]$ThroughDate) {
     return [pscustomobject]@{
         ok=$true
@@ -114,7 +144,19 @@ function Invoke-PetstarCodex([string]$Text, [string]$MessageId, [string]$Mode = 
     $script:testCodexCalls.Add([pscustomobject]@{text=$Text;mode=$Mode})
     $actions = @()
     $reply = '本机 Codex 正常回答。'
-    if ($Text -match '同步一下八九月支出') {
+    $needsInformation = $false
+    if ($Text -match '模拟预览限流') {
+        return [pscustomobject]@{ok=$false;cached=$false;retryable=$true;retry_after_seconds=120;error='Codex 当前请求较多，经营数据汇总已延后；系统会自动重试，无需重发。';reply='';actions=@()}
+    } elseif ($Text -match '组合线下成本测试') {
+        $actions = @(
+            (New-TestCodexAction 'SetSkuCost' @{goods_code='kw1109';amount=0;note='组合预演成本'}),
+            (New-TestCodexAction 'OfflineSale' @{date='2026-09-13';items='kw1109×4';amount=8;delivery_fee=0;receipt_status='已到账';platform='线下';note='组合预演线下单'})
+        )
+        $reply = '📝 待确认：先把成本改为0，再登记线下销售。'
+    } elseif ($Text -match '成本改成0元，但先核对') {
+        $reply = '成本证据仍需核对；原待确认修改已保留。'
+        $needsInformation = $true
+    } elseif ($Text -match '同步一下八九月支出') {
         $actions = @(New-TestCodexAction 'RefreshLedger' @{date='2026-09-13'})
         $reply = '刷新八九月支出。'
     } elseif ($Text -match '重新更新一遍9月收入表中今天的订单情况') {
@@ -167,7 +209,7 @@ function Invoke-PetstarCodex([string]$Text, [string]$MessageId, [string]$Mode = 
         $actions = @(New-TestCodexAction 'AddOrderGift' @{date='2026-09-13';order_no='999999999999999999';items='kw4189×1'})
         $reply = '📝 待确认：提前登记订单赠品。'
     }
-    return [pscustomobject]@{ok=$true;cached=$false;needs_information=$false;reply=$reply;actions=$actions}
+    return [pscustomobject]@{ok=$true;cached=$false;needs_information=$needsInformation;reply=$reply;actions=$actions}
 }
 function Invoke-PetstarEvent([string[]]$Arguments) {
     $map = Convert-PetstarArgumentsToMap $Arguments
@@ -272,9 +314,20 @@ try {
     $noActionReply = Invoke-TestMessage 'no-action-fake-preview' '请做一个没有动作的修改测试'
     if ($noActionReply.ack -match '待确认' -or $noActionReply.ack -notmatch '没有生成可执行修改' -or (Read-PendingConfirmation)) { throw "无执行动作时仍发送了误导性的待确认：$($noActionReply.ack)" }
 
+    $combinedOfflineDraft = Invoke-TestMessage 'combined-offline-cost-preview' '组合线下成本测试'
+    $combinedPending = Read-PendingConfirmation
+    if ($combinedOfflineDraft.ack -notmatch '成本 ¥0' -or @($combinedPending.operations).Count -ne 2 -or [double]@($combinedPending.operations)[1].result.product_cost -ne 0) { throw "组合操作预演没有按前序成本修改计算线下单：$($combinedOfflineDraft.ack)" }
+    $null = Clear-PendingConfirmation
+
     $script:testCalls.Clear()
     $feeDraft = Invoke-TestMessage 'draft-fee' '昨天订单3402294850565247821配送费是6.5元'
     if ($feeDraft.ack -notmatch '¥0 → ¥6.5') { throw '自然单配送费预览失败' }
+    $feePendingBeforeClarification = Read-PendingConfirmation
+    $feeClarification = Invoke-TestMessage 'clarify-fee-without-action' '成本改成0元，但先核对'
+    $feePendingAfterClarification = Read-PendingConfirmation
+    if ($feeClarification.ack -notmatch '原待确认修改已保留' -or -not $feePendingAfterClarification -or $feePendingAfterClarification.change_id -ne $feePendingBeforeClarification.change_id -or $feePendingAfterClarification.operation_signature -ne $feePendingBeforeClarification.operation_signature -or @($feePendingAfterClarification.operations).Count -ne 1) {
+        throw "无动作补充说明覆盖了原待确认项：ack=$($feeClarification.ack)"
+    }
     $feeAmend = Invoke-TestMessage 'amend-fee' '配送费改成8元'
     if ($feeAmend.ack -notmatch '¥0 → ¥8') { throw "待确认内容修改失败：$($feeAmend.ack)" }
     $feeConfirm = Invoke-TestMessage 'confirm-fee' '确认'
@@ -362,8 +415,21 @@ try {
     $secondConfirm = Invoke-TestMessage 'queue-confirm-second' '确认'
     if ((Read-PendingConfirmation) -or @($script:testCalls | Where-Object action -eq 'SetSkuCost').Count -ne 1) { throw '第二项待确认没有按队列执行' }
 
+    $stalePending = [pscustomobject]@{change_id='DEADBEEF';conversation_hash=(Get-ConversationHash ([pscustomobject]$baseEvent));original_message='旧说明';effective_message='旧说明';original_create_time=$testCreateTime;created_at=[datetimeoffset]::Now.ToString('o');expires_at=[datetimeoffset]::Now.AddHours(1).ToString('o');preview='只是一段说明';needs_information=$true;mutation_count=0;operations=@();operation_signature='[]'}
+    Write-PendingConfirmation $stalePending
+    $staleRecovery = Invoke-TestMessage 'recover-empty-pending' '把kw1109的销售单位成本改成0元，这是试吃装'
+    $recoveredPending = Read-PendingConfirmation
+    if ($staleRecovery.ack -notmatch 'SKU成本主表第19行' -or -not $recoveredPending -or $recoveredPending.change_id -eq 'DEADBEEF' -or @($recoveredPending.operations).Count -ne 1) { throw "零操作旧待确认项没有被安全恢复：$($staleRecovery.ack)" }
+    $null = Clear-PendingConfirmation
+
+    $rateLimitEvent = $baseEvent.Clone(); $rateLimitEvent.message_id='preview-rate-limit'; $rateLimitEvent.content='模拟预览限流并修改成本'
+    $script:testAcks.Clear()
+    $rateLimitResult = Process-EventWithLedger ($rateLimitEvent | ConvertTo-Json -Compress) 'user-1' 'test'
+    $rateLimitAck = $script:testAcks -join "`n"
+    if ($rateLimitResult -ne 'failed_retryable' -or $rateLimitAck -notmatch '约 2 分钟后自动重试' -or $rateLimitAck -match '无法生成待确认预览') { throw "预览阶段限流没有转入安全重试：result=$rateLimitResult ack=$rateLimitAck" }
+
     if (@($script:testCodexCalls | Where-Object {$_.text -match '3402294620217435837'}).Count -eq 0) { throw '干预单自然语言没有经过 Codex' }
-    [ordered]@{ok=$true;command_json='multiline-supported';ack_idempotency='max-50';ack_outbox='queue-and-retry';routing='codex-first';manual_sync='codex-dispatched';intervention='preview-confirm';intervention_correction='remove-add-atomic';non_executable_reply='not-pending';confirmation_execution='stored-plan-no-reparse';confirmation_failure='atomic-rollback-and-full-retry';delivery_fee='preview-amend-confirm';batch_date='calculated-preview-cancel';zero_cost_new_sku='preview-confirm';codex_question='direct-reply';pending_gift='preview-confirm-auto-match';sku_cost='explicit-preview-confirm';batch_sku_maintenance='preview-and-execute-single-call';pending_queue='fifo-preserved'} | ConvertTo-Json -Depth 5
+    [ordered]@{ok=$true;command_json='multiline-supported';ack_idempotency='max-50';ack_outbox='queue-and-retry';routing='codex-first';manual_sync='codex-dispatched';intervention='preview-confirm';intervention_correction='remove-add-atomic';non_executable_reply='not-pending';confirmation_execution='stored-plan-no-reparse';confirmation_failure='atomic-rollback-and-full-retry';delivery_fee='preview-amend-confirm';pending_amendment='zero-action-retains-original';stale_pending='auto-recovered';preview_rate_limit='deferred-retry';batch_date='calculated-preview-cancel';zero_cost_new_sku='preview-confirm';codex_question='direct-reply';pending_gift='preview-confirm-auto-match';sku_cost='explicit-preview-confirm';batch_sku_maintenance='preview-and-execute-single-call';pending_queue='fifo-preserved'} | ConvertTo-Json -Depth 5
 } finally {
     if (Test-Path -LiteralPath $testStateRoot) { Remove-Item -LiteralPath $testStateRoot -Recurse -Force }
 }

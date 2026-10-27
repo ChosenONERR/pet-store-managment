@@ -18,12 +18,12 @@ Invoke-Expression $incrementalFunctionAst[0].Extent.Text
 
 $unchangedOrder = [pscustomobject]@{
     ok=$true;data_changed=$false;change_details=[pscustomobject]@{summary=$false;items=$false;interventions=$false}
-    new_item_order_nos=@();changed_order_nos=@();affected_months=@();newly_detected_refunds=0;pending_refund_items=0;applied_refund_details=@()
+    new_item_order_nos=@();changed_order_nos=@();affected_months=@();newly_detected_refunds=0;pending_refund_items=0;applied_refund_details=@();refund_observation_count=0;refund_observation_details=@()
 }
 $changedOrder = [pscustomobject]@{
     ok=$true;data_changed=$true
     change_details=[pscustomobject]@{summary=$true;items=$true;interventions=$false}
-    new_item_order_nos=@('1001');changed_order_nos=@('1001');affected_months=@('2026-10');newly_detected_refunds=0;pending_refund_items=0;applied_refund_details=@()
+    new_item_order_nos=@('1001');changed_order_nos=@('1001');affected_months=@('2026-10');newly_detected_refunds=0;pending_refund_items=0;applied_refund_details=@();refund_observation_count=0;refund_observation_details=@()
 }
 $unchangedGift = [pscustomobject]@{ok=$true;updated_cells=0}
 $changedGift = [pscustomobject]@{ok=$true;updated_cells=2}
@@ -51,6 +51,17 @@ if (Test-UseNoChangeFastPath 'midday' $unchangedOrder $changedGift $false $false
 }
 if (Test-UseNoChangeFastPath 'midday' ([pscustomobject]@{ok=$true}) $unchangedGift $false $false) {
     throw 'missing change evidence must not be treated as unchanged'
+}
+$missingRefundEvidence = $unchangedOrder.PSObject.Copy()
+$missingRefundEvidence.PSObject.Properties.Remove('refund_observation_count')
+if (Test-UseNoChangeFastPath 'midday' $missingRefundEvidence $unchangedGift $false $false) {
+    throw 'missing refund observation evidence must not be treated as unchanged'
+}
+$pendingRefundObservation = $unchangedOrder.PSObject.Copy()
+$pendingRefundObservation.refund_observation_count = 1
+$pendingRefundObservation.refund_observation_details = @([pscustomobject]@{order_no='1001';state='pending'})
+if (-not (Test-UseNoChangeFastPath 'midday' $pendingRefundObservation $unchangedGift $false $false)) {
+    throw 'a pending platform refund should stay read-only and may still use the no-change accounting path'
 }
 if (Test-UseNoChangeFastPath 'midday' ([pscustomobject]@{data_changed=$false}) $unchangedGift $false $false) {
     throw 'order result without explicit ok=true must not use the fast path'

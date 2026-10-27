@@ -76,7 +76,7 @@ $spreadsheetToken = ([uri]$meta.workbook_url).Segments[-1].Trim('/')
 . (Join-Path $PSScriptRoot 'sku_master_schema.ps1')
 . (Join-Path $PSScriptRoot 'runtime_paths.ps1')
 $webAccessCheck = Get-PetstarWebAccessCheck
-$skuSchema = Get-SkuMasterSchema -SpreadsheetToken $spreadsheetToken
+$skuSchema = $null
 $dateText = $Date.ToString('yyyy-MM-dd')
 $runStartedAt = [datetime]::Now
 $stageTelemetry = [ordered]@{}
@@ -334,6 +334,25 @@ function Convert-ToSafeState($Value) {
     return ($json | ConvertFrom-Json)
 }
 
+function Get-SafeRuntimeContext {
+    $larkRegistryPath = 'Registry::HKEY_CURRENT_USER\Software\LarkCli\keychain\lark-cli'
+    $larkRegistryItem = Get-Item -LiteralPath $larkRegistryPath -ErrorAction SilentlyContinue
+    return [ordered]@{
+        windows_identity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        user_name = [string]$env:USERNAME
+        user_profile = [string]$env:USERPROFILE
+        app_data = [string]$env:APPDATA
+        local_app_data = [string]$env:LOCALAPPDATA
+        lark_channel = [string]$env:LARK_CHANNEL
+        lark_channel_config = [string]$env:LARK_CHANNEL_CONFIG
+        hermes_home = [string]$env:HERMES_HOME
+        lark_registry_present = ($null -ne $larkRegistryItem)
+        lark_registry_value_count = if ($null -ne $larkRegistryItem) { @($larkRegistryItem.Property).Count } else { 0 }
+        current_directory = [Environment]::CurrentDirectory
+        process_session_id = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    }
+}
+
 function Save-RunState($Value) {
     if (-not (Test-Path -LiteralPath $stateRoot)) { $null = New-Item -ItemType Directory -Path $stateRoot }
     $json = $Value | ConvertTo-Json -Depth 16
@@ -582,8 +601,12 @@ function Get-DailyNetProfit {
 }
 
 function Assert-FormulaRange([string]$SheetName, [string]$Range) {
-    $result = Invoke-LarkJson { lark-cli sheets +formula-verify --as user --spreadsheet-token $spreadsheetToken --sheet-name $SheetName --range $Range --format json --exit-on-error } "公式校验调用失败：$SheetName"
-    if ($result.data.status -ne 'success') { throw "公式存在错误：$SheetName" }
+    # Lark CLI 1.0.98 validates one continuous A1 area per invocation. Keep the
+    # existing compact call sites, but verify comma-separated areas one by one.
+    foreach ($continuousRange in @($Range -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+        $result = Invoke-LarkJson { lark-cli sheets +formula-verify --as user --spreadsheet-token $spreadsheetToken --sheet-name $SheetName --range $continuousRange --format json --exit-on-error } "公式校验调用失败：$SheetName $continuousRange"
+        if ($result.data.status -ne 'success') { throw "公式存在错误：$SheetName $continuousRange" }
+    }
 }
 
 function Invoke-JsonPowerShellScript([string]$Path, [hashtable]$Arguments) {
@@ -637,8 +660,13 @@ function Invoke-CostSnapshotRebuild([string[]]$EligibleOrderNumbers = @(), [bool
     $global:LASTEXITCODE = 0
     $costArguments = @{ ProjectRoot=$projectRoot; EligibleOrderNumbers=$EligibleOrderNumbers }
     if ($Incremental) { $costArguments.Incremental = $true }
-    $output = @(& $costScript @costArguments)
-    if ($LASTEXITCODE -ne 0) { throw '成本快照刷新失败' }
+    $output = @(& $costScript @costArguments 2>&1 | ForEach-Object { [string]$_ })
+    if ($LASTEXITCODE -ne 0) {
+        $detail = (($output | Where-Object { $_ -and $_.Trim() }) -join ' ').Trim()
+        if (-not $detail) { $detail = '子脚本未返回错误详情' }
+        if ($detail.Length -gt 1800) { $detail = $detail.Substring(0, 1800) }
+        throw "成本快照刷新失败：$detail"
+    }
     $jsonLine = @($output | ForEach-Object { [string]$_ } | Where-Object { $_.Trim().StartsWith('{') -and $_.Trim().EndsWith('}') } | Select-Object -Last 1)
     if (-not $jsonLine) { throw '成本快照未返回有效结果' }
     return ($jsonLine | ConvertFrom-Json)
@@ -656,9 +684,11 @@ function Test-UseNoChangeFastPath(
     if ($null -eq $OrderSyncResult -or $null -eq $GiftSyncResult) { return $false }
     $orderOkProperty = $OrderSyncResult.PSObject.Properties['ok']
     $orderChangedProperty = $OrderSyncResult.PSObject.Properties['data_changed']
+    $orderRefundObservationProperty = $OrderSyncResult.PSObject.Properties['refund_observation_count']
+    $orderRefundObservationDetailsProperty = $OrderSyncResult.PSObject.Properties['refund_observation_details']
     $giftUpdatedProperty = $GiftSyncResult.PSObject.Properties['updated_cells']
     $giftOkProperty = $GiftSyncResult.PSObject.Properties['ok']
-    if ($null -eq $orderOkProperty -or $null -eq $orderChangedProperty -or $null -eq $giftUpdatedProperty -or $null -eq $giftOkProperty) { return $false }
+    if ($null -eq $orderOkProperty -or $null -eq $orderChangedProperty -or $null -eq $orderRefundObservationProperty -or $null -eq $orderRefundObservationDetailsProperty -or $null -eq $giftUpdatedProperty -or $null -eq $giftOkProperty) { return $false }
     if ($OrderSyncResult.ok -ne $true -or $GiftSyncResult.ok -ne $true) { return $false }
     return ($OrderSyncResult.data_changed -eq $false -and [int]$GiftSyncResult.updated_cells -eq 0)
 }
@@ -673,7 +703,7 @@ function Test-UseIncrementalChangePath(
 ) {
     if ($SyncMode -notin @('midday','reminder','night','manual') -or $WasSyncSkipped -or $WereOrdersSkipped -or $ForceFullRebuild) { return $false }
     if ($null -eq $OrderSyncResult -or $null -eq $GiftSyncResult) { return $false }
-    foreach ($requiredProperty in @('ok','data_changed','change_details','new_item_order_nos','changed_order_nos','affected_months','newly_detected_refunds','pending_refund_items','applied_refund_details')) {
+    foreach ($requiredProperty in @('ok','data_changed','change_details','new_item_order_nos','changed_order_nos','affected_months','newly_detected_refunds','pending_refund_items','applied_refund_details','refund_observation_count','refund_observation_details')) {
         if ($null -eq $OrderSyncResult.PSObject.Properties[$requiredProperty]) { return $false }
     }
     foreach ($requiredProperty in @('ok','updated_cells')) {
@@ -1379,6 +1409,13 @@ $operationalDegraded = $false
 try {
     $stage = Invoke-WithRetry 'preflight' { Test-SyncPreflight } 5
     $preflightResult = $stage.value
+    # The schema read uses the Feishu user credential and can be the first
+    # request after a PC has been offline long enough for that credential to
+    # expire. Keep it after the read probe and inside the guarded retry path so
+    # a refresh race cannot terminate the scheduled process before state and
+    # failure notification are recorded.
+    $stage = Invoke-WithRetry 'sku_schema' { Get-SkuMasterSchema -SpreadsheetToken $spreadsheetToken } 4
+    $skuSchema = $stage.value
     try {
         $promotionCapture = Get-PromotionCaptureState
         if ($null -ne $promotionCapture) { Resolve-FailureNotification 'promotion-capture' }
@@ -1427,6 +1464,16 @@ try {
             }
             foreach ($pendingRefund in @($orderResult.pending_refund_details)) {
                 $syncWarnings.Add("退款待确认：订单 $($pendingRefund.order_no)｜$($pendingRefund.goods_code)×$($pendingRefund.quantity)｜顾客退款 ¥$($pendingRefund.refund_amount)；收入已扣减，货物成本暂保留。请告诉经营管家商品是‘已退回入库’、‘未退货’还是‘退回报损’。")
+            }
+            foreach ($refundObservation in @($orderResult.refund_observation_details)) {
+                $dailyLabel = if ($refundObservation.daily_order_no) { "美团$($refundObservation.daily_order_no)号单" } else { "订单 $($refundObservation.order_no)" }
+                $statusText = if ($refundObservation.status_text) { [string]$refundObservation.status_text } else { '平台未返回可识别状态文字' }
+                if ([string]$refundObservation.state -eq 'pending') {
+                    $syncWarnings.Add("退款状态观察：$dailyLabel（$($refundObservation.order_no)）检测到退货/退款仍在处理中，当前未改收入、成本或库存；后续每小时及00:00会继续核对。平台状态：$statusText。")
+                } else {
+                    $operationalDegraded = $true
+                    $syncWarnings.Add("退款识别待核对：$dailyLabel（$($refundObservation.order_no)）存在退款记录，但完成状态或退款金额不足以安全改账；本次未改收入、成本或库存，请人工查看美团售后状态。平台状态：$statusText。")
+                }
             }
         }
         if (-not $SkipInventory) {
@@ -1583,6 +1630,14 @@ try {
         $alertStage = Invoke-WithRetry 'pending_gift_alert' { Send-FeishuMessage $alertText $null $alertKey } 2
         $giftAlertResult = $alertStage.value
     }
+    $refundAlertResult = $null
+    $refundAlerts = @($syncWarnings | Where-Object { $_ -match '^退款(?:状态观察|识别待核对|待确认)：' })
+    if ($Silent -and $refundAlerts.Count -gt 0) {
+        $refundAlertText = "↩️ 退款/退货状态需要关注`n" + ($refundAlerts -join "`n")
+        $refundAlertKey = "petstar-refund-alert-$($Date.ToString('yyyyMMdd'))-$(Get-TextFingerprint ($refundAlerts -join '|'))"
+        $alertStage = Invoke-WithRetry 'refund_observation_alert' { Send-FeishuMessage $refundAlertText $null $refundAlertKey } 2
+        $refundAlertResult = $alertStage.value
+    }
     $sendResult = if ($Silent) {
         [pscustomobject]@{ sent = $false; dry_run = [bool]$DryRun; format = 'silent' }
     } else {
@@ -1613,6 +1668,7 @@ try {
         inventory_sync = $inventoryResult
         pending_gift_reconciliation = $giftReconcileResult
         pending_gift_alert = $giftAlertResult
+        refund_observation_alert = $refundAlertResult
         promotion_capture = if ($null -ne $promotionCapture) { [ordered]@{ok=$true;date=$promotionCapture.date;amount=$promotionCapture.amount} } elseif ($promotionCaptureError) { [ordered]@{ok=$false;date=$dateText;error=$promotionCaptureError;order_sync_continued=$true} } else { $null }
         cost_snapshot_rebuild = $costResult
         daily_ledger_sync = $ledgerResult
@@ -1686,6 +1742,7 @@ try {
         notification_suppressed = $failureNotificationSuppressed
         data_committed = $postCommitFailure
         error = $failureReason
+        runtime_context = Get-SafeRuntimeContext
         stages = $stageTelemetry
         duration_seconds = [math]::Round(([datetime]::Now - $runStartedAt).TotalSeconds, 2)
         completed_at = [datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss')

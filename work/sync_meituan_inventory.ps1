@@ -292,7 +292,7 @@ if (Test-Path -LiteralPath $skuDiscoveryPath) {
     if (-not $skuDiscovery.ok -or $skuDiscovery.formula_verification -ne 'success') { throw '新增KW自动建档或回读校验失败' }
 }
 
-$verify = Invoke-LarkJson { lark-cli sheets +formula-verify --as user --spreadsheet-token $spreadsheetToken --sheet-name '库存快照' --range 'H2:I2000,K2:K2000,M2:M2000' --format json --exit-on-error } '库存快照公式校验调用失败'
+$verify = Invoke-LarkJson { lark-cli sheets +formula-verify --as user --spreadsheet-token $spreadsheetToken --sheet-name '库存快照' --range 'H2:M2000' --format json --exit-on-error } '库存快照公式校验调用失败'
 if ($verify.data.status -ne 'success') { throw '库存快照公式校验失败' }
 $dashboardVerify = Invoke-LarkJson { lark-cli sheets +formula-verify --as user --spreadsheet-token $spreadsheetToken --sheet-name '驾驶舱' --range 'C2:C19' --format json --exit-on-error } '驾驶舱公式校验调用失败'
 if ($dashboardVerify.data.status -ne 'success') { throw '驾驶舱公式校验失败' }

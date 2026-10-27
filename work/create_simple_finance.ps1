@@ -147,23 +147,21 @@ $orderItemData = @()
 for ($i = 0; $i -lt 4000; $i++) { $orderItemData += ,@($null,$null,$null,$null,$null,$null,$null,$null,$null,$null,$null,$null,$null,$null,$null,$null) }
 $dashboardData = @()
 $dashboardData += ,@('经营结果','本月自然订单数',$null,'线上自然单与线下订单合计；不含干预单和取消单',$null,'')
-$dashboardData += ,@('经营结果','本月自然商品销售额',$null,'线上商品小计加线下成交收入',$null,'')
-$dashboardData += ,@('经营结果','本月预计结算收入',$null,'线上商家预计收入加线下成交收入，非实际到账',$null,'')
+$dashboardData += ,@('经营结果','本月自然商品销售额',$null,'线上订单实际商品小计加线下成交收入；不是商品目录标价',$null,'')
+$dashboardData += ,@('经营结果','本月预计结算收入',$null,'线上商家预计收入加线下成交收入；取消单排除，已确认退款按退款后金额',$null,'')
 $dashboardData += ,@('经营结果','本月商品成本',$null,'线上与线下订单货物成本合计',$null,'')
 $dashboardData += ,@('经营结果','本月经营毛利',$null,'线上与线下收入-商品成本-配送费',$null,'')
-$dashboardData += ,@('经营结果','本月经营利润',$null,'经营毛利-其他经营费用-老板人工',$null,'')
-$dashboardData += ,@('经营结果','本月经济利润',$null,'经营利润-市场租金机会成本',$null,'')
-$dashboardData += ,@('现金与库存','本月实际到账',$null,'月底在月度结算补当月这一行',$null,'')
+$dashboardData += ,@('经营结果','本月经营利润',$null,'经营毛利-其他经营费用；不再扣老板人工、摊销折旧和市场租金机会成本',$null,'')
 $dashboardData += ,@('现金与库存','本月补货付款',$null,'来自补货记录付款金额',$null,'')
-$dashboardData += ,@('现金与库存','本月现金净流入',$null,'实际到账-补货付款-其他现金支出-老板取款',$null,'')
+$dashboardData += ,@('现金与库存','本月现金净流入',$null,'平台与线下到账-补货付款-其他现金支出-老板取款',$null,'')
 $dashboardData += ,@('现金与库存','本月期末现金',$null,'期初现金+本月现金净流入',$null,'')
-$dashboardData += ,@('现金与库存','当前库存货值',$null,'按货号汇总库存×已确认单位成本',$null,'')
-$dashboardData += ,@('库存提醒','待恢复库存SKU数',$null,'干预订单造成的系统库存扣减，需人工恢复',$null,'')
+$dashboardData += ,@('现金与库存','当前库存货值',$null,'（美团库存+待恢复库存数量）×SKU成本主表当前移动平均成本',$null,'')
 $dashboardData += ,@('库存提醒','当前缺货SKU数',$null,'仅监控售卖中商品',$null,'')
 $dashboardData += ,@('库存提醒','当前低库存SKU数',$null,'售卖中且库存不高于补货阈值',$null,'')
 $dashboardData += ,@('数据质量','待核对数据数',$null,'缺货号、缺成本、重复货号及订单成本异常',$null,'')
 $dashboardData += ,@('系统状态','最近库存快照日期',$null,'RPA最近一次读取日期',$null,'')
 $dashboardData += ,@('系统状态','最近订单同步日期',$null,'RPA最近一次读取日期',$null,'')
+for ($dashboardPadding = $dashboardData.Count; $dashboardPadding -lt 18; $dashboardPadding++) { $dashboardData += ,@('','',$null,'',$null,'') }
 $settlementData = @()
 $settlementStartMonth = [datetime]::Parse('2026-08-01')
 for ($monthOffset = 0; $monthOffset -lt 24; $monthOffset++) {
@@ -187,9 +185,9 @@ $styles = @{ styles = @(
         @{range='A2:F19';background_color='#F4F7F5'};
         @{range='C2:C19';background_color='#E3F0E8';font_weight='bold'};
         @{range='C2:C2';number_format='0'};
-        @{range='C3:C13';number_format='#,##0.00'};
-        @{range='C14:C17';number_format='0'};
-        @{range='C18:C19';number_format='yyyy-mm-dd hh:mm'};
+        @{range='C3:C11';number_format='#,##0.00'};
+        @{range='C12:C14';number_format='0'};
+        @{range='C15:C16';number_format='yyyy-mm-dd hh:mm'};
         @{range='E2:E19';background_color='#FFF8E1'}
     ); row_sizes=@(@{range='1';type='pixel';size=40}); col_sizes=@(@{range='A';type='pixel';size=120},@{range='B';type='pixel';size=180},@{range='C';type='pixel';size=120},@{range='D';type='pixel';size=260},@{range='E';type='pixel';size=120},@{range='F';type='pixel';size=240})};
     @{name='干预订单'; cell_styles=@(@{range='A1:M1';background_color='#7A2E2E';font_color='#FFFFFF';font_weight='bold';horizontal_alignment='center'};@{range='A2:M1001';background_color='#FFF8E1'};@{range='A2:A1001';number_format='yyyy-mm-dd'};@{range='E2:I1001';number_format='#,##0.00'}); col_sizes=@(@{range='A';type='pixel';size=110},@{range='B:C';type='pixel';size=120},@{range='D';type='pixel';size=210},@{range='E:I';type='pixel';size=120},@{range='J:K';type='pixel';size=130},@{range='L';type='pixel';size=220},@{range='M';type='pixel';size=260})};
@@ -251,9 +249,9 @@ Set-FormulaColumn '订单商品' 'L' 4001 '=IF(F{r}="","",IFERROR(IF(VLOOKUP(F{r
 Set-FormulaColumn '订单商品' 'M' 4001 '=IF(F{r}="","",IF(E{r}="干预",0,IF(L{r}="","",IFERROR(I{r}*1,0)*IFERROR(L{r}*1,0))))'
 Set-FormulaColumn '订单商品' 'N' 4001 '=IF(F{r}="","",IF(M{r}="","",K{r}-M{r}))'
 Set-FormulaColumn '订单商品' 'P' 4001 '=IF(C{r}="","",IF(E{r}<>"干预","",IF(COUNTIFS(''干预订单''!$D$2:$D$1001,C{r},''干预订单''!$J$2:$J$1001,"已恢复")>0,"已恢复","待恢复")))'
-Set-FormulaColumn '库存快照' 'H' 2000 '=IF(B{r}="","",IFERROR(IF(VLOOKUP(B{r},''商品成本''!$A$2:$E$2000,5,FALSE)="待人工核对","",VLOOKUP(B{r},''商品成本''!$A$2:$D$2000,4,FALSE)),IFERROR(IF(VLOOKUP(G{r},''商品成本''!$A$2:$E$2000,5,FALSE)="待人工核对","",VLOOKUP(G{r},''商品成本''!$A$2:$D$2000,4,FALSE)),"")))'
-Set-FormulaColumn '库存快照' 'I' 2000 '=IF(OR(B{r}="",D{r}="",H{r}=""),"",D{r}*H{r})'
-Set-FormulaColumn '库存快照' 'K' 2000 '=IF(C{r}="","",IF(B{r}="","缺少货号",IF(H{r}="",IF(OR(IFERROR(VLOOKUP(B{r},''商品成本''!$A$2:$E$2000,5,FALSE),"")="待人工核对",IFERROR(VLOOKUP(G{r},''商品成本''!$A$2:$E$2000,5,FALSE),"")="待人工核对"),"成本待核对","缺少成本"),IF(ISNUMBER(SEARCH("重复货号",L{r})),"重复货号待核对",IF(F{r}<>"售卖中","不监控",IF(D{r}<=0,"缺货",IF(D{r}<=J{r},"低库存","正常")))))))'
+Set-FormulaColumn '库存快照' 'H' 2000 '=IF(B{r}="","",IFERROR(IF(ISBLANK(INDEX(''SKU成本主表''!$G$2:$G$3000,MATCH(N{r},''SKU成本主表''!$Q$2:$Q$3000,0))),"",INDEX(''SKU成本主表''!$G$2:$G$3000,MATCH(N{r},''SKU成本主表''!$Q$2:$Q$3000,0))),IFERROR(IF(ISBLANK(INDEX(''SKU成本主表''!$G$2:$G$3000,MATCH(B{r},''SKU成本主表''!$A$2:$A$3000,0))),"",INDEX(''SKU成本主表''!$G$2:$G$3000,MATCH(B{r},''SKU成本主表''!$A$2:$A$3000,0))),IFERROR(IF(ISBLANK(INDEX(''SKU成本主表''!$G$2:$G$3000,MATCH(G{r},''SKU成本主表''!$B$2:$B$3000,0))),"",INDEX(''SKU成本主表''!$G$2:$G$3000,MATCH(G{r},''SKU成本主表''!$B$2:$B$3000,0))),""))))'
+Set-FormulaColumn '库存快照' 'I' 2000 '=IF(OR(B{r}="",D{r}="",H{r}=""),"",(D{r}+IFERROR(M{r}*1,0))*H{r})'
+Set-FormulaColumn '库存快照' 'K' 2000 '=IF(C{r}="","",IF(B{r}="","缺少货号",IF(H{r}="","成本待核对",IF(ISNUMBER(SEARCH("重复货号",L{r})),"重复货号待核对",IF(F{r}<>"售卖中","不监控",IF(D{r}<=0,"缺货",IF(D{r}<=J{r},"低库存","正常")))))))'
 Set-FormulaColumn '库存快照' 'M' 2000 '=IF(B{r}="","",SUMIFS(''订单商品''!$I$2:$I$4001,''订单商品''!$E$2:$E$4001,"干预",''订单商品''!$D$2:$D$4001,"<>已取消",''订单商品''!$F$2:$F$4001,B{r},''订单商品''!$P$2:$P$4001,"待恢复")+IF(OR(G{r}="",G{r}=B{r}),0,SUMIFS(''订单商品''!$I$2:$I$4001,''订单商品''!$E$2:$E$4001,"干预",''订单商品''!$D$2:$D$4001,"<>已取消",''订单商品''!$F$2:$F$4001,G{r},''订单商品''!$P$2:$P$4001,"待恢复")))'
 
 $currentMonth = 'DATE(YEAR(TODAY()),MONTH(TODAY()),1)'
@@ -264,19 +262,19 @@ $dashboardFormulas = @(
     '=SUMIFS(''订单汇总''!$H$2:$H$2001,''订单汇总''!$A$2:$A$2001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''订单汇总''!$A$2:$A$2001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''订单汇总''!$E$2:$E$2001,"自然",''订单汇总''!$D$2:$D$2001,"<>已取消")+SUMIFS(''线下订单''!$D$2:$D$1001,''线下订单''!$A$2:$A$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''线下订单''!$A$2:$A$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))',
     '=SUMIFS(''订单汇总''!$K$2:$K$2001,''订单汇总''!$A$2:$A$2001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''订单汇总''!$A$2:$A$2001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''订单汇总''!$E$2:$E$2001,"自然",''订单汇总''!$D$2:$D$2001,"<>已取消")+SUMIFS(''线下订单''!$F$2:$F$1001,''线下订单''!$A$2:$A$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''线下订单''!$A$2:$A$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))',
     '=SUMIFS(''订单汇总''!$L$2:$L$2001,''订单汇总''!$A$2:$A$2001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''订单汇总''!$A$2:$A$2001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''订单汇总''!$E$2:$E$2001,"自然",''订单汇总''!$D$2:$D$2001,"<>已取消")+SUMIFS(''线下订单''!$D$2:$D$1001,''线下订单''!$A$2:$A$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''线下订单''!$A$2:$A$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))-SUMIFS(''线下订单''!$F$2:$F$1001,''线下订单''!$A$2:$A$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''线下订单''!$A$2:$A$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))-SUMIFS(''线下订单''!$E$2:$E$1001,''线下订单''!$A$2:$A$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''线下订单''!$A$2:$A$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))',
-    '=C6-SUMIFS(''月度结算''!$G$2:$G$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))-SUMIFS(''月度结算''!$I$2:$I$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))-SUMIFS(''月度结算''!$M$2:$M$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))',
-    '=C7-SUMIFS(''月度结算''!$J$2:$J$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))',
-    '=SUMIFS(''月度结算''!$B$2:$B$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))+SUMIFS(''月度结算''!$C$2:$C$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))+SUMIFS(''月度结算''!$D$2:$D$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))+SUMIFS(''月度结算''!$E$2:$E$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))',
-    '=SUMIFS(''补货记录''!$G$2:$G$1001,''补货记录''!$F$2:$F$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''补货记录''!$F$2:$F$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))+SUMIFS(''补货记录''!$G$2:$G$1001,''补货记录''!$F$2:$F$1001,"",''补货记录''!$A$2:$A$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''补货记录''!$A$2:$A$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))',
-    '=C9-C10-SUMIFS(''月度结算''!$F$2:$F$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))-SUMIFS(''月度结算''!$H$2:$H$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))',
-    '=C11+SUMIFS(''月度结算''!$K$2:$K$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))',
+    '=C6-SUMIFS(''月度结算''!$G$2:$G$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))',
+    '=SUMIFS(''补货记录''!$M$2:$M$1001,''补货记录''!$L$2:$L$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''补货记录''!$L$2:$L$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))',
+    '=SUMIFS(''月度结算''!$B$2:$B$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))+SUMIFS(''月度结算''!$C$2:$C$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))+SUMIFS(''月度结算''!$D$2:$D$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))+SUMIFS(''月度结算''!$E$2:$E$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))-C8-SUMIFS(''月度结算''!$F$2:$F$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))-SUMIFS(''月度结算''!$H$2:$H$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))',
+    '=C9+SUMIFS(''月度结算''!$K$2:$K$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))',
     '=SUMIFS(''库存快照''!$I$2:$I$2000,''库存快照''!$A$2:$A$2000,MAX(''库存快照''!$A$2:$A$2000))',
-    '=COUNTIFS(''库存快照''!$A$2:$A$2000,MAX(''库存快照''!$A$2:$A$2000),''库存快照''!$M$2:$M$2000,">0")',
     '=COUNTIFS(''库存快照''!$A$2:$A$2000,MAX(''库存快照''!$A$2:$A$2000),''库存快照''!$K$2:$K$2000,"缺货")',
     '=COUNTIFS(''库存快照''!$A$2:$A$2000,MAX(''库存快照''!$A$2:$A$2000),''库存快照''!$K$2:$K$2000,"低库存")',
     '=COUNTIFS(''库存快照''!$A$2:$A$2000,MAX(''库存快照''!$A$2:$A$2000),''库存快照''!$K$2:$K$2000,"*核对")+COUNTIFS(''库存快照''!$A$2:$A$2000,MAX(''库存快照''!$A$2:$A$2000),''库存快照''!$K$2:$K$2000,"缺少*")+COUNTIFS(''订单商品''!$A$2:$A$4001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''订单商品''!$A$2:$A$4001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''订单商品''!$C$2:$C$4001,"<>",''订单商品''!$L$2:$L$4001,"")',
     '=IF(COUNTA(''库存快照''!$A$2:$A$2000)=0,"",MAX(''库存快照''!$A$2:$A$2000))',
-    '=IF(COUNTA(''订单汇总''!$O$2:$O$2001)=0,"",MAX(''订单汇总''!$O$2:$O$2001))'
+    '=IF(COUNTA(''订单汇总''!$O$2:$O$2001)=0,"",MAX(''订单汇总''!$O$2:$O$2001))',
+    '=""',
+    '=""',
+    '=""'
 )
 $dashboardCells = @()
 for ($i = 0; $i -lt $dashboardFormulas.Count; $i++) { $dashboardCells += ,@(@{formula=$dashboardFormulas[$i]}) }
@@ -286,9 +284,9 @@ $verifyTargets = @(
     @{Sheet='干预订单';Range='I2:I1001'},
     @{Sheet='驾驶舱';Range='C2:C19'},
     @{Sheet='补货记录';Range='D2:D1001'},
-    @{Sheet='订单汇总';Range='E2:E2001,K2:L2001'},
-    @{Sheet='订单商品';Range='E2:E4001,K2:N4001,P2:P4001'},
-    @{Sheet='库存快照';Range='H2:I2000,K2:K2000,M2:M2000'},
+    @{Sheet='订单汇总';Range='E2:L2001'},
+    @{Sheet='订单商品';Range='E2:P4001'},
+    @{Sheet='库存快照';Range='H2:M2000'},
     @{Sheet='商品成本';Range='D2:E2000'}
 )
 foreach ($target in $verifyTargets) {

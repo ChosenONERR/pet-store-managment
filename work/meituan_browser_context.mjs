@@ -183,9 +183,21 @@ async function useExistingBoundMerchantPage(pages, targetUrl, storeMarker, timeo
 
 async function openInBoundContext(binding, resolved, targetUrl, storeMarker, timeoutMs) {
   let target = resolved.probeTarget;
-  if (!target) target = await openProfileProbe(binding.profile_directory, timeoutMs);
+  if (!target) {
+    const opened = await proxy(`/new?url=${encodeURIComponent(targetUrl)}`);
+    target = await waitForTarget(
+      (item) => item.type === 'page' && item.targetId === opened.targetId,
+      Math.min(timeoutMs, 15000),
+    );
+    if (!target || target.browserContextId !== resolved.browserContextId) {
+      await closeTarget(opened?.targetId);
+      throw new Error(`MEITUAN_BOUND_PROFILE_UNAVAILABLE: 无法在已绑定的 Chrome 资料 ${binding.profile_directory} 中打开店铺页`);
+    }
+  }
   try {
-    await proxy(`/navigate?target=${encodeURIComponent(target.targetId)}&url=${encodeURIComponent(targetUrl)}`);
+    if (target.url !== targetUrl) {
+      await proxy(`/navigate?target=${encodeURIComponent(target.targetId)}&url=${encodeURIComponent(targetUrl)}`);
+    }
     const identity = await waitForMerchantIdentity(target.targetId, storeMarker, timeoutMs);
     if (identity?.loginPage) {
       throw new Error('MEITUAN_AUTH_REQUIRED: 已绑定的 Chrome 资料中，美团商家后台登录态已失效；请只在该资料中重新登录');
