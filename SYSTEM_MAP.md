@@ -60,7 +60,7 @@ Windows 计划任务
 | 赠品与干预单 | `agent/reconcile_pending_gifts.ps1`、`agent/intervention_record.ps1` | 写赠品、干预订单 | 赠品成本计入订单成本；缺成本保持待确认 |
 | 经营数据查询 | `agent/query_business_data.ps1` | 只读飞书 | 供 Codex 回答经营、库存和待确认问题，禁止写入；SKU 查询返回绑定“主表行号＋美团商品ID”的内部 `action_code`，货号重复时必须用它安全定位，禁止裸商品ID或重复KW猜行 |
 | 定时任务 | `agent/configure_petstar_scheduled_tasks.ps1` | 修改 Windows 计划任务（仅 `-Apply`） | 默认只预览；新电脑必须显式安装 |
-| 运行守护 | `agent/ensure_lark_event_bridge.ps1`、`agent/run_hidden_watchdog.vbs` | 管理本地进程 | 保持消息桥常驻并隐藏黑色窗口 |
+| 运行守护 | `agent/ensure_lark_event_bridge.ps1`、`agent/run_hidden_watchdog.vbs` | 管理本地进程；只读检查当前 Chrome/CDP 实例 | 每 5 分钟保持消息桥常驻、修复失联 CDP 代理；新 Chrome 实例只主动触发一次 Allow，授权恢复后自动补跑一次整点同步（夜间失败则补跑夜间恢复）；全程隐藏黑色窗口，不修改美团数据 |
 | 美团在售 KW 折扣价导出 | `work/meituan_inventory_export.mjs`、`work/inspect_meituan_product_export_fields.mjs` | 美团商品页只读；本地生成 Excel | 导出时设置 `MEITUAN_EXPORT_EXTRA_FIELDS=price,discount_price_view`；折扣价为空才回退原价；多规格分行；非 KW 进入核对清单 |
 
 ### 商品折扣价导出规则
@@ -78,12 +78,12 @@ Windows 计划任务
 |---|---|
 | `agent/AGENTS.md` | `agent/` 子目录的补充维护约束 |
 | `agent/check_environment.ps1` | 新电脑或故障时只读检查依赖、路径和配置 |
-| `agent/check_meituan_browser.mjs` | 有界检查绑定 Chrome、美团登录态和店铺页面；每个新 Chrome 实例未授权时主动连接并触发一次 Allow 提醒，同一实例后续整点不重复弹窗 |
+| `agent/check_meituan_browser.mjs` | 有界检查当前 Chrome 实例与 CDP 代理；以 `DevToolsActivePort` 实例指纹和代理真实连接端口为准，不采信会跨重启残留的全局 Allow 标记；每个新实例未授权时主动连接并只触发一次 Allow；状态仅记录在 `agent/state/cdp_authorization_prompt.json`，不保存 Cookie/令牌；`--watchdog` 供五分钟看门狗短探测，`--mark-catch-up-started`/`--mark-sync-success` 只维护补跑幂等状态 |
 | `agent/codex_chat_bridge.py` | 调用 Codex 理解飞书消息、查询数据并输出结构化动作；补货未明确赊账/未付款时默认当天全额付款；遇到 429 时持久化全局冷却状态并返回可重试结果，成功调用后自动清除冷却；故障恢复可按原飞书消息ID精准失效旧解释缓存，不清空其他消息 |
 | `agent/codex_response_schema.json` | Codex 动作协议的 JSON Schema |
 | `agent/configure_hidden_gateway_startup.ps1` | 预览/配置 Hermes Gateway 隐藏启动 |
 | `agent/configure_petstar_scheduled_tasks.ps1` | 预览/安装宠速星 Windows 计划任务 |
-| `agent/ensure_lark_event_bridge.ps1` | 看门狗、重放、修复孤儿事件消费者 |
+| `agent/ensure_lark_event_bridge.ps1` | 五分钟看门狗、消息重放、修复孤儿事件消费者，并提前检查 Chrome/CDP；代理死亡时后台重启，当前实例完成 Allow 后自动启动一次隐藏补跑；已有同步运行时不重复启动 |
 | `agent/finance_transaction.ps1` | 财务写入互斥、before-image、提交与回滚 |
 | `agent/hermes_chat_bridge.py` | 旧 Hermes 对话入口兼容层；新链路优先使用 Codex bridge |
 | `agent/intervention_record.ps1` | 读取、匹配和维护干预订单记录 |
@@ -102,7 +102,7 @@ Windows 计划任务
 | `agent/run_hidden_watchdog.vbs` | 无窗口运行消息桥看门狗 |
 | `agent/run_scheduled_job.ps1` | 计划任务统一入口；启动子任务前清除 Hermes/OpenClaw/Lark Channel 工作区路由标记，并固定使用当前 Windows 用户的 `~/.lark-cli` 授权目录，避免后台误读隔离工作区凭据；不复制或保存 OAuth token |
 | `agent/authorize_lark_desktop.ps1` | 从普通 Windows 桌面/计划任务上下文发起一次飞书设备授权，并在同一上下文完成轮询和验证；仅在系统误把授权写入隔离注册表时人工运行，临时请求文件只含短期授权链接和 device code，不记录 token，禁止作为常驻任务 |
-| `agent/run_sync_and_notify.ps1` | 分阶段同步、事务、审计和飞书通知主编排；每小时轻量同步，00:00 复核补单/近期退款并仅刷新受影响月份；平台退款处理中或识别不清时发送按状态去重的飞书提醒并继续追踪，不触发无关重算；飞书凭证只读探针成功后再读取 SKU 表头，表头读取受统一重试、运行记录和失败通知保护，电脑离线后重新开机可在后续计划任务自动恢复；适配 Lark CLI 1.0.98，将逗号分隔的公式范围逐个按连续区域校验；成本快照子脚本失败时保留具体错误详情；安全诊断只记录 Windows Lark 凭据注册表是否存在及条目数，不读取或输出 token 内容 |
+| `agent/run_sync_and_notify.ps1` | 分阶段同步、事务、审计和飞书通知主编排；每小时轻量同步，00:00 复核补单/近期退款并仅刷新受影响月份；平台退款处理中或识别不清时发送按状态去重的飞书提醒并继续追踪，不触发无关重算；Chrome 新实例未 Allow 时明确提示“实例授权”而非笼统代理故障，成功同步后清除待补跑标记；飞书凭证只读探针成功后再读取 SKU 表头，表头读取受统一重试、运行记录和失败通知保护，电脑离线后重新开机可在后续计划任务自动恢复；适配 Lark CLI 1.0.98，将逗号分隔的公式范围逐个按连续区域校验；成本快照子脚本失败时保留具体错误详情；安全诊断只记录 Windows Lark 凭据注册表是否存在及条目数，不读取或输出 token 内容 |
 | `agent/run_weekly_maintenance.ps1` | 每周全历史只读审计；仅审计失败时触发原子化全量重建；不可作为普通同步入口 |
 | `agent/runtime_paths.ps1` | 解析 Python、PowerShell、Lark CLI 等本机路径 |
 | `agent/sku_master_schema.ps1` | SKU 主表字段、规范化和安全访问函数 |
@@ -126,6 +126,7 @@ Windows 计划任务
 | `work/meituan_inventory_export.mjs` | 创建并下载美团商品/库存只读导出；支持附加字段 |
 | `work/meituan_order_extract.mjs` | 从美团商家页只读提取订单、商品和退款信息；同时兼容普通退款 `refundInfoList` 与美团取退 `refundGoodsInfoList`；整单退货缺少独立金额时以订单顾客实付作为退款额并保留全量退货商品；退款记录保留处理中/已完成/已关闭/无法识别状态，不再过滤掉未完成售后；共享标签页无论停在哪一页，抓取前都会重置到第 1 页 |
 | `work/test_meituan_refund_extraction.mjs` | 本地只读验证美团退款状态分类，覆盖申请中、成功、关闭、否定完成和未知文案 |
+| `work/test_meituan_browser_recovery.mjs` | 使用临时目录和本地模拟端口验证 Chrome 新实例授权恢复：即使全局 Allow 标记残留，未真实连接的实例仍须判定待授权；真实连接后保留一次待补跑并可幂等领取。测试不访问美团、不写经营数据，临时文件结束即清理 |
 | `work/meituan_promotion_extract.mjs` | 从美团推广页只读提取消费 |
 | `work/reconcile_manual_delivery_fees.ps1` | 原子迁移/核对人工配送费权威来源 |
 | `work/repair_dashboard_offline_formulas.ps1` | 修复驾驶舱线下订单口径并与简账核对 |

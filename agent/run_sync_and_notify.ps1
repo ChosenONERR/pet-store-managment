@@ -1065,7 +1065,7 @@ function Limit-Text([string]$Value, [int]$Length) {
 }
 
 function Get-FailureGuidance([string]$Reason) {
-    if ($Reason -match 'MEITUAN_CDP_AUTH_REQUIRED') { return 'Chrome 重启后会生成新的浏览器实例，旧实例的 Allow 不会继承。系统已为当前实例主动触发一次 Allow 提醒；若当时未允许，后续整点不会重复弹窗。请打开 chrome://inspect/#remote-debugging，勾选“Allow remote debugging for this browser instance”，下一次计划任务会自动恢复。' }
+    if ($Reason -match 'MEITUAN_CDP_AUTH_REQUIRED') { return '这是新的 Chrome 实例尚未完成 Allow，不是美团登录失效。系统已主动发起一次连接；请点击 Allow，或打开 chrome://inspect/#remote-debugging 允许当前实例。完成后看门狗会在 5 分钟内自动重连并补跑，不需要等下一整点。' }
     if ($Reason -match 'MEITUAN_STORE_CONTEXT_REQUIRED|MEITUAN_BOUND_PROFILE_UNAVAILABLE|MEITUAN_STORE_IDENTITY_UNVERIFIED') { return '系统只使用已绑定的 Chrome 资料“人员 1”。请打开该资料并确认进入“宠速星宠物用品店”后台；系统不会检查其他 Chrome 账户。' }
     if ($Reason -match 'CDP|remote debugging|远程调试') { return '请保持 Chrome 打开，并确认 chrome://inspect/#remote-debugging 中已允许远程调试。' }
     if ($Reason -match '登录|login|扫码') { return '请在 Chrome 中重新登录美团商家后台；登录后系统会在下一次计划任务自动重试。' }
@@ -1693,6 +1693,9 @@ try {
     }
     $safeResult = Convert-ToSafeState $result
     Save-RunState $safeResult
+    if (-not $SkipSync) {
+        try { $null = & node $webAccessCheck --mark-sync-success 2>$null } catch {}
+    }
     try { $syncMutex.ReleaseMutex() } catch {}
     $syncMutex.Dispose()
     $safeResult | ConvertTo-Json -Depth 12

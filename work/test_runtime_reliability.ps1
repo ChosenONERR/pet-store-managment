@@ -226,7 +226,9 @@ $contracts = [ordered]@{
     scheduled_sync_yields_to_confirmed_writes = ($bridge -match 'interactive_priority\.json' -and $scheduledSync -match '人工确认写账优先，定时同步已让路')
     scheduled_sync_does_not_lock_before_chrome_check = ($scheduledSync.IndexOf("Invoke-WithRetry 'chrome_cdp'") -lt $scheduledSync.IndexOf('Start-SyncFinanceTransaction', $scheduledSync.IndexOf("Invoke-WithRetry 'chrome_cdp'")))
     chrome_preflight_is_bounded_and_nonretryable = ($browserPreflight -match 'waitForProxyTargets' -and $browserPreflight -match '45000' -and $browserPreflight -match 'MEITUAN_CDP_UNAVAILABLE' -and $scheduledSync -match "Invoke-WithRetry 'chrome_cdp'[\s\S]{0,700}\} 1" -and $scheduledSync -match '\$nonRetryable[\s\S]{0,300}MEITUAN_CDP_UNAVAILABLE')
-    chrome_preflight_self_heals_stale_proxy_and_prompts_once = ($browserPreflight -match 'readChromeInstanceFingerprint' -and $browserPreflight -match 'readPromptedFingerprint\(\) === instanceFingerprint' -and $browserPreflight -match 'savePromptedFingerprint\(instanceFingerprint\)' -and $browserPreflight -match 'Repeated /targets calls' -and $browserPreflight -match '后续定时任务只保留飞书提醒' -and $scheduledSync -match "return 'meituan-cdp-auth'" -and $scheduledSync -match "Resolve-FailureNotification 'meituan-cdp-auth'")
+    chrome_preflight_tracks_real_instance_connection = ($browserPreflight -match 'connected_instance_fingerprint' -and $browserPreflight -match 'prompted_instance_fingerprint' -and $browserPreflight -match 'proxyMatchesCurrentInstance' -and $browserPreflight -match 'Local State flag survives a browser restart' -and $browserPreflight -match 'pending_catch_up')
+    chrome_preflight_self_heals_stale_proxy_and_prompts_once = ($browserPreflight -match 'readChromeInstanceFingerprint' -and $browserPreflight -match 'currentInstanceWasPrompted' -and $browserPreflight -match 'waitForProxyTargets' -and $browserPreflight -match '后看门狗会在 5 分钟内自动重连并补跑同步' -and $scheduledSync -match "return 'meituan-cdp-auth'" -and $scheduledSync -match "Resolve-FailureNotification 'meituan-cdp-auth'")
+    watchdog_probes_browser_and_starts_bounded_catch_up = ($watchdog -match 'function Invoke-BrowserRecovery' -and $watchdog -match '--watchdog' -and $watchdog -match 'pending_catch_up' -and $watchdog -match '--mark-catch-up-started' -and $watchdog -match "catchUpJob = 'NightRecovery'" -and $scheduledSync -match '--mark-sync-success')
     runtime_prefers_project_browser_preflight = ($runtimePaths -match 'Join-Path \$PSScriptRoot ''check_meituan_browser\.mjs''')
     manual_delivery_fee_fork_self_heals_to_authoritative_source = ($ledgerSync -match 'function Set-SourceCellMatrix' -and $ledgerSync -match 'auto_reconciled_delivery_fee_count' -and $ledgerSync -match 'Set-SourceCellMatrix ''订单汇总'' "J\$\{sourceRowNumber\}:J\$\{sourceRowNumber\}"' -and $ledgerSync -match '配送费自动归一回读失败' -and $ledgerSync -match '人工确认配送费' -and $ledgerSync -notmatch '请先运行 work\\reconcile_manual_delivery_fees\.ps1' -and $integrityAudit -match 'unmigrated_manual_delivery_fees' -and $integrityAudit -notmatch 'preserved_manual_delivery_fees')
     nightly_intervention_reconciliation_repairs_and_alerts = ($orderSync -match 'intervention_repair_count' -and $orderSync -match '订单汇总中找不到原订单' -and $orderSync -match 'New-NullableNumberCell \$record\.PlatformFee' -and $scheduledSync -match '补单数据自动补救' -and $scheduledSync -match '补单数据待处理' -and $ledgerSync -match '平台扣款尚未识别；未知不等于0元' -and $integrityAudit -match 'intervention_data_errors' -and $integrityAudit -match '-not \$interventionSet\.ContainsKey\(\$orderNo\)')
@@ -261,6 +263,7 @@ $nodeFiles = @(
     (Join-Path $projectRoot 'work\inspect_meituan_product_export_fields.mjs'),
     (Join-Path $projectRoot 'work\meituan_promotion_extract.mjs')
     (Join-Path $projectRoot 'work\meituan_browser_context.mjs')
+    (Join-Path $projectRoot 'work\test_meituan_browser_recovery.mjs')
     (Join-Path $agentRoot 'check_meituan_browser.mjs')
 )
 foreach ($nodeFile in $nodeFiles) {
@@ -269,6 +272,8 @@ foreach ($nodeFile in $nodeFiles) {
 }
 & node (Join-Path $projectRoot 'work\test_meituan_refund_extraction.mjs') | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Meituan refund-state classification test failed' }
+& node (Join-Path $projectRoot 'work\test_meituan_browser_recovery.mjs') | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Meituan browser instance recovery test failed' }
 
 $resolvedWindowsPowerShell = Get-PetstarWindowsPowerShell
 if (-not (Test-Path -LiteralPath $resolvedWindowsPowerShell -PathType Leaf)) { throw 'Windows PowerShell resolver returned a missing file' }

@@ -22,6 +22,9 @@ $nightRecoveryPath = Join-Path $hermesProfileRoot 'scripts\petstar_night_recover
 $healthyNightPath = Join-Path $stateRoot 'last_healthy_night.json'
 $nightRecoveryAttemptPath = Join-Path $stateRoot 'night_recovery_attempt.json'
 $pendingAcknowledgementsPath = Join-Path $stateRoot 'pending_acknowledgements.json'
+$browserCheckPath = Join-Path $ProjectRoot 'agent\check_meituan_browser.mjs'
+$browserRecoveryStatePath = Join-Path $stateRoot 'cdp_authorization_prompt.json'
+$scheduledJobPath = Join-Path $ProjectRoot 'agent\run_scheduled_job.ps1'
 . (Join-Path $ProjectRoot 'agent\runtime_paths.ps1')
 $powershellExe = Get-PetstarWindowsPowerShell
 $codexPython = Get-PetstarPython
@@ -203,6 +206,70 @@ function Get-CodexHealth {
     }
 }
 
+function Invoke-BrowserRecovery {
+    if (-not (Test-Path -LiteralPath $browserCheckPath -PathType Leaf)) { return 'check-missing' }
+    $nodeCommand = Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $nodeCommand) { return 'node-missing' }
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $global:LASTEXITCODE = 0
+        $probeOutput = @(& $nodeCommand.Source $browserCheckPath --watchdog 2>&1 | ForEach-Object { [string]$_ })
+        $probeExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($probeExitCode -ne 0) {
+        $reason = ($probeOutput -join ' ').Trim()
+        if ($reason -match 'MEITUAN_CDP_AUTH_REQUIRED') { return 'authorization-required' }
+        if ($reason -match '请保持当前.+Chrome 开启') { return 'chrome-closed' }
+        Write-WatchdogLog "browser recovery probe failed: $reason"
+        return 'probe-failed'
+    }
+
+    $recoveryState = $null
+    if (Test-Path -LiteralPath $browserRecoveryStatePath -PathType Leaf) {
+        try { $recoveryState = Get-Content -LiteralPath $browserRecoveryStatePath -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
+    }
+    if ($null -eq $recoveryState -or -not [bool]$recoveryState.pending_catch_up) { return 'ready' }
+
+    $catchUpJob = 'Hourly'
+    $lastRunPath = Join-Path $stateRoot 'last_run.json'
+    if (Test-Path -LiteralPath $lastRunPath -PathType Leaf) {
+        try {
+            $lastRun = Get-Content -LiteralPath $lastRunPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if (-not [bool]$lastRun.ok -and [string]$lastRun.error -match 'MEITUAN_CDP_(?:AUTH_REQUIRED|UNAVAILABLE)' -and [string]$lastRun.mode -eq 'night') {
+                $catchUpJob = 'NightRecovery'
+            }
+        } catch {}
+    }
+
+    $syncProcesses = @(Get-CimInstance Win32_Process | Where-Object {
+        $_.CommandLine -and (
+            $_.CommandLine.IndexOf($scheduledJobPath,[StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+            $_.CommandLine -match '(?i)run_sync_and_notify\.ps1'
+        )
+    })
+    if ($syncProcesses.Count -gt 0) { return 'sync-already-running' }
+
+    try {
+        $arguments = @(
+            '-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass',
+            '-File',('"{0}"' -f $scheduledJobPath),'-Job',$catchUpJob,
+            '-ProjectRoot',('"{0}"' -f $ProjectRoot)
+        )
+        $started = Start-Process -FilePath $powershellExe -ArgumentList $arguments -WorkingDirectory $ProjectRoot -WindowStyle Hidden -PassThru
+        $null = & $nodeCommand.Source $browserCheckPath --mark-catch-up-started 2>$null
+        Write-WatchdogLog "browser authorization recovered; catch-up job=$catchUpJob pid=$($started.Id)"
+        return "catch-up-$($catchUpJob.ToLowerInvariant())-started"
+    } catch {
+        Write-WatchdogLog "browser authorization recovered but catch-up could not start: $($_.Exception.Message)"
+        return 'catch-up-start-failed'
+    }
+}
+
+$browserRecoveryAction = Invoke-BrowserRecovery
 $gatewayAction = 'none'
 $gatewayHealth = Get-GatewayHealth
 if (-not $gatewayHealth.healthy) {
@@ -291,6 +358,7 @@ if ($processes.Count -gt 0 -and $null -ne $health -and $health.running) {
         night_catch_up_action = $catchUpAction
         acknowledgement_outbox = $ackOutboxAction
         message_replay = $replayAction
+        browser_recovery_action = $browserRecoveryAction
         checked_at = [datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss')
     } | ConvertTo-Json -Compress
     exit 0
@@ -341,5 +409,6 @@ Write-WatchdogLog "bridge ready process_count=$($processes.Count) user_status=$(
     night_catch_up_action = $catchUpAction
     acknowledgement_outbox = $ackOutboxAction
     message_replay = $replayAction
+    browser_recovery_action = $browserRecoveryAction
     checked_at = [datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss')
 } | ConvertTo-Json -Compress
