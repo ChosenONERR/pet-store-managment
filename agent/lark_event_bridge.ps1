@@ -840,8 +840,16 @@ function Format-CodexExecutionReply($Operations) {
             'SetSkuExpiry' { $lines.Add("$($details.goods_code)：最早到期 $($details.earliest_expiry)") }
             'SetSkuCost' {
                 $oldCostText = if ($null -eq $details.old_baseline_cost -or [string]$details.old_baseline_cost -eq '') { '未填写' } else { "¥$($details.old_baseline_cost)" }
-                $historyText = if ($details.historical_order_no) { "；已按明确要求更新订单 $($details.historical_order_no) 并刷新所属月份" } else { '；未修改历史订单或经营简账' }
-                $lines.Add("SKU成本主表第$($details.row)行：$($details.goods_code) 销售单位成本 $oldCostText → ¥$($details.new_unit_cost)；当前成本现为 ¥$($details.new_moving_average_cost)$historyText")
+                $historyText = if ($details.historical_order_type -eq 'offline' -and $null -ne $details.historical_offline_order) {
+                    "；已按明确要求更新 $($details.historical_offline_order.daily_order_no)（$($details.historical_order_no)）并刷新所属月份"
+                } elseif ($details.historical_order_no) {
+                    "；已按明确要求更新订单 $($details.historical_order_no) 并刷新所属月份"
+                } else { '；未修改历史订单或经营简账' }
+                if ($details.master_cost_changed -eq $false) {
+                    $lines.Add("SKU成本主表第$($details.row)行：$($details.goods_code) 成本保持 ¥$($details.new_unit_cost)，未修改主表$historyText")
+                } else {
+                    $lines.Add("SKU成本主表第$($details.row)行：$($details.goods_code) 销售单位成本 $oldCostText → ¥$($details.new_unit_cost)；当前成本现为 ¥$($details.new_moving_average_cost)$historyText")
+                }
             }
             'SetRefundDisposition' {
                 $dispositionText = switch ([string]$details.new_disposition) { 'returned_restocked' {'已退回并恢复库存，已撤销货物成本'} 'refund_no_return' {'未退货，已保留货物成本'} 'returned_damaged' {'退回报损，已保留货物成本'} default {[string]$details.new_disposition} }
@@ -1304,10 +1312,24 @@ function Format-ConfirmationPreview([string]$ChangeId, $Operations, [string]$Fal
                 $titleText = if ($details.title) { "｜$($details.title)" } else { '' }
                 $oldCostText = if ($null -eq $details.old_baseline_cost -or [string]$details.old_baseline_cost -eq '') { '未填写' } else { "¥$($details.old_baseline_cost)" }
                 $lines.Add("修改：SKU成本主表第$($details.row)行｜$($details.goods_code)$titleText")
-                $lines.Add("成本：$oldCostText → ¥$($details.new_unit_cost)（每个销售单位）")
-                $lines.Add("位置：$($details.range)；只更新SKU成本主表，不会自动重算历史订单。")
+                if ($details.master_cost_changed -eq $false) {
+                    $lines.Add("主表成本保持 ¥$($details.new_unit_cost)（每个销售单位），不修改SKU成本主表。")
+                } else {
+                    $lines.Add("成本：$oldCostText → ¥$($details.new_unit_cost)（每个销售单位）")
+                }
                 if ($details.historical_order_no) {
-                    $lines.Add("明确联动历史订单：$($details.historical_order_no)；只修改该订单中此SKU的成本，并刷新该订单所属月份。")
+                    if ($details.master_cost_changed -ne $false) { $lines.Add("位置：$($details.range)；同时按本次明确要求联动一笔历史订单。") }
+                    if ($details.historical_order_type -eq 'offline' -and $null -ne $details.historical_offline_order) {
+                        $offline = $details.historical_offline_order
+                        $oldOrderCostText = if ($null -eq $offline.old_product_cost -or [string]$offline.old_product_cost -eq '') { '未填写' } else { "¥$($offline.old_product_cost)" }
+                        $oldProfitText = if ($null -eq $offline.old_profit -or [string]$offline.old_profit -eq '') { '未填写' } else { "¥$($offline.old_profit)" }
+                        $lines.Add("明确联动：$($offline.date) $($offline.daily_order_no)｜$($details.historical_order_no)｜$($offline.sold_goods)")
+                        $lines.Add("货物成本：$oldOrderCostText → ¥$($offline.new_product_cost)；利润：$oldProfitText → ¥$($offline.new_profit)；收入和配送费不变。")
+                    } else {
+                        $lines.Add("明确联动历史订单：$($details.historical_order_no)；只修改该订单中此SKU的成本，并刷新该订单所属月份。")
+                    }
+                } else {
+                    $lines.Add("位置：$($details.range)；只更新SKU成本主表，不会自动重算历史订单。")
                 }
                 foreach ($sheet in @($details.affected_tables)) { if ($sheet) { $null = $impacts.Add([string]$sheet) } }
             }

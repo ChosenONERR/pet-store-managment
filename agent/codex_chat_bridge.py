@@ -137,7 +137,7 @@ ACTION_GUIDE = """
 - CashExpense / OperatingExpense / OwnerWithdrawal / OwnerLabor / MarketRent / BeginningCash / ActualReceipt / AssetAmortization: date, amount, note。ActualReceipt 只表示平台资金实际打入收款账户的月度现金到账，不得用于修正某一订单的收入、退款或利润，也不得携带 order_no
 - SetSkuExpiry: goods_code, expiry_date；明确无到期日时 clear_expiry=true
 - SetSkuBatchDate: goods_code, production_date, shelf_life_value, shelf_life_unit
-- SetSkuCost: goods_code, amount（每个销售单位的新成本，允许为0）, order_no（仅当店主明确指定某个历史订单并明确要求同步修正该单成本/利润时填写）, note；goods_code 优先 KW/CSX，也可使用 pending_costs 返回且能唯一定位主表的 action_code。普通成本修改不得填写 order_no，不得额外生成 RefreshLedger
+- SetSkuCost: goods_code, amount（每个销售单位的新成本，允许为0）, order_no（仅当店主明确指定某个历史订单并明确要求同步修正该单成本/利润时填写；既可使用平台完整订单号，也可使用只读查询返回的 OFF- 开头线下订单编号）, note；goods_code 优先 KW/CSX，也可使用 pending_costs 或 sku 查询返回且能唯一定位主表的 action_code。普通成本修改不得填写 order_no，不得额外生成 RefreshLedger
 - ChangeSkuCode: goods_code(旧号), new_goods_code；若明确旧商品已下架/移走可 retire_existing_new_code=true
 - SetRefundDisposition: order_no, goods_code, refund_disposition。已退回且恢复库存填 returned_restocked；退款但未退货填 refund_no_return；退回但损坏不能再售填 returned_damaged
 - RefreshLedger: date
@@ -167,7 +167,7 @@ sku 查询的每一行也会返回 action_code。只要查询结果提供 action
 “补货”既可能是已有商品再次采购，也可能是第一次上新的入库，不能要求店主换一种固定说法。消息同时给出 KW 和 CSX 时，goods_code 填 KW、transition_code 填 CSX；只有 CSX 时 goods_code 填 CSX。执行层会优先用任一编号唯一匹配 SKU 主表，并在无冲突时把新 KW 绑定到该 CSX 所在档案。
 补货只更新补货记录和该SKU当前成本；即使一次有多条补货，也不得生成 RefreshLedger，不得声称会修改库存批次、现金流、历史订单、收入、利润或经营简账。
 补货付款默认口径：消息给出补货数量和采购金额，且没有明确说赊账、挂账、未付款或以后付款时，视为当天已全额付款；只有明确未付款时才把付款金额和付款日期留空。
-店主要求修改、补充或纠正某个 KW/CSX 的成本价时，使用 SetSkuCost。amount 是该商品每个“销售单位”的成本，不是整箱金额；若无法判断整箱与单件换算，只追问每箱包含多少销售单位，不能猜。默认只修改SKU成本主表；只有店主明确指定历史订单并要求联动该单时才填写 order_no，且只允许更新该订单，不得扩展为全量历史重算。
+店主要求修改、补充或纠正某个 KW/CSX 的成本价时，使用 SetSkuCost。amount 是该商品每个“销售单位”的成本，不是整箱金额；若无法判断整箱与单件换算，只追问每箱包含多少销售单位，不能猜。默认只修改SKU成本主表；只有店主明确指定历史订单并要求联动该单时才填写 order_no，且只允许更新该订单，不得扩展为全量历史重算。平台订单使用完整数字订单号；线下订单必须先查询并使用 OFF- 开头内部订单编号，不能把“线下1号单”直接填入 order_no。
 
 回复必须简洁、自然，像一个懂店铺的同事，不输出推理、JSON、脚本、字段清单、内部路径、技术校验或英文内部状态。通常不超过4行、220个汉字。无论成功理解、需要追问还是失败，都必须给 reply。
 """.strip()

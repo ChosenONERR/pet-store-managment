@@ -199,6 +199,9 @@ function Invoke-PetstarCodex([string]$Text, [string]$MessageId, [string]$Mode = 
     } elseif ($Text -match 'kw1048.*生产日期') {
         $actions = @(New-TestCodexAction 'SetSkuBatchDate' @{goods_code='kw1048';production_date='2026-08-13';shelf_life_value=12;shelf_life_unit='月'})
         $reply = '📝 待确认：更新 kw1048 批次日期。'
+    } elseif ($Text -match '线下历史订单成本修正') {
+        $actions = @(New-TestCodexAction 'SetSkuCost' @{goods_code='sku_ref:199:51185331395';amount=0.17;order_no='OFF-20261026-F7A77684';note='主表成本保持0.17，只联动指定线下订单'})
+        $reply = '📝 待确认：主表成本保持0.17，只联动指定线下订单。'
     } elseif ($Text -match '历史订单成本修正') {
         $actions = @(New-TestCodexAction 'SetSkuCost' @{goods_code='kw1109';amount=0;order_no='888888888888888888';note='明确修正指定历史订单成本'})
         $reply = '📝 待确认：修改 kw1109 成本，并只联动指定历史订单。'
@@ -234,7 +237,13 @@ function Invoke-PetstarEvent([string[]]$Arguments) {
         'ChangeSkuCode' { [pscustomobject]@{status='ready';old_code=$map.goods_code;new_code=$map.new_goods_code} }
         'SetOrderDeliveryFee' { [pscustomobject]@{order_no=$map.order_no;order_type='自然单';date='2026-09-12';daily_order_no='美团2号单';old_delivery_fee=0;delivery_fee=$amount} }
         'SetSkuBatchDate' { [pscustomobject]@{goods_code=$map.goods_code;production_date=$map.production_date;shelf_life="$($map.shelf_life_value)$($map.shelf_life_unit)";expiry_date='2027-08-13'} }
-        'SetSkuCost' { [pscustomobject]@{sheet='SKU成本主表';row=19;range='F19:G19,K19,M19:O19';goods_code=$map.goods_code;title='测试试吃装';old_baseline_cost=3.5;old_moving_average_cost=3.5;new_unit_cost=[double]$map.amount;new_moving_average_cost=[double]$map.amount;old_status='待人工核对';new_status='用户确认';historical_order_no=$map.order_no;affected_tables=$(if($map.order_no){@('SKU成本主表','指定订单的订单商品','订单汇总','9月收入','驾驶舱')}else{@('SKU成本主表')})} }
+        'SetSkuCost' {
+            if ([string]$map.order_no -like 'OFF-*') {
+                [pscustomobject]@{sheet='SKU成本主表';row=199;range='F199:G199,K199,M199:O199';goods_code='kw2099';title='随机口味一支';old_baseline_cost=0.17;old_moving_average_cost=0.17;new_unit_cost=[double]$map.amount;new_moving_average_cost=[double]$map.amount;old_status='当前KW冲突待核对';new_status='当前KW冲突待核对';master_cost_changed=$false;historical_order_no=$map.order_no;historical_order_type='offline';historical_order_items=@();historical_offline_order=[pscustomobject]@{date='2026-10-26';daily_order_no='线下1号单';sold_goods='kw2099×10';old_product_cost=$null;new_product_cost=1.7;old_profit=$null;new_profit=6.3};affected_tables=@('线下订单','10月收入','驾驶舱')}
+            } else {
+                [pscustomobject]@{sheet='SKU成本主表';row=19;range='F19:G19,K19,M19:O19';goods_code=$map.goods_code;title='测试试吃装';old_baseline_cost=3.5;old_moving_average_cost=3.5;new_unit_cost=[double]$map.amount;new_moving_average_cost=[double]$map.amount;old_status='待人工核对';new_status='用户确认';historical_order_no=$map.order_no;historical_order_type=$(if($map.order_no){'platform'}else{$null});affected_tables=$(if($map.order_no){@('SKU成本主表','指定订单的订单商品','订单汇总','9月收入','驾驶舱')}else{@('SKU成本主表')})}
+            }
+        }
         default { [pscustomobject]@{} }
     }
     if ($script:previewMode) {
@@ -388,6 +397,13 @@ try {
     $targetedCostConfirm = Invoke-TestMessage 'confirm-targeted-order-cost' '确认'
     $targetedCostCall = @($script:testCalls | Where-Object action -eq 'SetSkuCost')[-1]
     if (-not $targetedCostCall -or $targetedCostCall.arguments.order_no -ne '888888888888888888' -or $targetedCostConfirm.ack -notmatch '已按明确要求更新订单 888888888888888888') { throw "指定历史订单成本确认失败：$($targetedCostConfirm.ack)" }
+
+    $script:testCalls.Clear()
+    $offlineCostDraft = Invoke-TestMessage 'draft-targeted-offline-cost' '线下历史订单成本修正：OFF-20261026-F7A77684 的第199行商品成本保持0.17元'
+    if ($offlineCostDraft.ack -notmatch '主表成本保持 ¥0.17' -or $offlineCostDraft.ack -notmatch '2026-10-26 线下1号单' -or $offlineCostDraft.ack -notmatch '货物成本：未填写 → ¥1.7' -or $offlineCostDraft.ack -notmatch '利润：未填写 → ¥6.3' -or $offlineCostDraft.ack -match '将更新：SKU成本主表' -or $script:testCalls.Count -ne 0) { throw "指定线下历史订单成本预览失败：$($offlineCostDraft.ack)" }
+    $offlineCostConfirm = Invoke-TestMessage 'confirm-targeted-offline-cost' '确认'
+    $offlineCostCall = @($script:testCalls | Where-Object action -eq 'SetSkuCost')[-1]
+    if (-not $offlineCostCall -or $offlineCostCall.arguments.order_no -ne 'OFF-20261026-F7A77684' -or [double]$offlineCostCall.arguments.amount -ne 0.17 -or $offlineCostConfirm.ack -notmatch '成本保持 ¥0.17，未修改主表' -or $offlineCostConfirm.ack -notmatch '线下1号单（OFF-20261026-F7A77684）') { throw "指定线下历史订单成本确认失败：$($offlineCostConfirm.ack)" }
 
     $script:testCalls.Clear()
     $failureDraft = Invoke-TestMessage 'draft-confirmation-failure' '昨天3402294620217435837是干预单，补单人爸爸，我自己送，没有配送费，库存已恢复'

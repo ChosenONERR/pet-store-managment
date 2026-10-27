@@ -1938,85 +1938,186 @@ switch ($Action) {
         $oldNoteParts = @([regex]::Split([string]$oldNote, '[；;]') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
         $newNote = ((@($oldNoteParts + @($newNoteEntry,$Note)) | Where-Object { $_ } | Select-Object -Unique) -join '；')
         $targetOrderItems = [Collections.Generic.List[object]]::new()
+        $targetOfflineOrder = $null
+        $historicalOrderType = $null
         if ($OrderNo) {
-            if ($OrderNo -notmatch '^\d{10,30}$') { throw '更新历史订单成本必须提供有效的平台订单号' }
-            $orderItemRows = Get-SheetRows '订单商品' 'A2:Q4001'
             $matchingCodes = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
             foreach ($code in @($normalizedCode,$canonicalKw) + @([regex]::Split([string]$transitionCode, '[/,，、;；\s]+'))) {
                 if ($code) { $null = $matchingCodes.Add(([string]$code).Trim().ToLowerInvariant()) }
             }
-            for ($itemIndex = 0; $itemIndex -lt $orderItemRows.Count; $itemIndex++) {
-                $itemRow = $orderItemRows[$itemIndex]
-                if ((Get-CellValue $itemRow 2) -ne $OrderNo) { continue }
-                $itemProductId = ([string](Get-CellValue $itemRow 16)).Trim()
-                $itemCode = ([string](Get-CellValue $itemRow 5)).Trim().ToLowerInvariant()
-                $sameProduct = ($productId -and $itemProductId -eq $productId) -or ($itemCode -and $matchingCodes.Contains($itemCode))
-                if (-not $sameProduct) { continue }
-                $itemDate = Convert-ToDateValue (Get-CellValue $itemRow 0)
-                if ($null -eq $itemDate) { throw "订单 $OrderNo 的商品日期缺失，不能安全更新成本" }
-                $itemQuantity = Convert-ToNumber (Get-CellValue $itemRow 8)
-                $itemSalesAmount = Convert-ToNumber (Get-CellValue $itemRow 10)
-                $targetOrderItems.Add([pscustomobject]@{
-                    row=2+$itemIndex;date=$itemDate;quantity=$itemQuantity;sales_amount=$itemSalesAmount
-                    old_unit_cost=Convert-ToNullableNumber (Get-CellValue $itemRow 11)
-                    old_item_cost=Convert-ToNullableNumber (Get-CellValue $itemRow 12)
-                    new_unit_cost=$newCost
-                    new_item_cost=[math]::Round(($newCost * $itemQuantity),4)
-                    new_margin=[math]::Round(($itemSalesAmount - ($newCost * $itemQuantity)),4)
-                })
+            if ($OrderNo -match '^\d{10,30}$') {
+                $historicalOrderType = 'platform'
+                $orderItemRows = Get-SheetRows '订单商品' 'A2:Q4001'
+                for ($itemIndex = 0; $itemIndex -lt $orderItemRows.Count; $itemIndex++) {
+                    $itemRow = $orderItemRows[$itemIndex]
+                    if ((Get-CellValue $itemRow 2) -ne $OrderNo) { continue }
+                    $itemProductId = ([string](Get-CellValue $itemRow 16)).Trim()
+                    $itemCode = ([string](Get-CellValue $itemRow 5)).Trim().ToLowerInvariant()
+                    $sameProduct = ($productId -and $itemProductId -eq $productId) -or ($itemCode -and $matchingCodes.Contains($itemCode))
+                    if (-not $sameProduct) { continue }
+                    $itemDate = Convert-ToDateValue (Get-CellValue $itemRow 0)
+                    if ($null -eq $itemDate) { throw "订单 $OrderNo 的商品日期缺失，不能安全更新成本" }
+                    $itemQuantity = Convert-ToNumber (Get-CellValue $itemRow 8)
+                    $itemSalesAmount = Convert-ToNumber (Get-CellValue $itemRow 10)
+                    $targetOrderItems.Add([pscustomobject]@{
+                        row=2+$itemIndex;date=$itemDate;quantity=$itemQuantity;sales_amount=$itemSalesAmount
+                        old_unit_cost=Convert-ToNullableNumber (Get-CellValue $itemRow 11)
+                        old_item_cost=Convert-ToNullableNumber (Get-CellValue $itemRow 12)
+                        new_unit_cost=$newCost
+                        new_item_cost=[math]::Round(($newCost * $itemQuantity),4)
+                        new_margin=[math]::Round(($itemSalesAmount - ($newCost * $itemQuantity)),4)
+                    })
+                }
+                if ($targetOrderItems.Count -eq 0) { throw "订单 $OrderNo 中找不到与 $displayCode 对应的商品；没有修改任何成本" }
+                $distinctOrderDates = @($targetOrderItems | ForEach-Object { $_.date.ToString('yyyy-MM-dd') } | Select-Object -Unique)
+                if ($distinctOrderDates.Count -ne 1) { throw "订单 $OrderNo 的商品日期不一致，不能安全刷新对应月份" }
+                $explicitHistoricalOrderDate = [datetime]$targetOrderItems[0].date
+            } elseif ($OrderNo -match '^OFF-\d{8}-[A-Za-z0-9-]+$') {
+                $historicalOrderType = 'offline'
+                $offlineRows = @(Get-SheetRows '线下订单' 'A2:J1001')
+                $offlineMatches = [Collections.Generic.List[object]]::new()
+                for ($offlineIndex = 0; $offlineIndex -lt $offlineRows.Count; $offlineIndex++) {
+                    if (([string](Get-CellValue $offlineRows[$offlineIndex] 2)).Trim() -eq $OrderNo) {
+                        $offlineMatches.Add([pscustomobject]@{row=2+$offlineIndex;cells=$offlineRows[$offlineIndex]})
+                    }
+                }
+                if ($offlineMatches.Count -eq 0) { throw "找不到线下订单 $OrderNo；没有修改任何成本" }
+                if ($offlineMatches.Count -gt 1) { throw "线下订单号 $OrderNo 出现重复，不能安全更新成本" }
+                $offlineMatch = $offlineMatches[0]
+                $offlineDate = Convert-ToDateValue (Get-CellValue $offlineMatch.cells 0)
+                if ($null -eq $offlineDate) { throw "线下订单 $OrderNo 的日期缺失，不能安全更新成本" }
+                $soldGoodsText = ([string](Get-CellValue $offlineMatch.cells 7)).Trim()
+                $soldItemMatches = @([regex]::Matches($soldGoodsText, '(?i)\b((?:kw|csx)\d+)\s*[×xX*]\s*(\d+(?:\.\d+)?)'))
+                if ($soldItemMatches.Count -eq 0) { throw "线下订单 $OrderNo 的售出商品无法识别，不能安全更新成本" }
+                $targetQuantity = 0.0
+                $newOfflineProductCost = 0.0
+                $offlineCostDetails = [Collections.Generic.List[object]]::new()
+                foreach ($soldItemMatch in $soldItemMatches) {
+                    $soldCode = ([string]$soldItemMatch.Groups[1].Value).Trim().ToLowerInvariant()
+                    $soldQuantity = Convert-ToNumber $soldItemMatch.Groups[2].Value
+                    if ($matchingCodes.Contains($soldCode)) {
+                        $soldUnitCost = $newCost
+                        $targetQuantity += $soldQuantity
+                        $costSource = "SKU成本主表第${rowNumber}行（本次确认）"
+                    } else {
+                        $otherSkuTarget = Resolve-UniqueSkuReference $skuRows $soldCode
+                        $otherStatus = [string](Get-CellValue $otherSkuTarget.cells $skuSchema.CostStatus.Index)
+                        $otherUnitCostText = Get-CellValue $otherSkuTarget.cells $skuSchema.MovingAverageCost.Index
+                        if ($null -eq $otherUnitCostText -or [string]$otherUnitCostText -eq '') { $otherUnitCostText = Get-CellValue $otherSkuTarget.cells $skuSchema.BaselineUnitCost.Index }
+                        if ($null -eq $otherUnitCostText -or [string]$otherUnitCostText -eq '' -or $otherStatus -in @('待人工核对','包装换算待核对','缺少成本','缺少参考成本')) {
+                            throw "线下订单 $OrderNo 的 $soldCode 成本仍待核对，不能安全重算整单利润"
+                        }
+                        $soldUnitCost = Convert-ToNumber $otherUnitCostText
+                        $costSource = "SKU成本主表第$($otherSkuTarget.row_number)行"
+                    }
+                    $lineCost = [math]::Round(($soldUnitCost * $soldQuantity),4)
+                    $newOfflineProductCost += $lineCost
+                    $offlineCostDetails.Add([pscustomobject]@{goods_code=$soldCode;quantity=$soldQuantity;unit_cost=$soldUnitCost;item_cost=$lineCost;source=$costSource})
+                }
+                if ($targetQuantity -le 0) { throw "线下订单 $OrderNo 中找不到与 $displayCode 对应的商品；没有修改任何成本" }
+                $offlineIncome = Convert-ToNumber (Get-CellValue $offlineMatch.cells 3)
+                $offlineDeliveryFee = Convert-ToNumber (Get-CellValue $offlineMatch.cells 4)
+                $roundedOfflineCost = [math]::Round($newOfflineProductCost,2)
+                $oldOfflineCost = Convert-ToNullableNumber (Get-CellValue $offlineMatch.cells 5)
+                $oldOfflineProfit = Convert-ToNullableNumber (Get-CellValue $offlineMatch.cells 6)
+                $newOfflineProfit = [math]::Round(($offlineIncome - $roundedOfflineCost - $offlineDeliveryFee),2)
+                $oldOfflineNote = [string](Get-CellValue $offlineMatch.cells 9)
+                $keptOfflineNotes = @([regex]::Split($oldOfflineNote, '[；;]') | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notmatch '^货物成本待核对' })
+                $offlineAuditNote = "店主确认 $displayCode 销售单位成本为 $($newCost.ToString('0.####',[Globalization.CultureInfo]::InvariantCulture)) 元并重算本单（$($Date.ToString('yyyy-MM-dd'))）"
+                $newOfflineNote = ((@($keptOfflineNotes + @($offlineAuditNote,$Note)) | Where-Object { $_ } | Select-Object -Unique) -join '；')
+                $targetOfflineOrder = [pscustomobject]@{
+                    row=$offlineMatch.row;date=$offlineDate.ToString('yyyy-MM-dd');daily_order_no=Get-CellValue $offlineMatch.cells 1;order_no=$OrderNo
+                    sold_goods=$soldGoodsText;target_quantity=$targetQuantity;income=$offlineIncome;delivery_fee=$offlineDeliveryFee
+                    old_product_cost=$oldOfflineCost;new_product_cost=$roundedOfflineCost;old_profit=$oldOfflineProfit;new_profit=$newOfflineProfit
+                    cost_details=@($offlineCostDetails);old_note=$oldOfflineNote;new_note=$newOfflineNote
+                }
+                $explicitHistoricalOrderDate = $offlineDate
+            } else {
+                throw '更新历史订单成本必须提供有效的平台订单号或线下订单编号'
             }
-            if ($targetOrderItems.Count -eq 0) { throw "订单 $OrderNo 中找不到与 $displayCode 对应的商品；没有修改任何成本" }
-            $distinctOrderDates = @($targetOrderItems | ForEach-Object { $_.date.ToString('yyyy-MM-dd') } | Select-Object -Unique)
-            if ($distinctOrderDates.Count -ne 1) { throw "订单 $OrderNo 的商品日期不一致，不能安全刷新对应月份" }
-            $explicitHistoricalOrderDate = [datetime]$targetOrderItems[0].date
         }
-        $affectedTables = if ($OrderNo) { @('SKU成本主表','指定订单的订单商品','订单汇总','对应月份收入','驾驶舱') } else { @('SKU成本主表') }
+        $masterCostWillChange = -not (
+            $historicalOrderType -eq 'offline' -and
+            $null -ne $oldBaselineCost -and $null -ne $oldMovingCost -and
+            [math]::Abs([double]$oldBaselineCost - $newCost) -le 0.0001 -and
+            [math]::Abs([double]$oldMovingCost - $newCost) -le 0.0001
+        )
+        if (-not $masterCostWillChange) {
+            $newStatus = $oldStatus
+            $newNote = $oldNote
+        }
+        $affectedTables = if ($historicalOrderType -eq 'platform') {
+            @('SKU成本主表','指定订单的订单商品','订单汇总','对应月份收入','驾驶舱')
+        } elseif ($historicalOrderType -eq 'offline') {
+            if ($masterCostWillChange) { @('SKU成本主表','线下订单','对应月份收入','驾驶舱') } else { @('线下订单','对应月份收入','驾驶舱') }
+        } else { @('SKU成本主表') }
 
         if ($DryRun) {
             [ordered]@{ok=$true;dry_run=$true;action=$Action;result=[ordered]@{
                 sheet='SKU成本主表';row=$rowNumber;range="$($skuSchema.BaselineUnitCost.Column)${rowNumber}:$($skuSchema.MovingAverageCost.Column)${rowNumber},$($skuSchema.CostStatus.Column)${rowNumber},$($skuSchema.LastCostUpdate.Column)${rowNumber}:$($skuSchema.Note.Column)${rowNumber}"
                 goods_code=$displayCode;sku_reference=$normalizedCode;product_id=$productId;title=$title;old_baseline_cost=$oldBaselineCost;old_moving_average_cost=$oldMovingCost
                 new_unit_cost=$newCost;new_moving_average_cost=$newCost;old_status=$oldStatus;new_status=$newStatus;historical_order_no=$OrderNo
-                historical_order_items=@($targetOrderItems);affected_tables=$affectedTables
+                master_cost_changed=$masterCostWillChange;historical_order_type=$historicalOrderType;historical_order_items=@($targetOrderItems);historical_offline_order=$targetOfflineOrder;affected_tables=$affectedTables
             };message='预演成功，未写入飞书'} | ConvertTo-Json -Depth 10
             Complete-CurrentFinanceTransaction
             exit 0
         }
 
         if (-not (Test-Path -LiteralPath $stateRoot)) { $null = New-Item -ItemType Directory -Path $stateRoot }
-        $backupPath = Join-Path $stateRoot ("sku_cost_change_backup_{0}_{1}.json" -f $displayCode,[datetime]::Now.ToString('yyyyMMdd_HHmmss'))
-        [ordered]@{source="SKU成本主表!A${rowNumber}:Z${rowNumber}";captured_at=[datetime]::Now.ToString('o');cells=@($target.cells)} | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $backupPath -Encoding UTF8
-
-        $costMatrix = @(); $costMatrix += ,@((New-UnitCostCell $newCost),(New-UnitCostCell $newCost))
-        $jMatrix = @(); $jMatrix += ,@((New-ValueCell $newStatus))
-        $updatedAtMatrix = @(); $updatedAtMatrix += ,@((New-ValueCell (Convert-ToExcelSerial ([datetime]::Now))))
-        $mnMatrix = @(); $mnMatrix += ,@((New-ValueCell '店主确认的销售单位成本'),(New-ValueCell $newNote))
         $costOperations = [Collections.Generic.List[object]]::new()
-        $costOperations.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.BaselineUnitCost.Column)${rowNumber}:$($skuSchema.MovingAverageCost.Column)${rowNumber}";cells=$costMatrix}})
-        $costOperations.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.CostStatus.Column)${rowNumber}:$($skuSchema.CostStatus.Column)${rowNumber}";cells=$jMatrix}})
-        $costOperations.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.LastCostUpdate.Column)${rowNumber}:$($skuSchema.LastCostUpdate.Column)${rowNumber}";cells=$updatedAtMatrix}})
-        $costOperations.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.ConversionBasis.Column)${rowNumber}:$($skuSchema.Note.Column)${rowNumber}";cells=$mnMatrix}})
+        if ($masterCostWillChange) {
+            $backupPath = Join-Path $stateRoot ("sku_cost_change_backup_{0}_{1}.json" -f $displayCode,[datetime]::Now.ToString('yyyyMMdd_HHmmss'))
+            [ordered]@{source="SKU成本主表!A${rowNumber}:Z${rowNumber}";captured_at=[datetime]::Now.ToString('o');cells=@($target.cells)} | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $backupPath -Encoding UTF8
+            $costMatrix = @(); $costMatrix += ,@((New-UnitCostCell $newCost),(New-UnitCostCell $newCost))
+            $jMatrix = @(); $jMatrix += ,@((New-ValueCell $newStatus))
+            $updatedAtMatrix = @(); $updatedAtMatrix += ,@((New-ValueCell (Convert-ToExcelSerial ([datetime]::Now))))
+            $mnMatrix = @(); $mnMatrix += ,@((New-ValueCell '店主确认的销售单位成本'),(New-ValueCell $newNote))
+            $costOperations.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.BaselineUnitCost.Column)${rowNumber}:$($skuSchema.MovingAverageCost.Column)${rowNumber}";cells=$costMatrix}})
+            $costOperations.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.CostStatus.Column)${rowNumber}:$($skuSchema.CostStatus.Column)${rowNumber}";cells=$jMatrix}})
+            $costOperations.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.LastCostUpdate.Column)${rowNumber}:$($skuSchema.LastCostUpdate.Column)${rowNumber}";cells=$updatedAtMatrix}})
+            $costOperations.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.ConversionBasis.Column)${rowNumber}:$($skuSchema.Note.Column)${rowNumber}";cells=$mnMatrix}})
+        }
         foreach ($targetItem in $targetOrderItems) {
             $itemCostCells = @(); $itemCostCells += ,@(
                 (New-UnitCostCell $targetItem.new_unit_cost),(New-UnitCostCell $targetItem.new_item_cost),(New-UnitCostCell $targetItem.new_margin)
             )
             $costOperations.Add(@{shortcut='+cells-set';input=@{sheet_name='订单商品';range="L$($targetItem.row):N$($targetItem.row)";cells=$itemCostCells}})
         }
+        if ($null -ne $targetOfflineOrder) {
+            $offlineCostCells = @(); $offlineCostCells += ,@((New-UnitCostCell $targetOfflineOrder.new_product_cost))
+            $offlineNoteCells = @(); $offlineNoteCells += ,@((New-ValueCell $targetOfflineOrder.new_note))
+            $costOperations.Add(@{shortcut='+cells-set';input=@{sheet_name='线下订单';range="F$($targetOfflineOrder.row):F$($targetOfflineOrder.row)";cells=$offlineCostCells}})
+            $costOperations.Add(@{shortcut='+cells-set';input=@{sheet_name='线下订单';range="J$($targetOfflineOrder.row):J$($targetOfflineOrder.row)";cells=$offlineNoteCells}})
+        }
         Set-AtomicCellOperations $costOperations.ToArray()
 
-        $finalReadback = Get-SkuCostReadback $rowNumber $newCost $newStatus $newCost
-        $actualBaseline = [double]$finalReadback.baseline_cost
-        $actualMoving = [double]$finalReadback.moving_average_cost
-        $actualStatus = [string]$finalReadback.status
-        if ([math]::Abs($actualBaseline - $newCost) -gt 0.0001 -or [math]::Abs($actualMoving - $newCost) -gt 0.0001 -or $actualStatus -ne $newStatus) {
-            throw "SKU成本写入后回读不一致：$displayCode（基准成本=$actualBaseline，当前成本=$actualMoving，状态=$actualStatus，重试=$($finalReadback.attempt)次）"
+        if ($masterCostWillChange) {
+            $finalReadback = Get-SkuCostReadback $rowNumber $newCost $newStatus $newCost
+            $actualBaseline = [double]$finalReadback.baseline_cost
+            $actualMoving = [double]$finalReadback.moving_average_cost
+            $actualStatus = [string]$finalReadback.status
+            if ([math]::Abs($actualBaseline - $newCost) -gt 0.0001 -or [math]::Abs($actualMoving - $newCost) -gt 0.0001 -or $actualStatus -ne $newStatus) {
+                throw "SKU成本写入后回读不一致：$displayCode（基准成本=$actualBaseline，当前成本=$actualMoving，状态=$actualStatus，重试=$($finalReadback.attempt)次）"
+            }
+        } else {
+            $actualBaseline = [double]$oldBaselineCost
+            $actualMoving = [double]$oldMovingCost
+            $actualStatus = [string]$oldStatus
+        }
+        if ($null -ne $targetOfflineOrder) {
+            $offlineReadbackRows = @(Get-SheetRows '线下订单' "A$($targetOfflineOrder.row):J$($targetOfflineOrder.row)")
+            if ($offlineReadbackRows.Count -ne 1) { throw "线下订单 $OrderNo 写入后无法回读" }
+            $actualOfflineCost = Convert-ToNullableNumber (Get-CellValue $offlineReadbackRows[0] 5)
+            if ($null -eq $actualOfflineCost -or [math]::Abs([double]$actualOfflineCost - [double]$targetOfflineOrder.new_product_cost) -gt 0.0001) {
+                throw "线下订单 $OrderNo 成本写入后回读不一致：预期 $($targetOfflineOrder.new_product_cost)，实际 $actualOfflineCost"
+            }
         }
         $reference = "$displayCode $newCost"
         $writeResult = [pscustomobject]@{
             sheet='SKU成本主表';row=$rowNumber;range="$($skuSchema.BaselineUnitCost.Column)${rowNumber}:$($skuSchema.MovingAverageCost.Column)${rowNumber},$($skuSchema.CostStatus.Column)${rowNumber},$($skuSchema.LastCostUpdate.Column)${rowNumber}:$($skuSchema.Note.Column)${rowNumber}"
             goods_code=$displayCode;sku_reference=$normalizedCode;product_id=$productId;title=$title;old_baseline_cost=$oldBaselineCost;old_moving_average_cost=$oldMovingCost
             new_unit_cost=$newCost;new_moving_average_cost=$actualMoving;old_status=$oldStatus;new_status=$actualStatus
-            historical_order_no=$OrderNo;historical_order_items=@($targetOrderItems);affected_tables=$affectedTables
+            master_cost_changed=$masterCostWillChange;historical_order_no=$OrderNo;historical_order_type=$historicalOrderType;historical_order_items=@($targetOrderItems);historical_offline_order=$targetOfflineOrder;affected_tables=$affectedTables
         }
     }
     'SetSkuExpiry' {
@@ -2332,8 +2433,12 @@ if ($Action -in @('AddIntervention','RemoveIntervention','RestoreInventory','Con
 if ($Action -eq 'Replenishment') { Assert-FormulaRange '补货记录' 'D2:E1001,G2:G1001' }
 if ($Action -eq 'OfflineSale') { Assert-FormulaRange '线下订单' 'G2:G1001' }
 if ($Action -eq 'SetSkuCost' -and $OrderNo) {
-    Assert-FormulaRange '订单汇总' 'E2:E2001,K2:L2001'
-    Assert-FormulaRange '订单商品' 'E2:E4001,K2:K4001,P2:P4001'
+    if ($historicalOrderType -eq 'offline') {
+        Assert-FormulaRange '线下订单' 'G2:G1001'
+    } else {
+        Assert-FormulaRange '订单汇总' 'E2:E2001,K2:L2001'
+        Assert-FormulaRange '订单商品' 'E2:E4001,K2:K4001,P2:P4001'
+    }
 }
 
 $ledgerResult = $null
