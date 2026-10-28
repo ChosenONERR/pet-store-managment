@@ -57,7 +57,7 @@ Windows 计划任务
 | 退款补偿 | `agent/refund_adjustments.ps1`、`agent/run_sync_and_notify.ps1` | 写已完成退款调整及对应成本；读取并提醒未完成/无法识别状态 | 按退款记录 ID 幂等；只有平台明确完成且金额大于 0 才调整收入；退款后商家预计收入归零时标记全额退款，否则标记部分退款；处理中或无法识别时不改收入、成本、库存并发送去重提醒；退回库存只冲回实际退回商品成本 |
 | 实际履约修正 | `agent/record_finance_event.ps1`、`agent/order_actual_overrides.ps1` | 写指定订单的本地实际商品、最终收入和配送方式覆盖，再只刷新该单及所属月份 | 不修改美团库存；原商品数量不变且仅新增一个私下加购商品时，可按“最终收入－原商家收入”确定新增商品成交额；用户未提配送时确认执行沿用订单当前配送费；多个新增/替换商品仍须明确金额分摊 |
 | SKU 主表维护 | `agent/sync_new_skus.ps1`、`agent/sync_sku_master_by_identity.ps1`、`agent/sku_master_schema.ps1` | 写 SKU 成本主表 | 写入前检查重复 KW 和商品身份冲突；普通补货遇到旧同号档案时，仅在“有商品ID且平台状态为售卖中”的候选恰好一个时定位该行，其他情况继续停止，且不会自动删除旧档案 |
-| 赠品与干预单 | `agent/reconcile_pending_gifts.ps1`、`agent/intervention_record.ps1` | 写赠品、干预订单 | 赠品成本计入订单成本；缺成本保持待确认 |
+| 赠品与干预单 | `agent/reconcile_pending_gifts.ps1`、`agent/intervention_record.ps1`、`agent/record_finance_event.ps1` | 写赠品、干预订单及其关联订单成本/月份 | 赠品成本计入订单成本，缺成本保持待确认；新增、撤销干预单及指定订单的履约/退款状态修改只调用订单级增量成本刷新，只写该订单、实际涉及的 SKU 行及所属月份，禁止为单笔确认重写 `SKU成本主表` 整列或刷新无关月份 |
 | 经营数据查询 | `agent/query_business_data.ps1` | 只读飞书 | 供 Codex 回答经营、库存和待确认问题，禁止写入；SKU 查询返回绑定“主表行号＋美团商品ID”的内部 `action_code`，货号重复时必须用它安全定位，禁止裸商品ID或重复KW猜行 |
 | 定时任务 | `agent/configure_petstar_scheduled_tasks.ps1` | 修改 Windows 计划任务（仅 `-Apply`） | 默认只预览；新电脑必须显式安装 |
 | 运行守护 | `agent/ensure_lark_event_bridge.ps1`、`agent/run_hidden_watchdog.vbs` | 管理本地进程；只读检查当前 Chrome/CDP 实例 | 每 5 分钟保持消息桥常驻、修复失联 CDP 代理；新 Chrome 实例只主动触发一次 Allow，授权恢复后自动补跑一次整点同步（夜间失败则补跑夜间恢复）；全程隐藏黑色窗口，不修改美团数据 |
@@ -95,7 +95,7 @@ Windows 计划任务
 | `agent/README.md` | Agent 部署、运行、排障说明 |
 | `agent/rebuild_cost_snapshots.ps1` | 按订单商品和成本规则重建/增量更新成本快照；逗号分隔的公式范围按连续区域逐一校验，避免 Lark CLI 1.0.98 拒绝非连续范围 |
 | `agent/reconcile_pending_gifts.ps1` | 将已确认赠品成本补入相关订单 |
-| `agent/record_finance_event.ps1` | 所有经营事件的确定性执行器；补货默认当天全额付款（明确赊账/未付款除外），且只更新补货记录与 SKU 当前成本；内部 `sku_ref` 同时校验主表行号和商品ID，任一变化就停止，避免重复货号写错商品；指定 `OFF-` 线下订单的成本修正会回读该单售出商品并重算整单成本/利润，其他商品成本不明确时停止；若确认成本已等于主表基准成本和移动平均成本，则不改主表状态、备注或日期，只修目标线下单及其月份；公式校验将逗号分隔区域拆成连续范围，兼容 Lark CLI 1.0.98 |
+| `agent/record_finance_event.ps1` | 所有经营事件的确定性执行器；补货默认当天全额付款（明确赊账/未付款除外），且只更新补货记录与 SKU 当前成本；内部 `sku_ref` 同时校验主表行号和商品ID，任一变化就停止，避免重复货号写错商品；指定 `OFF-` 线下订单的成本修正会回读该单售出商品并重算整单成本/利润，其他商品成本不明确时停止；新增/撤销干预单、指定订单实际履约和退款处置使用 `-Incremental -EligibleOrderNumbers <订单号>`，从订单汇总读取真实日期并只更新相关订单、SKU 与月份；若确认成本已等于主表基准成本和移动平均成本，则不改主表状态、备注或日期，只修目标线下单及其月份；公式校验将逗号分隔区域拆成连续范围，兼容 Lark CLI 1.0.98 |
 | `agent/refund_adjustments.ps1` | 退款、退货和成本冲回的持久化规则 |
 | `agent/run_hidden_gateway.vbs` | 无窗口启动 Gateway |
 | `agent/run_hidden_scheduled_job.vbs` | 无窗口运行计划任务并返回真实退出码 |

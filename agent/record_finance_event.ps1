@@ -494,12 +494,18 @@ function Invoke-DailyLedgerSync([Nullable[datetime]]$TargetMonth) {
     }
     return (Convert-ChildOutputJson $output '每日经营简账')
 }
-function Invoke-CostSnapshotRebuild {
+function Invoke-CostSnapshotRebuild([string[]]$EligibleOrderNumbers = @(), [switch]$Incremental) {
     if (-not (Test-Path -LiteralPath $costScript)) { throw '缺少成本快照刷新脚本' }
     $previousErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $output = @(& $powershellExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $costScript -ProjectRoot $projectRoot 2>&1)
+        $arguments = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$costScript,'-ProjectRoot',$projectRoot)
+        if ($Incremental) {
+            $arguments += '-Incremental'
+            $arguments += '-EligibleOrderNumbers'
+            $arguments += @($EligibleOrderNumbers)
+        }
+        $output = @(& $powershellExe @arguments 2>&1)
         $childExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
@@ -1276,8 +1282,11 @@ switch ($Action) {
         $script:refundStateBackupPath = Get-RefundAdjustmentStatePath $projectRoot
         $script:refundStateBackup = [IO.File]::ReadAllText($script:refundStateBackupPath, [Text.Encoding]::UTF8)
         $updated = @(Set-RefundItemDisposition $projectRoot $OrderNo $GoodsCode $RefundDisposition $Note)
+        $orderRows = Get-SheetRows '订单汇总' 'A2:Q2001'
+        $orderMatch = @($orderRows | Where-Object { (Get-CellValue $_ 2) -eq $OrderNo })
+        $orderDate = if ($orderMatch.Count -eq 1) { Convert-ToDateValue (Get-CellValue $orderMatch[0] 0) } else { $null }
         $reference = "$OrderNo $($GoodsCode.ToLowerInvariant()) $RefundDisposition"
-        $writeResult = [pscustomobject]@{order_no=$OrderNo;goods_code=$GoodsCode.ToLowerInvariant();title=$matched[0].title;quantity=$matched[0].quantity;refund_amount=$matched[0].refund_amount;old_disposition=$matched[0].old_disposition;new_disposition=$RefundDisposition;updated_events=@($updated.event_id);affected_tables=@('退款补偿状态','订单商品成本','订单汇总','对应月份收入','SKU成本主表账面库存')}
+        $writeResult = [pscustomobject]@{order_no=$OrderNo;date=$(if($orderDate){$orderDate.ToString('yyyy-MM-dd')}else{$null});daily_order_no=$(if($orderMatch.Count -eq 1){Get-CellValue $orderMatch[0] 16}else{$null});goods_code=$GoodsCode.ToLowerInvariant();title=$matched[0].title;quantity=$matched[0].quantity;refund_amount=$matched[0].refund_amount;old_disposition=$matched[0].old_disposition;new_disposition=$RefundDisposition;updated_events=@($updated.event_id);affected_tables=@('退款补偿状态','订单商品成本','订单汇总','对应月份收入','SKU成本主表账面库存')}
     }
     'RemoveIntervention' {
         if (-not $OrderNo -or $OrderNo -notmatch '^\d{10,30}$') { throw '撤销干预必须提供有效平台订单号' }
@@ -1296,9 +1305,12 @@ switch ($Action) {
         if ($matches.Count -gt 1) { throw "干预订单中发现 $($matches.Count) 条重复记录：$OrderNo；为避免误删，本次未修改" }
 
         $target = $matches[0]
+        $orderDate = Convert-ToDateValue (Get-CellValue $orderMatches[0] 0)
         $details = [ordered]@{
             row = $target.row_number
             order_no = $OrderNo
+            date = $(if($orderDate){$orderDate.ToString('yyyy-MM-dd')}else{$null})
+            daily_order_no = Get-CellValue $orderMatches[0] 16
             person = Get-CellValue $target.cells 2
             delivery_type = Get-CellValue $target.cells 5
             delivery_fee = Convert-ToNumber (Get-CellValue $target.cells 7)
@@ -1376,7 +1388,7 @@ switch ($Action) {
                 exit 0
             }
         }
-        $orderRows = Get-SheetRows '订单汇总' 'A2:E2001'
+        $orderRows = Get-SheetRows '订单汇总' 'A2:Q2001'
         $exactOrder = @($orderRows | Where-Object { (Get-CellValue $_ 2) -eq $OrderNo })
         if ($exactOrder.Count -eq 0) {
             $nearbyOrders = @($orderRows | Where-Object {
@@ -1388,21 +1400,28 @@ switch ($Action) {
                 throw "干预订单号未匹配到真实订单：$OrderNo；发现仅差一位的订单 $($nearbyOrders[0])，请核对。系统未写入错误编号"
             }
         }
+        $effectiveDate = $Date.Date
+        $matchedDailyOrderNo = $null
+        if ($exactOrder.Count -eq 1) {
+            $matchedDate = Convert-ToDateValue (Get-CellValue $exactOrder[0] 0)
+            if ($null -ne $matchedDate) { $effectiveDate = $matchedDate.Date }
+            $matchedDailyOrderNo = Get-CellValue $exactOrder[0] 16
+        }
         $rowNumber = Get-FirstEmptyRow $rows 3 2 1001
         if ($DryRun) {
-            [ordered]@{ok=$true;dry_run=$true;duplicate=$false;action=$Action;result=[ordered]@{row=$rowNumber;order_no=$OrderNo;person=$Person;state='待恢复'};message='预演成功，未写入飞书'} | ConvertTo-Json -Depth 8
+            [ordered]@{ok=$true;dry_run=$true;duplicate=$false;action=$Action;result=[ordered]@{row=$rowNumber;order_no=$OrderNo;date=$effectiveDate.ToString('yyyy-MM-dd');daily_order_no=$matchedDailyOrderNo;person=$Person;state='待恢复'};message='预演成功，未写入飞书'} | ConvertTo-Json -Depth 8
             Complete-CurrentFinanceTransaction
             exit 0
         }
         $newRow = @(); $newRow += ,@(
-            (New-ValueCell (Convert-ToExcelSerial $Date)),(New-ValueCell $null),(New-ValueCell $Person),(New-ValueCell $OrderNo),
+            (New-ValueCell (Convert-ToExcelSerial $effectiveDate)),(New-ValueCell $matchedDailyOrderNo),(New-ValueCell $Person),(New-ValueCell $OrderNo),
             (New-ValueCell $null),(New-ValueCell $null),(New-ValueCell $null),(New-ValueCell $null),
             @{formula="=IF(D$rowNumber=`"`",`"`",IFERROR(G$rowNumber*1,0)+IFERROR(H$rowNumber*1,0))"},
             (New-ValueCell '待恢复'),(New-ValueCell $null),(New-ValueCell $null),(New-ValueCell $Note)
         )
         Set-CellMatrix '干预订单' "A${rowNumber}:M${rowNumber}" $newRow
         $reference = $OrderNo
-        $writeResult = [pscustomobject]@{row=$rowNumber;state='待恢复';person=$Person}
+        $writeResult = [pscustomobject]@{row=$rowNumber;order_no=$OrderNo;date=$effectiveDate.ToString('yyyy-MM-dd');daily_order_no=$matchedDailyOrderNo;state='待恢复';person=$Person}
     }
     'RestoreInventory' {
         if (-not $OrderNo) { throw '库存恢复必须提供平台订单号' }
@@ -1437,8 +1456,12 @@ switch ($Action) {
                 $newNote = if ($oldNote) { "$oldNote；$Note" } else { $Note }
                 Set-OneRow '干预订单' "M${rowNumber}:M${rowNumber}" @($newNote)
             }
+            $orderDate = Convert-ToDateValue (Get-CellValue $rows[$i] 0)
             $writeResult = [pscustomobject]@{
                 row=$rowNumber
+                order_no=$OrderNo
+                date=$(if($orderDate){$orderDate.ToString('yyyy-MM-dd')}else{$null})
+                daily_order_no=(Get-CellValue $rows[$i] 1)
                 delivery_type='自配送'
                 delivery_fee=0
                 external_delivery_fee=0
@@ -1469,8 +1492,12 @@ switch ($Action) {
                 $newNote = if ($oldNote) { "$oldNote；$Note" } else { $Note }
                 Set-OneRow '干预订单' "M${rowNumber}:M${rowNumber}" @($newNote)
             }
+            $orderDate = Convert-ToDateValue (Get-CellValue $rows[$i] 0)
             $writeResult = [pscustomobject]@{
                 row=$rowNumber
+                order_no=$OrderNo
+                date=$(if($orderDate){$orderDate.ToString('yyyy-MM-dd')}else{$null})
+                daily_order_no=(Get-CellValue $rows[$i] 1)
                 delivery_type='骑手配送'
                 delivery_fee=$amountValue
                 external_delivery_fee=$amountValue
@@ -1512,7 +1539,8 @@ switch ($Action) {
                 $newNote = if ($oldNote) { "$oldNote；$Note" } else { $Note }
                 Set-OneRow '干预订单' "M${rowNumber}:M${rowNumber}" @($newNote)
             }
-            $writeResult = [pscustomobject]@{row=$rowNumber;order_no=$OrderNo;order_type='干预单';old_delivery_fee=$oldAmount;delivery_fee=$amountValue;delivery_type=$deliveryType;total_cost=[math]::Round($platformFee+$amountValue,2)}
+            $orderDate = Convert-ToDateValue (Get-CellValue $row 0)
+            $writeResult = [pscustomobject]@{row=$rowNumber;order_no=$OrderNo;order_type='干预单';date=$(if($orderDate){$orderDate.ToString('yyyy-MM-dd')}else{$null});daily_order_no=(Get-CellValue $row 1);old_delivery_fee=$oldAmount;delivery_fee=$amountValue;delivery_type=$deliveryType;total_cost=[math]::Round($platformFee+$amountValue,2)}
         } else {
             $orderRows = Get-SheetRows '订单汇总' 'A2:Q2001'
             $orderIndex = -1
@@ -2443,7 +2471,15 @@ if ($Action -eq 'SetSkuCost' -and $OrderNo) {
 
 $ledgerResult = $null
 if ($Action -in @('AddIntervention','RemoveIntervention','SetOrderActuals','AddOrderGift','SetRefundDisposition') -and $null -eq $costResult) {
-    $costResult = Invoke-CostSnapshotRebuild
+    $orderScopedCostActions = @('AddIntervention','RemoveIntervention','SetOrderActuals','SetRefundDisposition')
+    if ($Action -in $orderScopedCostActions -and $OrderNo) {
+        # These actions only change one known order. Replaying the full event
+        # stream is still required to derive its final SKU state, but writes are
+        # restricted to that order and the SKU rows it actually touches.
+        $costResult = Invoke-CostSnapshotRebuild -EligibleOrderNumbers @($OrderNo) -Incremental
+    } else {
+        $costResult = Invoke-CostSnapshotRebuild
+    }
 }
 if ($Action -in @('AddIntervention','RemoveIntervention','ConfirmSelfDelivery','SetExternalDeliveryFee','SetOrderDeliveryFee','SetOrderActuals','OfflineSale','AddOrderGift','SetRefundDisposition')) {
     # Order-local changes only require rebuilding their own month. Cost-basis changes
