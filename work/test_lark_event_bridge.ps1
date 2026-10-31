@@ -185,11 +185,12 @@ function Invoke-PetstarCodex([string]$Text, [string]$MessageId, [string]$Mode = 
         $reply = "📝 待确认：配送费改为 $fee 元。"
     } elseif ($Text -match '批量SKU维护测试') {
         $actions = @(
+            (New-TestCodexAction 'SetCostBookQuantity' @{date='2026-09-13';goods_code='kw1104';quantity=1;note='店主确认补货前实际还有1袋'}),
             (New-TestCodexAction 'Replenishment' @{date='2026-09-13';goods_code='kw1104';quantity=2;purchase_amount=20;note='批量测试补货'}),
             (New-TestCodexAction 'SetSkuCost' @{date='2026-09-13';goods_code='kw1109';amount=1.25;note='批量测试成本'}),
             (New-TestCodexAction 'Replenishment' @{date='2026-09-13';goods_code='kw1113';quantity=3;purchase_amount=0;note='批量测试零成本补货'})
         )
-        $reply = '📝 待确认：批量登记两笔补货和一笔普通成本修改。'
+        $reply = '📝 待确认：先纠正补货前成本账数量，再批量登记两笔补货和一笔普通成本修改。'
     } elseif ($Text -match 'kw1113') {
         $actions = @(New-TestCodexAction 'Replenishment' @{date='2026-09-13';goods_code='kw1113';quantity=12;purchase_amount=0;production_date='2026-08-26';shelf_life_value=18;shelf_life_unit='月';note='试吃装，成本为0'})
         $reply = '📝 待确认：登记 kw1113 零成本试吃装补货。'
@@ -262,6 +263,8 @@ function Invoke-PetstarBatchSkuMaintenance($StoredOperations, $Event, [int]$Star
         $args = $stored.arguments
         $details = if ([string]$stored.action -eq 'Replenishment') {
             [pscustomobject]@{row=80+$executed.Count;goods_code=$args.goods_code;package_quantity=[double]$args.quantity;purchase_amount=[double]$args.purchase_amount;after_average_cost=$(if([double]$args.purchase_amount-eq 0){0}else{10});sku_status=$(if($Preview -and $args.goods_code -eq 'kw1113'){'will_create_pending_profile'}else{'matched'})}
+        } elseif ([string]$stored.action -eq 'SetCostBookQuantity') {
+            [pscustomobject]@{sheet='SKU成本主表';row=18;goods_code=$args.goods_code;old_quantity=0;new_quantity=[double]$args.quantity;moving_average_cost=10;historical_orders_changed=$false;ledger_changed=$false}
         } else {
             [pscustomobject]@{sheet='SKU成本主表';row=19;goods_code=$args.goods_code;old_baseline_cost=3.5;new_unit_cost=[double]$args.amount;new_moving_average_cost=[double]$args.amount;historical_order_no=$null}
         }
@@ -365,12 +368,12 @@ try {
     $script:testCalls.Clear()
     $script:testBatchCalls.Clear()
     $batchSkuDraft = Invoke-TestMessage 'draft-batch-sku-maintenance' '批量SKU维护测试'
-    if ($batchSkuDraft.ack -notmatch '待确认' -or $batchSkuDraft.ack -notmatch '不会重算历史订单' -or $script:testBatchCalls.Count -ne 1 -or -not [bool]$script:testBatchCalls[0].preview -or [int]$script:testBatchCalls[0].count -ne 3 -or $script:testCalls.Count -ne 0) {
+    if ($batchSkuDraft.ack -notmatch '待确认' -or $batchSkuDraft.ack -notmatch '不会重算历史订单' -or $batchSkuDraft.ack -notmatch '成本账数量 0 → 1' -or $script:testBatchCalls.Count -ne 1 -or -not [bool]$script:testBatchCalls[0].preview -or [int]$script:testBatchCalls[0].count -ne 4 -or $script:testCalls.Count -ne 0) {
         throw "批量 SKU 维护预览没有一次处理全部兼容动作：ack=$($batchSkuDraft.ack) batch=$($script:testBatchCalls|ConvertTo-Json -Compress -Depth 8) single=$($script:testCalls.Count)"
     }
     $batchSkuConfirm = Invoke-TestMessage 'confirm-batch-sku-maintenance' '确认'
     $executionBatchCalls = @($script:testBatchCalls | Where-Object { -not [bool]$_.preview })
-    if ($script:testBatchCalls.Count -ne 2 -or $executionBatchCalls.Count -ne 1 -or [int]$executionBatchCalls[0].count -ne 3 -or $script:testCalls.Count -ne 0 -or $batchSkuConfirm.ack -notmatch '补货记录第' -or $batchSkuConfirm.ack -notmatch '未修改历史订单或经营简账') {
+    if ($script:testBatchCalls.Count -ne 2 -or $executionBatchCalls.Count -ne 1 -or [int]$executionBatchCalls[0].count -ne 4 -or $script:testCalls.Count -ne 0 -or $batchSkuConfirm.ack -notmatch '补货记录第' -or $batchSkuConfirm.ack -notmatch '成本账数量 0 → 1' -or $batchSkuConfirm.ack -notmatch '未修改历史订单或经营简账') {
         throw "批量 SKU 维护没有一次执行全部兼容动作：ack=$($batchSkuConfirm.ack) batch=$($script:testBatchCalls|ConvertTo-Json -Compress -Depth 8) single=$($script:testCalls.Count)"
     }
 

@@ -48,7 +48,7 @@ Windows 计划任务
 
 | 功能 | 主入口 | 读取/写入范围 | 使用说明 |
 |---|---|---|---|
-| 飞书对话记账 | `agent/lark_event_bridge.ps1`、`agent/codex_chat_bridge.py`、`agent/record_finance_event.ps1` | 读飞书消息；确认后写指定经营表 | 所有修改先预览，用户回复“确认”后原子执行；同一消息内多笔普通补货使用批量原子路径；明确指定线下历史单修正 SKU 成本时，按只读查询返回的 `OFF-` 订单编号唯一定位，并原子重算该线下单成本/利润及所属月份；若用户给出的成本与 SKU 主表当前成本一致，则主表完全不动，只修目标线下单，不要求伪造平台订单号；同一待确认项先改 SKU 成本再登记线下单时，预演按前序新成本计算后续线下单；补充说明若没有形成可执行动作则保留原待确认计划，旧版遗留的零操作空计划会自动清除并按当前消息重建；Codex 在普通回答或待确认预览阶段返回 429 时，原消息都保持未完成并按 1—15 分钟递增冷却，由看门狗重放自动恢复，飞书只发送幂等的延后提示；Lark CLI 1.0.98 下公式区域拆开逐一校验 |
+| 飞书对话记账 | `agent/lark_event_bridge.ps1`、`agent/codex_chat_bridge.py`、`agent/record_finance_event.ps1` | 读飞书消息；确认后写指定经营表 | 所有修改先预览，用户回复“确认”后原子执行；同一消息内多笔普通补货使用批量原子路径；店主明确纠正补货前成本账数量时，先执行 `SetCostBookQuantity` 再执行对应补货，整组原子确认，纠正值只作为移动平均成本旧数量，不修改美团库存、历史订单或简账；明确指定线下历史单修正 SKU 成本时，按只读查询返回的 `OFF-` 订单编号唯一定位，并原子重算该线下单成本/利润及所属月份；若用户给出的成本与 SKU 主表当前成本一致，则主表完全不动，只修目标线下单，不要求伪造平台订单号；同一待确认项先改 SKU 成本再登记线下单时，预演按前序新成本计算后续线下单；补充说明若没有形成可执行动作则保留原待确认计划，旧版遗留的零操作空计划会自动清除并按当前消息重建；Codex 在普通回答或待确认预览阶段返回 429 时，原消息都保持未完成并按 1—15 分钟递增冷却，由看门狗重放自动恢复，飞书只发送幂等的延后提示；Lark CLI 1.0.98 下公式区域拆开逐一校验 |
 | 美团订单同步 | `work/sync_meituan_orders.ps1`、`work/meituan_order_extract.mjs` | 美团只读；写订单汇总/商品/干预数据 | 绑定唯一 Chrome 店铺；每次抓取及失败重试先回到第 1 页再完整分页；退款状态区分处理中/已完成/已关闭/无法识别，处理中或证据不足时不改账、保留观察结果并飞书提醒，后续同步继续追踪；公式校验使用 Lark CLI 1.0.98 支持的连续区域；每次按完整订单号用已存订单汇总/商品自愈历史干预单自动字段；不得修改美团订单或库存 |
 | 美团库存同步 | `work/sync_meituan_inventory.ps1`、`work/meituan_inventory_export.mjs` | 美团只读导出；写库存相关飞书表 | 导出器默认字段保持稳定，附加字段通过环境变量请求 |
 | 成本与利润 | `agent/rebuild_cost_snapshots.ps1` | 写订单成本快照和公式结果 | 历史快照默认冻结；只有明确指定订单才改历史成本；Lark CLI 1.0.98 下将多个公式区域拆开逐一校验 |
@@ -79,7 +79,7 @@ Windows 计划任务
 | `agent/AGENTS.md` | `agent/` 子目录的补充维护约束 |
 | `agent/check_environment.ps1` | 新电脑或故障时只读检查依赖、路径和配置 |
 | `agent/check_meituan_browser.mjs` | 有界检查当前 Chrome 实例与 CDP 代理；以 `DevToolsActivePort` 实例指纹和代理真实连接端口为准，不采信会跨重启残留的全局 Allow 标记；每个新实例未授权时主动连接并只触发一次 Allow；状态仅记录在 `agent/state/cdp_authorization_prompt.json`，不保存 Cookie/令牌；`--watchdog` 供五分钟看门狗短探测，`--mark-catch-up-started`/`--mark-sync-success` 只维护补跑幂等状态 |
-| `agent/codex_chat_bridge.py` | 调用 Codex 理解飞书消息、查询数据并输出结构化动作；补货未明确赊账/未付款时默认当天全额付款；遇到 429 时持久化全局冷却状态并返回可重试结果，成功调用后自动清除冷却；故障恢复可按原飞书消息ID精准失效旧解释缓存，不清空其他消息 |
+| `agent/codex_chat_bridge.py` | 调用 Codex 理解飞书消息、查询数据并输出结构化动作；补货未明确赊账/未付款时默认当天全额付款；同条消息明确补货前成本账数量时输出 `SetCostBookQuantity` 并置于对应补货之前；遇到 429 时持久化全局冷却状态并返回可重试结果，成功调用后自动清除冷却；故障恢复可按原飞书消息ID精准失效旧解释缓存，不清空其他消息 |
 | `agent/codex_response_schema.json` | Codex 动作协议的 JSON Schema |
 | `agent/configure_hidden_gateway_startup.ps1` | 预览/配置 Hermes Gateway 隐藏启动 |
 | `agent/configure_petstar_scheduled_tasks.ps1` | 预览/安装宠速星 Windows 计划任务 |
@@ -88,14 +88,14 @@ Windows 计划任务
 | `agent/hermes_chat_bridge.py` | 旧 Hermes 对话入口兼容层；新链路优先使用 Codex bridge |
 | `agent/intervention_record.ps1` | 读取、匹配和维护干预订单记录 |
 | `agent/lark_cli_noexit.ps1` | Lark CLI 包装，保留原退出码且不结束宿主进程 |
-| `agent/lark_event_bridge.ps1` | 飞书事件长连接、去重、待确认队列和回执发送；待确认补充未生成动作时不得覆盖原计划，历史零操作空计划会在下条消息进入时自动丢弃；Codex 普通调用或嵌套预览限流时均保留原消息供后台重放，并发送不泄露内部错误的幂等延后提示；所有回执返回值必须被抑制，禁止污染消息处理布尔状态 |
+| `agent/lark_event_bridge.ps1` | 飞书事件长连接、去重、待确认队列和回执发送；普通成本账数量纠正与同条消息内补货合并预演、一次确认和原子执行；待确认补充未生成动作时不得覆盖原计划，历史零操作空计划会在下条消息进入时自动丢弃；Codex 普通调用或嵌套预览限流时均保留原消息供后台重放，并发送不泄露内部错误的幂等延后提示；所有回执返回值必须被抑制，禁止污染消息处理布尔状态 |
 | `agent/order_actual_overrides.ps1` | 保存订单实际商品、配送方式等人工覆盖 |
 | `agent/petstar_cli.py` | 统一命令行入口和参数分发 |
 | `agent/query_business_data.ps1` | 只读查询飞书经营数据 |
 | `agent/README.md` | Agent 部署、运行、排障说明 |
 | `agent/rebuild_cost_snapshots.ps1` | 按订单商品和成本规则重建/增量更新成本快照；逗号分隔的公式范围按连续区域逐一校验，避免 Lark CLI 1.0.98 拒绝非连续范围 |
 | `agent/reconcile_pending_gifts.ps1` | 将已确认赠品成本补入相关订单 |
-| `agent/record_finance_event.ps1` | 所有经营事件的确定性执行器；补货默认当天全额付款（明确赊账/未付款除外），且只更新补货记录与 SKU 当前成本；内部 `sku_ref` 同时校验主表行号和商品ID，任一变化就停止，避免重复货号写错商品；指定 `OFF-` 线下订单的成本修正会回读该单售出商品并重算整单成本/利润，其他商品成本不明确时停止；新增/撤销干预单、指定订单实际履约和退款处置使用 `-Incremental -EligibleOrderNumbers <订单号>`，从订单汇总读取真实日期并只更新相关订单、SKU 与月份；若确认成本已等于主表基准成本和移动平均成本，则不改主表状态、备注或日期，只修目标线下单及其月份；公式校验将逗号分隔区域拆成连续范围，兼容 Lark CLI 1.0.98 |
+| `agent/record_finance_event.ps1` | 所有经营事件的确定性执行器；补货默认当天全额付款（明确赊账/未付款除外），且只更新补货记录与 SKU 当前成本；`SetCostBookQuantity` 仅纠正补货前成本账数量并保留原成本，和后续补货共用同一次主表读取及原子事务；内部 `sku_ref` 同时校验主表行号和商品ID，任一变化就停止，避免重复货号写错商品；指定 `OFF-` 线下订单的成本修正会回读该单售出商品并重算整单成本/利润，其他商品成本不明确时停止；新增/撤销干预单、指定订单实际履约和退款处置使用 `-Incremental -EligibleOrderNumbers <订单号>`，从订单汇总读取真实日期并只更新相关订单、SKU 与月份；若确认成本已等于主表基准成本和移动平均成本，则不改主表状态、备注或日期，只修目标线下单及其月份；公式校验将逗号分隔区域拆成连续范围，兼容 Lark CLI 1.0.98 |
 | `agent/refund_adjustments.ps1` | 退款、退货和成本冲回的持久化规则 |
 | `agent/run_hidden_gateway.vbs` | 无窗口启动 Gateway |
 | `agent/run_hidden_scheduled_job.vbs` | 无窗口运行计划任务并返回真实退出码 |
@@ -137,7 +137,9 @@ Windows 计划任务
 
 | 文件 | 用途 |
 |---|---|
-| `work/create_finance_workbook.ps1`、`work/create_simple_finance.ps1` | 创建早期/简版财务工作簿；简版驾驶舱经营利润只扣其他经营费用，库存货值按（美团库存+待恢复数量）×SKU 当前移动平均成本 |
+| `work/create_finance_workbook.ps1`、`work/create_simple_finance.ps1` | 创建早期/简版财务工作簿；简版驾驶舱经营毛利按“线上与线下收入-商品成本-配送费-平台推广费用”，经营利润再扣除不含推广费的其他经营费用；“计算明细”紧邻“数值”右侧，仅展示经营毛利、经营利润、现金净流入和期末现金的组成，库存货值按（美团库存+待恢复数量）×SKU 当前移动平均成本 |
+| `work/update_dashboard_calculation_details.ps1` | 幂等更新现有驾驶舱的经营毛利/经营利润口径，把“计算明细”移动到“数值”右侧，并从当月支出回填月度结算“平台推广费用”；事务化、带公式校验和回读，可在口径被误改时重跑，不修改订单、库存或历史成本 |
+| `work/ensure_replenishment_product_name.ps1` | 幂等确保 `补货记录` U 列为“商品名”；读取补货货号/商品 ID 与 `SKU成本主表` 的当前货号、商品 ID、自定义标题和平台标题，写入映射公式并校验回读；工作表仅有 A:T 时在 T 右侧追加 U 列，不移动既有列；事务化，可在列公式被破坏时重跑，不修改补货金额、成本、库存、订单或利润 |
 | `work/create_daily_ledger.ps1` | 创建每日经营简账及月份表 |
 | `work/fill_finance_formulas.ps1`、`work/write_finance_formulas.ps1` | 填充或重写财务公式 |
 | `work/add_gift_feature.ps1` | 建立赠品字段和相关公式 |
@@ -219,6 +221,7 @@ Windows 计划任务
 | `work/test_gift_order_formula.ps1` | 赠品成本计入订单利润 |
 | `work/test_lark_event_bridge.ps1` | 飞书事件去重、待确认和重放 |
 | `work/test_pending_gifts.ps1` | 未知赠品成本保持待确认 |
+| `work/test_replenishment_product_name.ps1` | 补货商品名按商品 ID 优先、货号兜底，自定义标题优先及事务/公式安全性 |
 | `work/test_sku_master_schema_safety.ps1` | SKU 主表字段访问和列变化安全性 |
 | `work/test_sync_new_skus.ps1` | 新 SKU 发现、重复拦截和写入 |
 | `work/test_trial_zero_cost_rule.ps1` | 试吃/尝鲜商品零成本规则 |

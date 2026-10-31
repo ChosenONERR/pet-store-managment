@@ -1117,7 +1117,7 @@ function Build-Card($Snapshot, [bool]$Succeeded, [string]$FailureReason = '') {
     $hasWarnings = $syncWarnings.Count -gt 0
     $isOperationallyDegraded = [bool]$Snapshot.sync_degraded
     $focusValue = if ($isNight) { Format-Money $Snapshot.today_net_profit } else { Format-Money $Snapshot.metrics['本月经营毛利'] }
-    $focusLabel = if ($isNight) { '当天赚/亏（暂估）' } else { '本月订单毛利（暂估）' }
+    $focusLabel = if ($isNight) { '当天赚/亏（暂估）' } else { '本月经营毛利（暂估）' }
     $profitNumber = if ($isNight) { Convert-ToNumber $Snapshot.today_net_profit } else { Convert-ToNumber $Snapshot.metrics['本月经营毛利'] }
     $profitColor = if ($null -ne $profitNumber -and $profitNumber -lt 0) { 'red' } else { 'green' }
     $profitBackground = if ($profitColor -eq 'red') { 'red-50' } else { 'green-50' }
@@ -1245,7 +1245,7 @@ function Build-Card($Snapshot, [bool]$Succeeded, [string]$FailureReason = '') {
     return [ordered]@{
         schema = '2.0'
         config = [ordered]@{
-            width_mode = 'fill'; update_multi = $true; summary = [ordered]@{ content = $(if ($isNight) { "宠速星经营日结：当天赚/亏（暂估）$focusValue" } else { "宠速星${modeName}同步：本月订单毛利（暂估）$focusValue" }) }
+            width_mode = 'fill'; update_multi = $true; summary = [ordered]@{ content = $(if ($isNight) { "宠速星经营日结：当天赚/亏（暂估）$focusValue" } else { "宠速星${modeName}同步：本月经营毛利（暂估）$focusValue" }) }
             style = [ordered]@{
                 color = [ordered]@{
                     'cus-primary' = [ordered]@{ light_mode = 'rgba(30,120,255,1)'; dark_mode = 'rgba(80,150,255,1)' }
@@ -1380,7 +1380,7 @@ function Build-Message($Snapshot, [bool]$Succeeded, [string]$FailureReason = '')
     }
     $lines = [Collections.Generic.List[string]]::new()
     $lines.Add("【宠速星经营助手｜${modeName}同步完成】")
-    $lines.Add("本月订单毛利（暂估）：$(Format-Money $Snapshot.metrics['本月经营毛利'])")
+    $lines.Add("本月经营毛利（暂估）：$(Format-Money $Snapshot.metrics['本月经营毛利'])")
     $lines.Add("今日订单：自然 $($Snapshot.today_natural) / 干预 $($Snapshot.today_intervention) / 取消 $($Snapshot.today_cancelled)")
     $lines.Add("重点补货：$(@($Snapshot.urgent_restock).Count) 个（库存≤1且自然月售估算≥1）")
     foreach ($item in @($Snapshot.urgent_restock | Select-Object -First 10)) {
@@ -1528,7 +1528,7 @@ try {
             Assert-FormulaRange '订单汇总' 'E2:E2001,K2:L2001'
             Assert-FormulaRange '订单商品' 'E2:E4001,K2:K4001,P2:P4001'
             Assert-FormulaRange '库存快照' 'H2:I2000,K2:K2000,M2:M2000'
-            Assert-FormulaRange '补货记录' 'D2:E1001,G2:G1001'
+            Assert-FormulaRange '补货记录' 'D2:E1001,G2:G1001,U2:U1001'
             Assert-FormulaRange '驾驶舱' 'C2:C19'
             return 'success'
         } 3
@@ -1579,7 +1579,7 @@ try {
             Assert-FormulaRange '订单汇总' 'E2:E2001,K2:L2001'
             Assert-FormulaRange '订单商品' 'E2:E4001,K2:K4001,P2:P4001'
             Assert-FormulaRange '库存快照' 'H2:I2000,K2:K2000,M2:M2000'
-            Assert-FormulaRange '补货记录' 'D2:E1001,G2:G1001'
+            Assert-FormulaRange '补货记录' 'D2:E1001,G2:G1001,U2:U1001'
             Assert-FormulaRange '驾驶舱' 'C2:C19'
             return 'success'
         } 3

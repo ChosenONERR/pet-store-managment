@@ -23,6 +23,11 @@ function New-FormulaCell([string]$Formula) {
     if (-not $Formula) { return @{} }
     return @{formula=$Formula}
 }
+function New-ReplenishmentProductNameFormula([int]$RowNumber) {
+    $kwLookup = "IFERROR(IF(VLOOKUP(B${RowNumber},'SKU成本主表'!`$A`$2:`$D`$3000,4,FALSE)<>`"`",VLOOKUP(B${RowNumber},'SKU成本主表'!`$A`$2:`$D`$3000,4,FALSE),VLOOKUP(B${RowNumber},'SKU成本主表'!`$A`$2:`$D`$3000,3,FALSE)),`"`")"
+    $idLookup = "IFERROR(IF(INDEX('SKU成本主表'!`$D`$2:`$D`$3000,MATCH(O${RowNumber},'SKU成本主表'!`$Q`$2:`$Q`$3000,0))<>`"`",INDEX('SKU成本主表'!`$D`$2:`$D`$3000,MATCH(O${RowNumber},'SKU成本主表'!`$Q`$2:`$Q`$3000,0)),INDEX('SKU成本主表'!`$C`$2:`$C`$3000,MATCH(O${RowNumber},'SKU成本主表'!`$Q`$2:`$Q`$3000,0))),${kwLookup})"
+    return "=IF(B${RowNumber}=`"`",`"`",IF(O${RowNumber}<>`"`",${idLookup},${kwLookup}))"
+}
 function Get-CellValue($Row, [int]$Index) {
     if ($null -eq $Row -or $Index -ge @($Row).Count) { return $null }
     $cell = @($Row)[$Index]
@@ -194,10 +199,17 @@ for ($row=2; $row -le 1001; $row++) {
 Set-CellMatrix '补货记录' 'D2:D1001' $dCells
 Set-CellMatrix '补货记录' 'E2:E1001' $eCells
 Set-CellMatrix '补货记录' 'G2:G1001' $gCells
+$productNameHeader = @(); $productNameHeader += ,@((New-ValueCell '商品名'))
+Set-CellMatrix '补货记录' 'U1:U1' $productNameHeader
+$productNameCells = @()
+for ($row=2; $row -le 1001; $row++) { $productNameCells += ,@((New-FormulaCell (New-ReplenishmentProductNameFormula $row))) }
+Set-CellMatrix '补货记录' 'U2:U1001' $productNameCells
 
 $styleCommands = @(
     @('A1:N1','#8A5A13','#FFFFFF','bold','center'),
+    @('U1:U1','#8A5A13','#FFFFFF','bold','center'),
     @('A2:N1001','#FFF8E1',$null,$null,$null),
+    @('U2:U1001','#FFF8E1',$null,$null,$null),
     @('D2:E1001','#E8F1EC',$null,$null,$null),
     @('G2:K1001','#E8F1EC',$null,$null,$null)
 )
@@ -214,13 +226,13 @@ foreach ($dateRange in @('A2:A1001','L2:L1001','P2:P1001','S2:S1001')) {
     $null = lark-cli sheets +cells-set-style --as user --spreadsheet-token $token --sheet-name '补货记录' --range $dateRange --number-format 'yyyy-mm-dd' --horizontal-alignment center --format json | Out-String
     if ($LASTEXITCODE -ne 0) { throw "更新补货记录日期格式失败：$dateRange" }
 }
-$widths = '{"A:B":115,"C:K":135,"L:M":120,"N":260}'
+$widths = '{"A:B":115,"C:K":135,"L:M":120,"N":260,"U":360}'
 $null = lark-cli sheets +cols-resize --as user --spreadsheet-token $token --sheet-name '补货记录' --widths $widths --format json | Out-String
 if ($LASTEXITCODE -ne 0) { throw '更新补货记录列宽失败' }
 $null = lark-cli sheets +dim-freeze --as user --spreadsheet-token $token --sheet-name '补货记录' --dimension row --count 1 --format json | Out-String
 
 Assert-FormulaRange '商品成本' 'D2:D2000'
-Assert-FormulaRange '补货记录' 'D2:E1001,G2:G1001'
+Assert-FormulaRange '补货记录' 'D2:E1001,G2:G1001,U2:U1001'
 
 $readback = Get-SheetRows 'SKU成本主表' "A2:N$($masterRows.Count + 1)"
 if ($readback.Count -ne $masterRows.Count) { throw 'SKU成本主表回读行数不一致' }

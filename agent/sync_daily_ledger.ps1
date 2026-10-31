@@ -471,6 +471,15 @@ foreach ($row in $interventionRows) {
     if ($orderNo) { $interventionOrderSet[$orderNo] = $true }
 }
 
+$monthSettlementRowsByKey = @{}
+$monthSettlementRange = Get-SheetRows $sourceToken '月度结算' 'A2:N25'
+for ($settlementIndex = 0; $settlementIndex -lt $monthSettlementRange.rows.Count; $settlementIndex++) {
+    $settlementMonth = Convert-ToDate (Get-CellValue $monthSettlementRange.rows[$settlementIndex] 0)
+    if ($null -eq $settlementMonth) { continue }
+    $settlementRowNumber = if ($monthSettlementRange.row_indices.Count -eq $monthSettlementRange.rows.Count) { [int]$monthSettlementRange.row_indices[$settlementIndex] } else { 2 + $settlementIndex }
+    $monthSettlementRowsByKey[$settlementMonth.ToString('yyyy-MM')] = $settlementRowNumber
+}
+
 $summaries = @()
 $requestedDateSummary = $null
 $autoReconciledDeliveryFees = [Collections.Generic.List[object]]::new()
@@ -720,6 +729,21 @@ foreach ($monthSheet in $monthSheets) {
         }
     }
     $expenseEntries = @($expenseEntries | Sort-Object @{Expression={if ($null -eq $_.date) {[datetime]::MaxValue} else {$_.date}}}, order_no, sort_order, project)
+    $promotionExpenseTotal = 0.0
+    foreach ($expenseEntry in @($expenseEntries)) {
+        if (([string]$expenseEntry.project).Trim() -ne '投流推广费' -or $null -eq $expenseEntry.fee) { continue }
+        $promotionExpenseTotal += [double]$expenseEntry.fee
+    }
+    $promotionExpenseTotal = [math]::Round($promotionExpenseTotal,2)
+    $monthKey = $monthSheet.month.ToString('yyyy-MM')
+    if (-not $monthSettlementRowsByKey.ContainsKey($monthKey)) { throw "月度结算缺少月份：$monthKey" }
+    $monthSettlementRow = [int]$monthSettlementRowsByKey[$monthKey]
+    Set-SourceCellMatrix '月度结算' "N${monthSettlementRow}:N${monthSettlementRow}" @(@(New-ValueCell $promotionExpenseTotal))
+    $promotionReadback = (Get-SheetRows $sourceToken '月度结算' "N${monthSettlementRow}:N${monthSettlementRow}").rows
+    $actualPromotionExpense = if ($promotionReadback.Count -gt 0) { Convert-ToNullableNumber (Get-CellValue $promotionReadback[0] 0) } else { $null }
+    if ($null -eq $actualPromotionExpense -or [math]::Abs($actualPromotionExpense - $promotionExpenseTotal) -gt 0.005) {
+        throw "平台推广费用回读失败：$monthKey，预期=$promotionExpenseTotal，实际=$actualPromotionExpense"
+    }
     if ($expenseEntries.Count -gt 1000) { throw "$($monthSheet.expense) 超过1000行容量" }
     $expenseMatrix = @()
     foreach ($entry in $expenseEntries) {
@@ -821,6 +845,7 @@ foreach ($monthSheet in $monthSheets) {
         expense_rows = $expenseMatrix.Count
         automatic_intervention_expense_rows = $autoExpenseCount
         preserved_manual_expense_rows = $expenseMatrix.Count - $autoExpenseCount
+        promotion_expense = $promotionExpenseTotal
     }
 }
 

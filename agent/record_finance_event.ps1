@@ -1,6 +1,6 @@
 ﻿param(
     [Parameter(Mandatory=$true)]
-    [ValidateSet('AddIntervention','RemoveIntervention','RestoreInventory','ConfirmSelfDelivery','SetExternalDeliveryFee','SetOrderDeliveryFee','SetOrderActuals','OfflineSale','AddOrderGift','Replenishment','BatchSkuMaintenance','CashExpense','OperatingExpense','OwnerWithdrawal','OwnerLabor','MarketRent','BeginningCash','ActualReceipt','AssetAmortization','SetSkuExpiry','SetSkuBatchDate','SetSkuCost','ChangeSkuCode','SetRefundDisposition')]
+    [ValidateSet('AddIntervention','RemoveIntervention','RestoreInventory','ConfirmSelfDelivery','SetExternalDeliveryFee','SetOrderDeliveryFee','SetOrderActuals','OfflineSale','AddOrderGift','Replenishment','BatchSkuMaintenance','SetCostBookQuantity','CashExpense','OperatingExpense','OwnerWithdrawal','OwnerLabor','MarketRent','BeginningCash','ActualReceipt','AssetAmortization','SetSkuExpiry','SetSkuBatchDate','SetSkuCost','ChangeSkuCode','SetRefundDisposition')]
     [string]$Action,
     [datetime]$Date = [datetime]::Today,
     [string]$OrderNo,
@@ -577,7 +577,7 @@ function Get-FirstCompletelyEmptyRow($Rows, [int]$ColumnCount, [int]$StartRow, [
     throw '表格容量已满'
 }
 function Get-MonthRow([datetime]$TargetDate) {
-    $rows = Get-SheetRows '月度结算' 'A2:M25'
+    $rows = Get-SheetRows '月度结算' 'A2:N25'
     $prefix = $TargetDate.ToString('yyyy-MM')
     for ($i = 0; $i -lt $rows.Count; $i++) {
         $value = Get-CellValue $rows[$i] 0
@@ -602,6 +602,10 @@ function Update-MonthlyCell([int]$ColumnIndex, [string]$ColumnName, [double]$Val
 function Normalize-BusinessText([string]$Value) {
     if (-not $Value) { return '' }
     return (($Value.Trim().ToLowerInvariant()) -replace '[\s，,。；;：:]+','')
+}
+
+function Test-IsPromotionExpense([string]$Project) {
+    return (Normalize-BusinessText $Project) -eq (Normalize-BusinessText '投流推广费')
 }
 
 function Get-OperatingExpenseState([datetime]$TargetDate, [double]$TargetAmount, [string]$TargetNote) {
@@ -641,6 +645,12 @@ function Get-OperatingExpenseState([datetime]$TargetDate, [double]$TargetAmount,
             $projectNoteIndexes.Add($noteIndex)
         }
     }
+    $promotionTotal = 0.0
+    foreach ($ledgerRow in @($ledgerRows)) {
+        if (-not (Test-IsPromotionExpense (Get-CellValue $ledgerRow 1))) { continue }
+        $promotionAmount = Convert-ToNumber (Get-CellValue $ledgerRow 2)
+        if ($null -ne $promotionAmount) { $promotionTotal += [double]$promotionAmount }
+    }
 
     return [pscustomobject]@{
         project = $project
@@ -656,6 +666,8 @@ function Get-OperatingExpenseState([datetime]$TargetDate, [double]$TargetAmount,
         project_note_indexes = $projectNoteIndexes.ToArray()
         project_note_count = $projectNoteIndexes.Count
         month_note_entry = $entry
+        is_promotion = Test-IsPromotionExpense $project
+        promotion_total = [math]::Round($promotionTotal,2)
     }
 }
 
@@ -699,10 +711,16 @@ function Invoke-OperatingExpenseWrite([datetime]$TargetDate, [double]$TargetAmou
             Set-OneRow '月度结算' "L$($state.month.row_number):L$($state.month.row_number)" @(($newParts -join '；'))
 
             $check = Get-OperatingExpenseState $TargetDate $TargetAmount $TargetNote
+            if ($state.is_promotion) {
+                Set-OneRow '月度结算' "N$($state.month.row_number):N$($state.month.row_number)" @([double]$check.promotion_total)
+                $check = Get-OperatingExpenseState $TargetDate $TargetAmount $TargetNote
+            }
             $actualMonthlyValue = Convert-ToNumber (Get-CellValue $check.month.cells 6)
+            $actualPromotionValue = Convert-ToNumber (Get-CellValue $check.month.cells 13)
             if ($check.project_match_count -ne 1 -or $check.ledger_match_count -ne 1 -or
                 $check.project_note_count -ne 1 -or $check.month_note_count -ne 1 -or
-                [math]::Abs($actualMonthlyValue - $newMonthlyValue) -gt 0.0001) {
+                [math]::Abs($actualMonthlyValue - $newMonthlyValue) -gt 0.0001 -or
+                ($state.is_promotion -and ($null -eq $actualPromotionValue -or [math]::Abs($actualPromotionValue - [double]$check.promotion_total) -gt 0.0001))) {
                 throw "推广费更新后回读校验失败：$($TargetDate.ToString('yyyy-MM-dd')) $($state.project) ¥$TargetAmount"
             }
             return [pscustomobject]@{
@@ -763,8 +781,14 @@ function Invoke-OperatingExpenseWrite([datetime]$TargetDate, [double]$TargetAmou
     Set-OneRow '月度结算' "L$($state.month.row_number):L$($state.month.row_number)" @($newNote)
 
     $check = Get-OperatingExpenseState $TargetDate $TargetAmount $TargetNote
+    if ($state.is_promotion) {
+        Set-OneRow '月度结算' "N$($state.month.row_number):N$($state.month.row_number)" @([double]$check.promotion_total)
+        $check = Get-OperatingExpenseState $TargetDate $TargetAmount $TargetNote
+    }
     $actualMonthlyValue = Convert-ToNumber (Get-CellValue $check.month.cells 6)
-    if ($check.ledger_match_count -ne 1 -or $check.month_note_count -ne 1 -or [math]::Abs($actualMonthlyValue - $newMonthlyValue) -gt 0.0001) {
+    $actualPromotionValue = Convert-ToNumber (Get-CellValue $check.month.cells 13)
+    if ($check.ledger_match_count -ne 1 -or $check.month_note_count -ne 1 -or [math]::Abs($actualMonthlyValue - $newMonthlyValue) -gt 0.0001 -or
+        ($state.is_promotion -and ($null -eq $actualPromotionValue -or [math]::Abs($actualPromotionValue - [double]$check.promotion_total) -gt 0.0001))) {
         throw "其他经营费用写入后回读校验失败：$($TargetDate.ToString('yyyy-MM-dd')) $($state.project) ¥$TargetAmount"
     }
 
@@ -866,8 +890,42 @@ function Invoke-BatchSkuMaintenance([object[]]$Operations) {
         $operation = $Operations[$operationIndex]
         $operationAction = [string](Get-BatchArgument $operation 'action')
         $arguments = Get-BatchArgument $operation 'arguments'
-        if ($operationAction -notin @('Replenishment','SetSkuCost')) { throw "批量 SKU 维护不支持动作：$operationAction" }
+        if ($operationAction -notin @('Replenishment','SetSkuCost','SetCostBookQuantity')) { throw "批量 SKU 维护不支持动作：$operationAction" }
         if ($operationAction -eq 'SetSkuCost' -and (Get-BatchArgument $arguments 'order_no')) { throw '指定历史订单的成本修正不能与普通 SKU 维护合并执行' }
+
+        if ($operationAction -eq 'SetCostBookQuantity') {
+            $goodsCode = [string](Get-BatchArgument $arguments 'goods_code')
+            $quantityValue = Convert-ToNullableNumber (Get-BatchArgument $arguments 'quantity')
+            if (-not $goodsCode -or $goodsCode.Trim().Length -gt 100) { throw "第$($operationIndex+1)项成本账数量纠正缺少可唯一定位的货号" }
+            Assert-NonNegative $quantityValue "第$($operationIndex+1)项成本账数量"
+            $operationDate = Convert-BatchDate (Get-BatchArgument $arguments 'date') $Date '数量纠正日期'
+            $target = Resolve-UniqueSkuReference $skuRows $goodsCode.Trim().ToLowerInvariant()
+            $rowNumber = [int]$target.row_number
+            $cells = Copy-CellRow $skuRows[$rowNumber-2] 26
+            $canonicalKw = Get-CellValue $cells $skuSchema.CurrentKw.Index
+            $transitionCode = Get-CellValue $cells $skuSchema.TransitionCode.Index
+            $productId = Get-CellValue $cells $skuSchema.ProductId.Index
+            $displayCode = if ($canonicalKw) { $canonicalKw.Trim().ToLowerInvariant() } elseif ($transitionCode) { @([regex]::Split($transitionCode,'[/,，、;；\s]+') | Where-Object { $_ } | Select-Object -First 1)[0].Trim().ToLowerInvariant() } elseif ($productId) { "SKU ID $productId" } else { $goodsCode.Trim().ToLowerInvariant() }
+            $oldQuantity = Convert-ToNullableNumber (Get-CellValue $cells $skuSchema.CostBookQuantity.Index)
+            if ($null -eq $oldQuantity) { $oldQuantity = 0.0 }
+            $newQuantity = [math]::Round([double]$quantityValue,4)
+            $noteValue = [string](Get-BatchArgument $arguments 'note')
+            $noteEntry = "店主确认补货前成本账数量由 $([double]$oldQuantity) 纠正为 $newQuantity（$($operationDate.ToString('yyyy-MM-dd'))）"
+            $newNote = ((@([regex]::Split([string](Get-CellValue $cells $skuSchema.Note.Index),'[；;]') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) + @($noteEntry,$noteValue) | Where-Object { $_ } | Select-Object -Unique) -join '；')
+            $updatedAt = Convert-ToExcelSerial ([datetime]::Now)
+
+            $cells[$skuSchema.CostBookQuantity.Index] = New-UnitCostCell $newQuantity
+            $cells[$skuSchema.LastCostUpdate.Index] = New-ValueCell $updatedAt
+            $cells[$skuSchema.Note.Index] = New-ValueCell $newNote
+            Set-WorkingRow $skuRows $rowNumber $cells
+
+            $matrix = @(); $matrix += ,@((New-UnitCostCell $newQuantity)); $writes.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.CostBookQuantity.Column)${rowNumber}:$($skuSchema.CostBookQuantity.Column)${rowNumber}";cells=$matrix}})
+            $matrix = @(); $matrix += ,@((New-ValueCell $updatedAt)); $writes.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.LastCostUpdate.Column)${rowNumber}:$($skuSchema.LastCostUpdate.Column)${rowNumber}";cells=$matrix}})
+            $matrix = @(); $matrix += ,@((New-ValueCell $newNote)); $writes.Add(@{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.Note.Column)${rowNumber}:$($skuSchema.Note.Column)${rowNumber}";cells=$matrix}})
+            $expectedSku[[string]$rowNumber] = [pscustomobject]@{baseline=Convert-ToNullableNumber (Get-CellValue $cells $skuSchema.BaselineUnitCost.Index);moving=Convert-ToNullableNumber (Get-CellValue $cells $skuSchema.MovingAverageCost.Index);quantity=$newQuantity;status=Get-CellValue $cells $skuSchema.CostStatus.Index}
+            $results.Add([pscustomobject]@{sheet='SKU成本主表';row=$rowNumber;goods_code=$displayCode;sku_reference=$goodsCode.Trim().ToLowerInvariant();product_id=$productId;title=Get-CellValue $cells $skuSchema.CustomTitle.Index;old_quantity=[double]$oldQuantity;new_quantity=$newQuantity;moving_average_cost=Convert-ToNullableNumber (Get-CellValue $cells $skuSchema.MovingAverageCost.Index);affected_tables=@('SKU成本主表');historical_orders_changed=$false;ledger_changed=$false})
+            continue
+        }
 
         if ($operationAction -eq 'SetSkuCost') {
             $goodsCode = [string](Get-BatchArgument $arguments 'goods_code')
@@ -1037,7 +1095,7 @@ function Invoke-BatchSkuMaintenance([object[]]$Operations) {
     Set-AtomicCellOperations $writes.ToArray()
     foreach($entry in $expectedSku.GetEnumerator()) { $row=[int]$entry.Key;$e=$entry.Value;$a=Get-SingleSheetRow 'SKU成本主表' "A${row}:Z${row}";if($null-eq$a -or -not(Test-NullableNumberEqual (Get-CellValue $a $skuSchema.BaselineUnitCost.Index) $e.baseline) -or -not(Test-NullableNumberEqual (Get-CellValue $a $skuSchema.MovingAverageCost.Index) $e.moving) -or -not(Test-NullableNumberEqual (Get-CellValue $a $skuSchema.CostBookQuantity.Index) $e.quantity) -or [string](Get-CellValue $a $skuSchema.CostStatus.Index)-ne[string]$e.status){throw "批量 SKU 维护写后校验失败：SKU成本主表第 $row 行"} }
     foreach($entry in $expectedReplenishment.GetEnumerator()) { $row=[int]$entry.Key;$e=$entry.Value;$a=Get-SingleSheetRow '补货记录' "A${row}:T${row}";if($null-eq$a -or [string](Get-CellValue $a 1)-ne[string]$e.goods_code -or -not(Test-NullableNumberEqual (Get-CellValue $a 2) $e.quantity) -or -not(Test-NullableNumberEqual (Get-CellValue $a 5) $e.purchase_amount) -or [string](Get-CellValue $a 19)-ne[string]$e.batch_id -or -not(Test-NullableNumberEqual (Get-CellValue $a 9) $e.after_quantity) -or -not(Test-NullableNumberEqual (Get-CellValue $a 10) $e.after_average)){throw "批量补货写后校验失败：补货记录第 $row 行"} }
-    if($formulaRows.Count-gt 0){$ranges=@($formulaRows|Sort-Object|ForEach-Object{"D${_}:E${_},G${_}:G${_}"})-join',';Assert-FormulaRange '补货记录' $ranges}
+    if($formulaRows.Count-gt 0){$ranges=@($formulaRows|Sort-Object|ForEach-Object{"D${_}:E${_},G${_}:G${_},U${_}:U${_}"})-join',';Assert-FormulaRange '补货记录' $ranges}
     return [pscustomobject]@{operations=$results.ToArray();operation_count=$results.Count;write_operation_count=$writes.Count;master_read_count=1;replenishment_read_count=1}
 }
 
@@ -1047,7 +1105,7 @@ if (-not $DryRun -and $EventId -and (Test-ProcessedEvent $EventId)) {
     exit 0
 }
 
-$nativeDryRunActions = @('AddIntervention','RemoveIntervention','SetOrderDeliveryFee','SetOrderActuals','OfflineSale','AddOrderGift','Replenishment','BatchSkuMaintenance','SetSkuCost','SetSkuExpiry','SetSkuBatchDate','ChangeSkuCode','OperatingExpense','SetRefundDisposition')
+$nativeDryRunActions = @('AddIntervention','RemoveIntervention','SetOrderDeliveryFee','SetOrderActuals','OfflineSale','AddOrderGift','Replenishment','BatchSkuMaintenance','SetCostBookQuantity','SetSkuCost','SetSkuExpiry','SetSkuBatchDate','ChangeSkuCode','OperatingExpense','SetRefundDisposition')
 if ($DryRun -and $Action -notin $nativeDryRunActions) {
     throw "动作 $Action 暂不支持直接预演；已在任何写入前停止"
 }
@@ -1066,6 +1124,26 @@ $writeResult = $null
 $costResult = $null
 $explicitHistoricalOrderDate = $null
 switch ($Action) {
+    'SetCostBookQuantity' {
+        $singleOperation = [pscustomobject]@{
+            action = 'SetCostBookQuantity'
+            arguments = [pscustomobject]@{
+                goods_code = $GoodsCode
+                quantity = $Quantity
+                date = $Date.ToString('yyyy-MM-dd')
+                note = $Note
+                event_id = $EventId
+            }
+        }
+        $singleResult = Invoke-BatchSkuMaintenance @($singleOperation)
+        $writeResult = @($singleResult.operations)[0]
+        $reference = "$GoodsCode quantity=$Quantity"
+        if ($DryRun) {
+            [ordered]@{ok=$true;dry_run=$true;action=$Action;result=$writeResult;message='成本账数量纠正预演成功，未写入飞书'} | ConvertTo-Json -Depth 12
+            Complete-CurrentFinanceTransaction
+            exit 0
+        }
+    }
     'BatchSkuMaintenance' {
         $batchOperations = @(Get-BatchOperationsPayload)
         $batchResult = Invoke-BatchSkuMaintenance $batchOperations
@@ -2458,7 +2536,7 @@ if ($Action -in @('AddIntervention','RemoveIntervention','RestoreInventory','Con
     Assert-FormulaRange '订单商品' 'E2:E4001,K2:K4001,P2:P4001'
     Assert-FormulaRange '库存快照' 'M2:M2000'
 }
-if ($Action -eq 'Replenishment') { Assert-FormulaRange '补货记录' 'D2:E1001,G2:G1001' }
+if ($Action -eq 'Replenishment') { Assert-FormulaRange '补货记录' 'D2:E1001,G2:G1001,U2:U1001' }
 if ($Action -eq 'OfflineSale') { Assert-FormulaRange '线下订单' 'G2:G1001' }
 if ($Action -eq 'SetSkuCost' -and $OrderNo) {
     if ($historicalOrderType -eq 'offline') {

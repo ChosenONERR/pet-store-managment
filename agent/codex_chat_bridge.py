@@ -134,6 +134,7 @@ ACTION_GUIDE = """
 - OfflineSale: date, items(KW/CSX×数量), amount, delivery_fee, receipt_status, platform, note。receipt_status 只填“已到账”或“未到账”；platform 只填“美团”“淘宝闪购”“京东到家”“线下”（用户说“京东外卖”时填“京东到家”）
 - AddOrderGift: date, order_no或daily_order_no, items, note
 - Replenishment: date, goods_code, transition_code（消息同时给出CSX时填写）, quantity, purchase_amount, payment_amount, payment_date, production_date, shelf_life_value, shelf_life_unit, note。店主没有明确说赊账、挂账、未付款或以后付款时，默认当天已全额付款，payment_amount 填 purchase_amount，payment_date 填 date；明确未付款时 payment_amount/payment_date 留空，并在 note 保留原话。该动作只新增补货记录并更新SKU当前成本，不重算历史订单、收入、利润或经营简账
+- SetCostBookQuantity: goods_code, quantity, date, note。仅当店主明确纠正某 SKU 在本次补货前的“成本账数量”时使用；若同一请求还包含该 SKU 补货，必须把本动作放在对应 Replenishment 前面，使移动平均成本按纠正后的旧数量计算。它不代表美团库存，不修改历史订单或经营简账
 - CashExpense / OperatingExpense / OwnerWithdrawal / OwnerLabor / MarketRent / BeginningCash / ActualReceipt / AssetAmortization: date, amount, note。ActualReceipt 只表示平台资金实际打入收款账户的月度现金到账，不得用于修正某一订单的收入、退款或利润，也不得携带 order_no
 - SetSkuExpiry: goods_code, expiry_date；明确无到期日时 clear_expiry=true
 - SetSkuBatchDate: goods_code, production_date, shelf_life_value, shelf_life_unit
@@ -166,6 +167,7 @@ sku 查询的每一行也会返回 action_code。只要查询结果提供 action
 店主明确说试吃装、赠送、免费或成本为0时，Replenishment 的 purchase_amount 可以是0，并在 note 保留零成本原因。新KW尚未存在于SKU成本主表时也照常生成 Replenishment，由执行层建立待平台同步档案，不能改成 SetSkuBatchDate 或直接报无法处理。
 “补货”既可能是已有商品再次采购，也可能是第一次上新的入库，不能要求店主换一种固定说法。消息同时给出 KW 和 CSX 时，goods_code 填 KW、transition_code 填 CSX；只有 CSX 时 goods_code 填 CSX。执行层会优先用任一编号唯一匹配 SKU 主表，并在无冲突时把新 KW 绑定到该 CSX 所在档案。
 补货只更新补货记录和该SKU当前成本；即使一次有多条补货，也不得生成 RefreshLedger，不得声称会修改库存批次、现金流、历史订单、收入、利润或经营简账。
+店主明确说“补货前其实还有/原来有 N 个（袋/件）”“成本账数量应由 X 改为 Y”时，先生成 SetCostBookQuantity，再生成对应 Replenishment；两者和同一消息中的其他补货必须保持原顺序并一次确认、原子执行。不得把成本账数量纠正理解为修改美团库存，也不得单独改写历史订单。
 补货付款默认口径：消息给出补货数量和采购金额，且没有明确说赊账、挂账、未付款或以后付款时，视为当天已全额付款；只有明确未付款时才把付款金额和付款日期留空。
 店主要求修改、补充或纠正某个 KW/CSX 的成本价时，使用 SetSkuCost。amount 是该商品每个“销售单位”的成本，不是整箱金额；若无法判断整箱与单件换算，只追问每箱包含多少销售单位，不能猜。默认只修改SKU成本主表；只有店主明确指定历史订单并要求联动该单时才填写 order_no，且只允许更新该订单，不得扩展为全量历史重算。平台订单使用完整数字订单号；线下订单必须先查询并使用 OFF- 开头内部订单编号，不能把“线下1号单”直接填入 order_no。
 

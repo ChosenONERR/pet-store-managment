@@ -118,6 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
             "AssetAmortization",
             "SetSkuExpiry",
             "SetSkuBatchDate",
+            "SetCostBookQuantity",
             "SetSkuCost",
             "ChangeSkuCode",
             "SetRefundDisposition",

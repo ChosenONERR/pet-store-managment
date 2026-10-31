@@ -20,6 +20,12 @@ function Get-CellValue($Row, [int]$Index) {
     return [string]@($Row)[$Index].value
 }
 function New-ValueCell($Value) { if ($null -eq $Value -or [string]$Value -eq '') { return @{value=''} }; return @{value=$Value} }
+function New-FormulaCell([string]$Formula) { if (-not $Formula) { return @{value=''} }; return @{formula=$Formula} }
+function New-ReplenishmentProductNameFormula([int]$RowNumber) {
+    $kwLookup = "IFERROR(IF(VLOOKUP(B${RowNumber},'SKU成本主表'!`$A`$2:`$D`$3000,4,FALSE)<>`"`",VLOOKUP(B${RowNumber},'SKU成本主表'!`$A`$2:`$D`$3000,4,FALSE),VLOOKUP(B${RowNumber},'SKU成本主表'!`$A`$2:`$D`$3000,3,FALSE)),`"`")"
+    $idLookup = "IFERROR(IF(INDEX('SKU成本主表'!`$D`$2:`$D`$3000,MATCH(O${RowNumber},'SKU成本主表'!`$Q`$2:`$Q`$3000,0))<>`"`",INDEX('SKU成本主表'!`$D`$2:`$D`$3000,MATCH(O${RowNumber},'SKU成本主表'!`$Q`$2:`$Q`$3000,0)),INDEX('SKU成本主表'!`$C`$2:`$C`$3000,MATCH(O${RowNumber},'SKU成本主表'!`$Q`$2:`$Q`$3000,0))),${kwLookup})"
+    return "=IF(B${RowNumber}=`"`",`"`",IF(O${RowNumber}<>`"`",${idLookup},${kwLookup}))"
+}
 function Set-Cells([string]$Sheet,[string]$Range,$Rows) {
     $rowValues = @($Rows)
     $matrix = [Collections.ArrayList]::new()
@@ -50,6 +56,10 @@ Set-Cells '补货记录' 'O1:T1' @(@(
     @{value='商品ID';cell_styles=$headerStyle},@{value='生产日期';cell_styles=$headerStyle},@{value='保质期数值';cell_styles=$headerStyle},
     @{value='保质期单位';cell_styles=$headerStyle},@{value='到期日期';cell_styles=$headerStyle},@{value='批次ID';cell_styles=$headerStyle}
 ))
+Set-Cells '补货记录' 'U1:U1' @(@(@{value='商品名';cell_styles=$headerStyle}))
+$productNameCells = @()
+for ($rowNumber = 2; $rowNumber -le 1001; $rowNumber++) { $productNameCells += ,@((New-FormulaCell (New-ReplenishmentProductNameFormula $rowNumber))) }
+Set-Cells '补货记录' 'U2:U1001' $productNameCells
 $batchHeaders = @('批次ID','商品ID','当前KW','入库日期','入库销售单位数量','生产日期','保质期数值','保质期单位','到期日期','剩余数量','来源记录','状态','备注')
 $batchCells = @(); foreach ($header in $batchHeaders) { $batchCells += ,@{value=$header;cell_styles=$headerStyle} }
 Set-Cells '库存批次' 'A1:M1' @($batchCells)
@@ -72,10 +82,14 @@ for ($i=0; $i -lt $rows.Count; $i++) {
 }
 
 $null = Invoke-LarkJson { lark-cli sheets +dim-freeze --as user --spreadsheet-token $spreadsheetToken --sheet-name '库存批次' --dimension row --count 1 --format json } '冻结库存批次表头失败'
+$null = Invoke-LarkJson { lark-cli sheets +range-copy --as user --spreadsheet-token $spreadsheetToken --sheet-name '补货记录' --source-range 'B2:B1001' --target-range 'U2' --paste-type formats --format json } '复制补货商品名列格式失败'
+$null = Invoke-LarkJson { lark-cli sheets +cols-resize --as user --spreadsheet-token $spreadsheetToken --sheet-name '补货记录' --range 'U' --width 360 --format json } '设置补货商品名列宽失败'
 $null = Invoke-LarkJson { lark-cli sheets +cols-resize --as user --spreadsheet-token $spreadsheetToken --sheet-name '库存批次' --widths '{"A:B":150,"C:D":105,"E:J":115,"K":170,"L":90,"M":220}' --format json } '设置库存批次列宽失败'
 $null = Invoke-LarkJson { lark-cli sheets +sheet-hide --as user --spreadsheet-token $spreadsheetToken --sheet-name '库存批次' --format json } '隐藏库存批次表失败'
 
 $verify = Invoke-LarkJson { lark-cli sheets +formula-verify --as user --spreadsheet-token $spreadsheetToken --sheet-name 'SKU成本主表' --range 'A1:R3000' --format json --exit-on-error } 'SKU成本主表公式校验失败'
 if ($verify.data.status -ne 'success') { throw 'SKU成本主表公式存在错误' }
+$replenishmentVerify = Invoke-LarkJson { lark-cli sheets +formula-verify --as user --spreadsheet-token $spreadsheetToken --sheet-name '补货记录' --range 'U2:U1001' --format json --exit-on-error } '补货商品名公式校验失败'
+if ($replenishmentVerify.data.status -ne 'success') { throw '补货商品名公式存在错误' }
 
 [ordered]@{ok=$true;cleaned_historical_kw_aliases=$cleaned;batch_sheet='库存批次';formula_verification='success'} | ConvertTo-Json -Compress

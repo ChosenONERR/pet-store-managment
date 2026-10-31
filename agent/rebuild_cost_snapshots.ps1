@@ -594,7 +594,7 @@ if (-not $Incremental) {
 
 Assert-FormulaRange '订单汇总' 'E2:E2001,K2:L2001'
 Assert-FormulaRange '订单商品' 'E2:E4001,K2:K4001,P2:P4001'
-Assert-FormulaRange '补货记录' 'D2:E1001,G2:G1001'
+Assert-FormulaRange '补货记录' 'D2:E1001,G2:G1001,U2:U1001'
 
 $costArithmeticErrors = @($itemOutputs | Where-Object {
     -not $_.intervention -and -not $_.cancelled -and $null -ne $_.unit_cost -and $null -ne $_.item_cost -and

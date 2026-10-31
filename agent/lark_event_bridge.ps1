@@ -531,7 +531,7 @@ function Invoke-PetstarEvent([string[]]$Arguments) {
     $action = [string]$argumentMap.action
     if ($script:previewMode) {
         $previewResult = $null
-        if ($action -in @('RemoveIntervention','OfflineSale','AddOrderGift','Replenishment','SetSkuExpiry','SetSkuBatchDate','SetSkuCost','ChangeSkuCode','SetOrderDeliveryFee','SetOrderActuals','SetRefundDisposition')) {
+        if ($action -in @('RemoveIntervention','OfflineSale','AddOrderGift','Replenishment','SetCostBookQuantity','SetSkuExpiry','SetSkuBatchDate','SetSkuCost','ChangeSkuCode','SetOrderDeliveryFee','SetOrderActuals','SetRefundDisposition')) {
             $previewOutputLines = @(& $pythonExe $petstarCli event @Arguments --dry-run 2>&1 | ForEach-Object { [string]$_ })
             $previewExitCode = $LASTEXITCODE
             $previewResult = Convert-CommandOutputToJson $previewOutputLines
@@ -564,7 +564,7 @@ function Invoke-PetstarEvent([string[]]$Arguments) {
 
 function Test-BatchCompatibleSkuOperation($Operation) {
     $action = [string]$Operation.action
-    if ($action -eq 'Replenishment') { return $true }
+    if ($action -in @('Replenishment','SetCostBookQuantity')) { return $true }
     if ($action -ne 'SetSkuCost') { return $false }
     return -not (Get-CodexActionValue $Operation.arguments 'order_no')
 }
@@ -578,7 +578,7 @@ function Invoke-PetstarBatchSkuMaintenance($StoredOperations, $Event, [int]$Star
         $stored = $operationList[$offset]
         $arguments = [ordered]@{}
         foreach ($property in @($stored.arguments.PSObject.Properties)) { $arguments[$property.Name] = $property.Value }
-        if ([string]$stored.action -eq 'Replenishment' -and -not $arguments['date']) {
+        if ([string]$stored.action -in @('Replenishment','SetCostBookQuantity') -and -not $arguments['date']) {
             $arguments['date'] = (Resolve-MessageDate ([string]$Event.content) ([string]$Event.create_time)).ToString('yyyy-MM-dd')
         }
         if (-not $arguments['note']) { $arguments['note'] = '本机 Codex 通过飞书自然语言解析' }
@@ -680,7 +680,7 @@ function Invoke-CodexAction($CodexAction, $Event, [int]$Index, [string]$Mode) {
         'AddIntervention','RemoveIntervention','RestoreInventory','ConfirmSelfDelivery','SetExternalDeliveryFee','SetOrderDeliveryFee','SetOrderActuals',
         'OfflineSale','AddOrderGift','Replenishment','CashExpense','OperatingExpense','OwnerWithdrawal',
         'OwnerLabor','MarketRent','BeginningCash','ActualReceipt','AssetAmortization','SetSkuExpiry',
-        'SetSkuBatchDate','SetSkuCost','ChangeSkuCode','SetRefundDisposition','RefreshLedger','SendDailySummary','SyncPlatformData'
+        'SetSkuBatchDate','SetCostBookQuantity','SetSkuCost','ChangeSkuCode','SetRefundDisposition','RefreshLedger','SendDailySummary','SyncPlatformData'
     )
     if ($actionName -notin $allowed) { throw "Codex 返回了不允许的经营动作：$actionName" }
 
@@ -835,6 +835,9 @@ function Format-CodexExecutionReply($Operations) {
                 $lines.Add("SKU成本主表当前移动平均成本：$afterCostText；未重算历史订单或经营简账。")
                 if ($details.sku_status -eq 'created_pending_profile') { $lines.Add('已建立待平台同步的SKU档案。') }
                 if ($details.sku_status -eq 'attached_kw_by_csx') { $lines.Add("已按 CSX 匹配原档案并绑定当前 KW：$($details.goods_code)。") }
+            }
+            'SetCostBookQuantity' {
+                $lines.Add("SKU成本主表第$($details.row)行：$($details.goods_code) 成本账数量 $($details.old_quantity) → $($details.new_quantity)；未修改美团库存、历史订单或经营简账。")
             }
             'SetSkuBatchDate' { $lines.Add("$($details.goods_code)：到期 $($details.expiry_date)") }
             'SetSkuExpiry' { $lines.Add("$($details.goods_code)：最早到期 $($details.earliest_expiry)") }
@@ -1299,6 +1302,11 @@ function Format-ConfirmationPreview([string]$ChangeId, $Operations, [string]$Fal
                 if ($details.sku_status -eq 'will_attach_kw_by_csx') { $lines.Add("已通过 $($details.transition_code) 唯一找到 SKU主表第$($details.sku_master_row)行；确认后绑定当前KW为 $($details.goods_code)。") }
                 if ($details.sku_status -eq 'matched_unique_active_platform_sku') { $lines.Add("主表存在旧的同号档案；本次已按唯一在售商品ID定位到第$($details.sku_master_row)行，未删除或修改其他同号行。") }
                 $null = $impacts.Add('补货记录及SKU成本主表')
+            }
+            'SetCostBookQuantity' {
+                $lines.Add("补货前数量纠正：SKU成本主表第$($details.row)行｜$($details.goods_code)｜成本账数量 $($details.old_quantity) → $($details.new_quantity)")
+                $lines.Add('仅作为后续补货移动平均成本的起点；不修改美团库存、历史订单或经营简账。')
+                $null = $impacts.Add('SKU成本主表')
             }
             'SetSkuBatchDate' {
                 $lines.Add("批次：$($details.goods_code)｜生产 $($details.production_date)｜保质期 $($details.shelf_life)｜到期 $($details.expiry_date)")

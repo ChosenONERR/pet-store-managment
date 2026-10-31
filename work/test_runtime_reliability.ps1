@@ -15,6 +15,8 @@ $runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\s
 $runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\reconcile_manual_delivery_fees.ps1')
 $runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\repair_dashboard_offline_formulas.ps1')
 $runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\repair_dashboard_and_replenishment_payments_20261025.ps1')
+$runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\update_dashboard_calculation_details.ps1')
+$runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\ensure_replenishment_product_name.ps1')
 $runtimePowerShellFiles += @(Get-ChildItem -LiteralPath (Join-Path $projectRoot 'work') -Filter 'test_*.ps1' -File)
 
 $parseFailures = [Collections.Generic.List[string]]::new()
@@ -56,6 +58,8 @@ $deliveryReconciliation = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\r
 $dashboardFormulaRepair = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\repair_dashboard_offline_formulas.ps1'),[Text.Encoding]::UTF8)
 $dashboardPaymentRepair = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\repair_dashboard_and_replenishment_payments_20261025.ps1'),[Text.Encoding]::UTF8)
 $simpleFinanceBuilder = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\create_simple_finance.ps1'),[Text.Encoding]::UTF8)
+$dashboardDetailsUpdater = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\update_dashboard_calculation_details.ps1'),[Text.Encoding]::UTF8)
+$replenishmentProductNameUpdater = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\ensure_replenishment_product_name.ps1'),[Text.Encoding]::UTF8)
 $orderExtractor = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\meituan_order_extract.mjs'),[Text.Encoding]::UTF8)
 $orderSync = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\sync_meituan_orders.ps1'),[Text.Encoding]::UTF8)
 $refundAdjustments = [IO.File]::ReadAllText((Join-Path $agentRoot 'refund_adjustments.ps1'),[Text.Encoding]::UTF8)
@@ -236,6 +240,10 @@ $contracts = [ordered]@{
     manual_delivery_repair_is_atomic_and_read_back = ($deliveryReconciliation -match 'New-FinanceTransaction' -and $deliveryReconciliation -match 'Register-FinanceRangeBeforeImage' -and $deliveryReconciliation -match 'Invoke-FinanceTransactionRollback' -and $deliveryReconciliation -match '配送费回读订单数量不一致')
     dashboard_includes_offline_orders_and_matches_ledger = ($dashboardFormulaRepair -match "''线下订单''" -and $dashboardFormulaRepair -match 'dashboard_gross_profit' -and $dashboardFormulaRepair -match 'ledger_profit' -and $dashboardFormulaRepair -match 'Invoke-FinanceTransactionRollback')
     dashboard_uses_current_cost_inventory_and_compact_metrics = ($simpleFinanceBuilder -match '\(D\{r\}\+IFERROR\(M\{r\}\*1,0\)\)\*H\{r\}' -and $simpleFinanceBuilder -match 'SKU成本主表.+G.2.+G.3000' -and $simpleFinanceBuilder -notmatch '本月经济利润.+\$null' -and $dashboardPaymentRepair -match 'october_purchase_amount' -and $dashboardPaymentRepair -match 'Invoke-FinanceTransactionRollback')
+    dashboard_gross_profit_includes_promotion_once = ($simpleFinanceBuilder -match '平台推广费用' -and $simpleFinanceBuilder -match '\$promotionExpenseExpression' -and $simpleFinanceBuilder -match "'=C4-C5-\('" -and $simpleFinanceBuilder -match "'=C6-\('" -and $financeEvent -match 'promotion_total' -and $ledgerSync -match '平台推广费用回读失败')
+    dashboard_calculation_details_are_targeted_and_verified = ($dashboardDetailsUpdater -match "detailFormulas = @\{" -and $dashboardDetailsUpdater -match '6 = ' -and $dashboardDetailsUpdater -match '7 = ' -and $dashboardDetailsUpdater -match '9 = ' -and $dashboardDetailsUpdater -match '10 = ' -and $dashboardDetailsUpdater -match "D6:D7" -and $dashboardDetailsUpdater -match "D9:D10" -and $dashboardDetailsUpdater -match "计算明细.*解释" -and $dashboardDetailsUpdater -match 'Invoke-FinanceTransactionRollback')
+    cost_book_quantity_correction_is_atomic_with_replenishment = ($financeEvent -match 'SetCostBookQuantity' -and $financeEvent -match '批量 SKU 维护不支持动作' -and $financeEvent -match '成本账数量由' -and $financeEvent -match 'historical_orders_changed=\$false' -and $codexBridge -match '先生成 SetCostBookQuantity，再生成对应 Replenishment' -and $bridge -match '成本账数量')
+    replenishment_product_name_is_identity_mapped_and_verified = ($replenishmentProductNameUpdater -match "MATCH\(O\$\{RowNumber\},'SKU成本主表'!" -and $replenishmentProductNameUpdater -match "VLOOKUP\(B\$\{RowNumber\},'SKU成本主表'!" -and $replenishmentProductNameUpdater -match "range 'U1:U1'" -and $replenishmentProductNameUpdater -match 'formula-verify' -and $replenishmentProductNameUpdater -match 'Invoke-FinanceTransactionRollback' -and $financeEvent -match 'U2:U1001')
     confirmed_writes_wait_for_running_sync = ($financeTransaction -match 'LockTimeoutSeconds' -and $bridge -match 'Invoke-StoredConfirmationOperations \$pending \$executeEvent 5' -and $bridge -match "Mode', 'RetryPending'" -and $bridge -match 'Invoke-StoredConfirmationOperations \$pending \$executeEvent 2700')
     codex_mutation_preview_reuses_first_parse = ($bridge -match 'function New-ConfirmationDraftFromCodexResult' -and $bridge -match 'Reuse them[\s\S]{0,240}New-ConfirmationDraftFromCodexResult')
 }

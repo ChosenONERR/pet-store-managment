@@ -59,6 +59,7 @@
               "AssetAmortization",
               "SetSkuExpiry",
               "SetSkuBatchDate",
+              "SetCostBookQuantity",
               "SetSkuCost",
               "ChangeSkuCode",
               "SetRefundDisposition",
