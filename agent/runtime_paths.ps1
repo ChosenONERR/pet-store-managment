@@ -39,8 +39,15 @@ function Resolve-PetstarExecutable {
     throw "$Label was not found. Configure the matching PETSTAR_* environment variable or run agent\check_environment.ps1."
 }
 
-function Get-PetstarPython {
+function Get-PetstarUserProfile {
     $userProfile = [Environment]::GetFolderPath('UserProfile')
+    if (-not $userProfile) { $userProfile = [string]$env:USERPROFILE }
+    if (-not $userProfile) { throw 'Cannot resolve the current Windows user profile path' }
+    return $userProfile
+}
+
+function Get-PetstarPython {
+    $userProfile = Get-PetstarUserProfile
     return Resolve-PetstarExecutable -Label 'Python' -Candidates @(
         $env:PETSTAR_PYTHON,
         (Join-Path $userProfile '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'),
@@ -73,7 +80,7 @@ function Get-PetstarLarkCli {
 }
 
 function Get-PetstarWebAccessCheck {
-    $userProfile = [Environment]::GetFolderPath('UserProfile')
+    $userProfile = Get-PetstarUserProfile
     $roots = @(
         $env:PETSTAR_WEB_ACCESS_CHECK,
         (Join-Path $PSScriptRoot 'check_meituan_browser.mjs'),

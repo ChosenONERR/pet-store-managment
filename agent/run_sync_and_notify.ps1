@@ -931,6 +931,15 @@ function Build-Snapshot {
         $name = Get-CellValue $row 1
         if ($name) { $metrics[$name] = Get-CellValue $row 2 }
     }
+    # The visible dashboard can be switched to a historical month. Scheduled
+    # notifications must still use the hidden current-month gross-profit cell.
+    try {
+        $systemDashboardRows = Get-SheetRows '驾驶舱' 'J1:J2'
+        if (@($systemDashboardRows).Count -ge 2) {
+            $systemGrossProfit = Get-CellValue $systemDashboardRows[1] 0
+            if ($null -ne $systemGrossProfit -and [string]$systemGrossProfit -ne '') { $metrics['本月经营毛利'] = $systemGrossProfit }
+        }
+    } catch {}
 
     $orderRows = Get-SheetRows '订单汇总' 'A2:E2001'
     $todayRows = @($orderRows | Where-Object {

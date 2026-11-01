@@ -237,6 +237,21 @@ if ($LASTEXITCODE -ne 0) { throw '设置干预订单库存恢复状态下拉失�
 $null = lark-cli sheets +dropdown-set --as user --spreadsheet-token $token --sheet-name '干预订单' --range 'K2:K1001' --options '["未好评","已好评"]' --colors '["#9CA3AF","#16A34A"]' --format json | Out-String
 if ($LASTEXITCODE -ne 0) { throw '设置干预订单好评状态下拉失败' }
 
+$dashboardMonthOptions = [Collections.Generic.List[string]]::new()
+$dashboardMonthCursor = [datetime]'2026-08-01'
+$dashboardMonthEnd = [datetime]::Today.AddDays(1-[datetime]::Today.Day).Date
+while ($dashboardMonthCursor -le $dashboardMonthEnd) {
+    $dashboardMonthOptions.Add($dashboardMonthCursor.ToString('yyyy-MM'))
+    $dashboardMonthCursor = $dashboardMonthCursor.AddMonths(1)
+}
+$dashboardMonthOptionsJson = @($dashboardMonthOptions) | ConvertTo-Json -Compress
+$null = $dashboardMonthOptionsJson | lark-cli sheets +dropdown-set --as user --spreadsheet-token $token --sheet-name '驾驶舱' --range 'I1:I1' --options - --highlight=false --format json | Out-String
+if ($LASTEXITCODE -ne 0) { throw '设置驾驶舱月份下拉失败' }
+Set-Cells '驾驶舱' 'H1:I1' @(@(@{value='查看月份'},@{value=[datetime]::Today.ToString('yyyy-MM')}))
+$null = lark-cli sheets +cells-set-style --as user --spreadsheet-token $token --sheet-name '驾驶舱' --range 'H1:H1' --background-color '#173A2D' --font-color '#FFFFFF' --font-weight bold --horizontal-alignment center --vertical-alignment middle --format json | Out-String
+$null = lark-cli sheets +cells-set-style --as user --spreadsheet-token $token --sheet-name '驾驶舱' --range 'I1:I1' --background-color '#E3F0E8' --font-weight bold --horizontal-alignment center --vertical-alignment middle --number-format '@' --format json | Out-String
+$null = lark-cli sheets +cols-resize --as user --spreadsheet-token $token --sheet-name '驾驶舱' --range 'H:I' --width 120 --format json | Out-String
+
 Set-FormulaColumn '干预订单' 'I' 1001 '=IF(D{r}="","",IFERROR(G{r}*1,0)+IFERROR(H{r}*1,0))'
 Set-FormulaColumn '商品成本' 'D' 2000 '=IF(A{r}="","",IF(C{r}>0,B{r}/C{r},B{r}))'
 Set-FormulaColumn '商品成本' 'E' 2000 '=IF(A{r}="","",IF(OR(A{r}="csx188",A{r}="csx576"),"待人工核对",IF(C{r}>0,"拆分成本","默认成本")))'
@@ -285,6 +300,9 @@ $dashboardFormulas = @(
     '=""',
     '=""'
 )
+$systemCurrentGrossProfitFormula = $dashboardFormulas[4]
+$dashboardSelectedMonthExpression = 'DATE(VALUE(LEFT($I$1,4)),VALUE(RIGHT($I$1,2)),1)'
+$dashboardFormulas = @($dashboardFormulas | ForEach-Object { $_.Replace('DATE(YEAR(TODAY()),MONTH(TODAY()),1)',$dashboardSelectedMonthExpression) })
 $dashboardCells = @()
 for ($i = 0; $i -lt $dashboardFormulas.Count; $i++) { $dashboardCells += ,@(@{formula=$dashboardFormulas[$i]}) }
 Set-Cells '驾驶舱' 'C2:C19' $dashboardCells
@@ -295,18 +313,25 @@ $dashboardDetailFormulas = @{
     9 = '="=平台与线下到账-补货付款-其他现金支出-老板取款="&TEXT((' + $cashReceiptExpression + '),"#,##0.00")&"-"&TEXT(C8,"#,##0.00")&"-"&TEXT((' + $otherCashExpenseExpression + '),"#,##0.00")&"-"&TEXT((' + $ownerWithdrawalExpression + '),"#,##0.00")'
     10 = '="=期初现金+本月现金净流入="&TEXT((' + $beginningCashExpression + '),"#,##0.00")&IF(C9>=0,"+","")&TEXT(C9,"#,##0.00")'
 }
+foreach ($detailRow in @($dashboardDetailFormulas.Keys)) {
+    $dashboardDetailFormulas[$detailRow] = $dashboardDetailFormulas[$detailRow].Replace('DATE(YEAR(TODAY()),MONTH(TODAY()),1)',$dashboardSelectedMonthExpression)
+}
 $dashboardDetailCells = @()
 for ($rowNumber = 2; $rowNumber -le 19; $rowNumber++) {
     if ($dashboardDetailFormulas.ContainsKey($rowNumber)) { $dashboardDetailCells += ,@(@{formula=$dashboardDetailFormulas[$rowNumber]}) }
     else { $dashboardDetailCells += ,@(@{value=''}) }
 }
 Set-Cells '驾驶舱' 'D2:D19' $dashboardDetailCells
+Set-Cells '驾驶舱' 'J1:J2' @(@(@{value='系统当月经营毛利'}),@(@{formula=$systemCurrentGrossProfitFormula}))
+$null = lark-cli sheets +dim-hide --as user --spreadsheet-token $token --sheet-name '驾驶舱' --range 'J:J' --format json | Out-String
+if ($LASTEXITCODE -ne 0) { throw '隐藏驾驶舱系统辅助列失败' }
 
 $verifyTargets = @(
     @{Sheet='干预订单';Range='I2:I1001'},
     @{Sheet='驾驶舱';Range='C2:C19'},
     @{Sheet='驾驶舱';Range='D6:D7'},
     @{Sheet='驾驶舱';Range='D9:D10'},
+    @{Sheet='驾驶舱';Range='J2:J2'},
     @{Sheet='补货记录';Range='D2:D1001'},
     @{Sheet='订单汇总';Range='E2:L2001'},
     @{Sheet='订单商品';Range='E2:P4001'},

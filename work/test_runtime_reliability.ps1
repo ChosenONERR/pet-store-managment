@@ -59,9 +59,13 @@ $dashboardFormulaRepair = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\r
 $dashboardPaymentRepair = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\repair_dashboard_and_replenishment_payments_20261025.ps1'),[Text.Encoding]::UTF8)
 $simpleFinanceBuilder = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\create_simple_finance.ps1'),[Text.Encoding]::UTF8)
 $dashboardDetailsUpdater = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\update_dashboard_calculation_details.ps1'),[Text.Encoding]::UTF8)
+$dashboardMonthSelector = [IO.File]::ReadAllText((Join-Path $agentRoot 'update_dashboard_month_selector.ps1'),[Text.Encoding]::UTF8)
+$trafficSuggestion = [IO.File]::ReadAllText((Join-Path $agentRoot 'send_daily_traffic_suggestion.ps1'),[Text.Encoding]::UTF8)
+$trafficSuggestionRules = [IO.File]::ReadAllText((Join-Path $agentRoot 'traffic_suggestion_rules.json'),[Text.Encoding]::UTF8) | ConvertFrom-Json
 $replenishmentProductNameUpdater = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\ensure_replenishment_product_name.ps1'),[Text.Encoding]::UTF8)
 $orderExtractor = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\meituan_order_extract.mjs'),[Text.Encoding]::UTF8)
 $orderSync = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\sync_meituan_orders.ps1'),[Text.Encoding]::UTF8)
+$orderItemIdentityMappings = [IO.File]::ReadAllText((Join-Path $agentRoot 'order_item_identity_mappings.json'),[Text.Encoding]::UTF8) | ConvertFrom-Json
 $refundAdjustments = [IO.File]::ReadAllText((Join-Path $agentRoot 'refund_adjustments.ps1'),[Text.Encoding]::UTF8)
 $orderActualOverrides = [IO.File]::ReadAllText((Join-Path $agentRoot 'order_actual_overrides.ps1'),[Text.Encoding]::UTF8)
 $inventoryExporter = [IO.File]::ReadAllText((Join-Path $projectRoot 'work\meituan_inventory_export.mjs'),[Text.Encoding]::UTF8)
@@ -155,6 +159,7 @@ $contracts = [ordered]@{
     incomplete_orders_validate_quantity_sum = ($orderSync -match 'Measure-Object -Property quantity -Sum' -and $orderSync -match 'expectedItemCount')
     incomplete_orders_fail_before_sheet_read = ($orderSync.IndexOf('$incompleteOrders') -lt $orderSync.IndexOf("Get-SheetRows '订单汇总'"))
     system_powershell_resolver_avoids_pshome = ($runtimePaths -match 'System32\\WindowsPowerShell\\v1\.0\\powershell\.exe' -and $runtimePaths -notmatch '\$PSHOME')
+    runtime_paths_fall_back_to_userprofile = ($runtimePaths -match 'function Get-PetstarUserProfile' -and $runtimePaths -match "GetFolderPath\('UserProfile'\)" -and $runtimePaths -match 'if \(-not \$userProfile\) \{ \$userProfile = \[string\]\$env:USERPROFILE \}' -and $runtimePaths -match 'function Get-PetstarPython \{\s*\$userProfile = Get-PetstarUserProfile' -and $runtimePaths -match 'function Get-PetstarWebAccessCheck \{\s*\$userProfile = Get-PetstarUserProfile')
     production_scripts_do_not_assume_pshome_powershell = (-not (($runtimePowerShellFiles | Where-Object { $_.Name -notlike 'test_*' } | ForEach-Object { [IO.File]::ReadAllText($_.FullName,[Text.Encoding]::UTF8) }) -match '\$PSHOME'))
     child_script_failure_preserves_detail = ($scheduledSync -match '2>&1' -and $scheduledSync -match '子脚本未返回错误详情' -and $orderSync -match 'throw \$originalError' -and $orderSync -notmatch '(?m)^\s*trap\s*\{')
     codex_query_uses_system_powershell = ($codexBridge -match 'WINDOWS_POWERSHELL' -and $codexBridge -notmatch 'command = \[\s*"powershell\.exe"')
@@ -217,6 +222,12 @@ $contracts = [ordered]@{
     targeted_sku_cost_requires_order_and_month_scope = ($setSkuCostBlock -match '订单 \$OrderNo 中找不到' -and $financeEvent -match '\$Action -eq ''SetSkuCost'' -and \$null -ne \$explicitHistoricalOrderDate' -and $financeEvent -match 'Invoke-DailyLedgerSync \$explicitHistoricalOrderDate')
     targeted_offline_cost_uses_internal_order_id_and_recomputes_profit = ($setSkuCostBlock -match "\^OFF-\\d\{8\}" -and $setSkuCostBlock -match "Get-SheetRows '线下订单'" -and $setSkuCostBlock -match 'newOfflineProfit' -and $setSkuCostBlock -match 'masterCostWillChange' -and $setSkuCostBlock -match 'historical_order_type=\$historicalOrderType' -and $bridge -match "historical_order_type -eq 'offline'")
     order_sync_moves_cost_snapshot_with_item_identity = ($orderSync -match 'Get-OrderItemSnapshotKey' -and $orderSync -match 'Take-CostSnapshotFromQueue' -and $orderSync -match 'Set-CellMatrix ''订单商品'' "L2:N\$itemsLastRow"')
+    order_item_manual_identity_mapping_is_strict_and_persistent = (
+        @($orderItemIdentityMappings.mappings | Where-Object { $_.goods_code -eq 'kw1067' -and $_.spec -eq '10袋起购优惠价格' -and $_.product_id -eq '51180542118' }).Count -eq 1 -and
+        $orderSync -match 'Resolve-ManualOrderItemIdentity' -and
+        $orderSync -match 'if \(\(\[string\]\$GoodsCode\)\.Trim\(\)\) \{ return \$null \}' -and
+        $orderSync -match '\$effectiveGoodsCode = if'
+    )
     scheduled_sync_initializes_only_targeted_order_costs = ($orderSync -match 'changed_order_nos' -and $scheduledSync -match 'Get-TargetedOrderNumbers' -and $scheduledSync -match 'Invoke-CostSnapshotRebuild \$targetedOrderNumbers \$true')
     order_sync_detects_business_changes_before_writing = ($orderSync -match 'Get-RecordsFingerprint' -and $orderSync -match '\$dataChanged = \[bool\]\$Initialize -or \$summaryChanged -or \$itemsChanged -or \$interventionsChanged' -and $orderSync -match 'if \(\$dataChanged\)[\s\S]{0,500}Set-CellMatrix ''订单汇总''')
     ordinary_no_change_sync_skips_writes = ($scheduledSync -match "SyncMode -notin @\('midday','reminder','night','manual'\)" -and $scheduledSync -match 'OrderSyncResult\.data_changed -eq \$false' -and $scheduledSync -match '00:00 仅执行本月只读审计')
@@ -242,6 +253,29 @@ $contracts = [ordered]@{
     dashboard_uses_current_cost_inventory_and_compact_metrics = ($simpleFinanceBuilder -match '\(D\{r\}\+IFERROR\(M\{r\}\*1,0\)\)\*H\{r\}' -and $simpleFinanceBuilder -match 'SKU成本主表.+G.2.+G.3000' -and $simpleFinanceBuilder -notmatch '本月经济利润.+\$null' -and $dashboardPaymentRepair -match 'october_purchase_amount' -and $dashboardPaymentRepair -match 'Invoke-FinanceTransactionRollback')
     dashboard_gross_profit_includes_promotion_once = ($simpleFinanceBuilder -match '平台推广费用' -and $simpleFinanceBuilder -match '\$promotionExpenseExpression' -and $simpleFinanceBuilder -match "'=C4-C5-\('" -and $simpleFinanceBuilder -match "'=C6-\('" -and $financeEvent -match 'promotion_total' -and $ledgerSync -match '平台推广费用回读失败')
     dashboard_calculation_details_are_targeted_and_verified = ($dashboardDetailsUpdater -match "detailFormulas = @\{" -and $dashboardDetailsUpdater -match '6 = ' -and $dashboardDetailsUpdater -match '7 = ' -and $dashboardDetailsUpdater -match '9 = ' -and $dashboardDetailsUpdater -match '10 = ' -and $dashboardDetailsUpdater -match "D6:D7" -and $dashboardDetailsUpdater -match "D9:D10" -and $dashboardDetailsUpdater -match "计算明细.*解释" -and $dashboardDetailsUpdater -match 'Invoke-FinanceTransactionRollback')
+    dashboard_month_selector_is_verified_and_preserves_current_notifications = (
+        $dashboardMonthSelector -match 'DATE\(VALUE\(LEFT\(\$I\$1,4\)\),VALUE\(RIGHT\(\$I\$1,2\)\),1\)' -and
+        $dashboardMonthSelector -match "range 'I1:I1'" -and
+        $dashboardMonthSelector -match "range 'J:J'" -and
+        $dashboardMonthSelector -match "C2:C10" -and
+        $dashboardMonthSelector -match "J2:J2" -and
+        $scheduledSync -match "Get-SheetRows '驾驶舱' 'J1:J2'" -and
+        $simpleFinanceBuilder -match 'dashboardSelectedMonthExpression' -and
+        $simpleFinanceBuilder -match 'systemCurrentGrossProfitFormula'
+    )
+    daily_traffic_suggestion_is_in_stock_rotation_not_sales_gate = (
+        $scheduledTaskInstaller -match "Name='Petstar-Traffic-Suggestion'.+At='10:00'" -and
+        $scheduledJob -match "'TrafficSuggestion'" -and
+        $trafficSuggestion -match '\$stock -le 0' -and
+        $trafficSuggestion -match 'recent_natural' -and
+        $trafficSuggestion -match '\$fallbackCandidates' -and
+        $trafficSuggestion -match 'suggestion already sent' -and
+        $trafficSuggestion -match '\+messages-send' -and
+        $trafficSuggestion -notmatch 'sync_meituan|修改库存|评价订单|创建订单' -and
+        [string]$trafficSuggestionRules.recent_sales_note -match '不作为是否推荐的门槛' -and
+        [string]$trafficSuggestionRules.fallback_keyword -eq '宠物用品' -and
+        @($trafficSuggestionRules.rules).Count -ge 5
+    )
     cost_book_quantity_correction_is_atomic_with_replenishment = ($financeEvent -match 'SetCostBookQuantity' -and $financeEvent -match '批量 SKU 维护不支持动作' -and $financeEvent -match '成本账数量由' -and $financeEvent -match 'historical_orders_changed=\$false' -and $codexBridge -match '先生成 SetCostBookQuantity，再生成对应 Replenishment' -and $bridge -match '成本账数量')
     replenishment_product_name_is_identity_mapped_and_verified = ($replenishmentProductNameUpdater -match "MATCH\(O\$\{RowNumber\},'SKU成本主表'!" -and $replenishmentProductNameUpdater -match "VLOOKUP\(B\$\{RowNumber\},'SKU成本主表'!" -and $replenishmentProductNameUpdater -match "range 'U1:U1'" -and $replenishmentProductNameUpdater -match 'formula-verify' -and $replenishmentProductNameUpdater -match 'Invoke-FinanceTransactionRollback' -and $financeEvent -match 'U2:U1001')
     confirmed_writes_wait_for_running_sync = ($financeTransaction -match 'LockTimeoutSeconds' -and $bridge -match 'Invoke-StoredConfirmationOperations \$pending \$executeEvent 5' -and $bridge -match "Mode', 'RetryPending'" -and $bridge -match 'Invoke-StoredConfirmationOperations \$pending \$executeEvent 2700')

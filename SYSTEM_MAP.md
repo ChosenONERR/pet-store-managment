@@ -38,6 +38,11 @@ Windows 计划任务
   -> agent/run_scheduled_job.ps1
   -> agent/run_sync_and_notify.ps1
   -> 美团只读提取 + 订单/成本/简账同步 + 完整性校验 + 飞书通知
+
+每天 10:00
+  -> agent/send_daily_traffic_suggestion.ps1
+  -> 最新库存快照 + 最近 30 天自然订单（仅作参考）
+  -> 飞书私聊一条“引流款运营建议”
 ```
 
 同步采用三级路径：每小时只处理变化订单；每天 00:00 回看最近 7 天退款、核对全部有效补单，并只修相关订单/月份；每周一 00:00（周日晚结束后）先做全历史只读审计，只有审计失败或显式 `--full-rebuild` 才允许全量重建。证据不完整时停止写入并告警，不得自动扩大范围。普通补货只更新补货记录和 SKU 当前成本，不能自动倒改历史订单和简账。
@@ -49,7 +54,7 @@ Windows 计划任务
 | 功能 | 主入口 | 读取/写入范围 | 使用说明 |
 |---|---|---|---|
 | 飞书对话记账 | `agent/lark_event_bridge.ps1`、`agent/codex_chat_bridge.py`、`agent/record_finance_event.ps1` | 读飞书消息；确认后写指定经营表 | 所有修改先预览，用户回复“确认”后原子执行；同一消息内多笔普通补货使用批量原子路径；店主明确纠正补货前成本账数量时，先执行 `SetCostBookQuantity` 再执行对应补货，整组原子确认，纠正值只作为移动平均成本旧数量，不修改美团库存、历史订单或简账；明确指定线下历史单修正 SKU 成本时，按只读查询返回的 `OFF-` 订单编号唯一定位，并原子重算该线下单成本/利润及所属月份；若用户给出的成本与 SKU 主表当前成本一致，则主表完全不动，只修目标线下单，不要求伪造平台订单号；同一待确认项先改 SKU 成本再登记线下单时，预演按前序新成本计算后续线下单；补充说明若没有形成可执行动作则保留原待确认计划，旧版遗留的零操作空计划会自动清除并按当前消息重建；Codex 在普通回答或待确认预览阶段返回 429 时，原消息都保持未完成并按 1—15 分钟递增冷却，由看门狗重放自动恢复，飞书只发送幂等的延后提示；Lark CLI 1.0.98 下公式区域拆开逐一校验 |
-| 美团订单同步 | `work/sync_meituan_orders.ps1`、`work/meituan_order_extract.mjs` | 美团只读；写订单汇总/商品/干预数据 | 绑定唯一 Chrome 店铺；每次抓取及失败重试先回到第 1 页再完整分页；退款状态区分处理中/已完成/已关闭/无法识别，处理中或证据不足时不改账、保留观察结果并飞书提醒，后续同步继续追踪；公式校验使用 Lark CLI 1.0.98 支持的连续区域；每次按完整订单号用已存订单汇总/商品自愈历史干预单自动字段；不得修改美团订单或库存 |
+| 美团订单同步 | `work/sync_meituan_orders.ps1`、`work/meituan_order_extract.mjs`、`agent/order_item_identity_mappings.json` | 美团只读；写订单汇总/商品/干预数据 | 绑定唯一 Chrome 店铺；每次抓取及失败重试先回到第 1 页再完整分页；退款状态区分处理中/已完成/已关闭/无法识别，处理中或证据不足时不改账、保留观察结果并飞书提醒，后续同步继续追踪；店主确认“同商品其他规格未设置货号”后，可按商品名＋规格严格映射当前 KW/商品 ID，仅在平台货号为空时启用；公式校验使用 Lark CLI 1.0.98 支持的连续区域；每次按完整订单号用已存订单汇总/商品自愈历史干预单自动字段；不得修改美团订单或库存 |
 | 美团库存同步 | `work/sync_meituan_inventory.ps1`、`work/meituan_inventory_export.mjs` | 美团只读导出；写库存相关飞书表 | 导出器默认字段保持稳定，附加字段通过环境变量请求 |
 | 成本与利润 | `agent/rebuild_cost_snapshots.ps1` | 写订单成本快照和公式结果 | 历史快照默认冻结；只有明确指定订单才改历史成本；Lark CLI 1.0.98 下将多个公式区域拆开逐一校验 |
 | 每日经营简账 | `agent/sync_daily_ledger.ps1` | 写月份收入/支出及驾驶舱来源数据；必要时把旧月表孤立的人工配送费原子归一到订单汇总 | 新单、退款、补单和赠品变化只刷新受影响月份；配送费来源分叉可安全自愈；补单平台扣款未知时留空并标记待识别；Lark CLI 1.0.98 下非连续公式区域逐一校验，禁止写成0或因校验参数格式回滚有效数据 |
@@ -60,6 +65,8 @@ Windows 计划任务
 | 赠品与干预单 | `agent/reconcile_pending_gifts.ps1`、`agent/intervention_record.ps1`、`agent/record_finance_event.ps1` | 写赠品、干预订单及其关联订单成本/月份 | 赠品成本计入订单成本，缺成本保持待确认；新增、撤销干预单及指定订单的履约/退款状态修改只调用订单级增量成本刷新，只写该订单、实际涉及的 SKU 行及所属月份，禁止为单笔确认重写 `SKU成本主表` 整列或刷新无关月份 |
 | 经营数据查询 | `agent/query_business_data.ps1` | 只读飞书 | 供 Codex 回答经营、库存和待确认问题，禁止写入；SKU 查询返回绑定“主表行号＋美团商品ID”的内部 `action_code`，货号重复时必须用它安全定位，禁止裸商品ID或重复KW猜行 |
 | 定时任务 | `agent/configure_petstar_scheduled_tasks.ps1` | 修改 Windows 计划任务（仅 `-Apply`） | 默认只预览；新电脑必须显式安装 |
+| 驾驶舱月份选择 | `agent/update_dashboard_month_selector.ps1` | 写驾驶舱 `H1:I1` 月份选择、相关月度公式；`J` 列保存并隐藏系统当前月毛利 | 用户可切换历史月份；库存/同步状态仍显示当前值；定时通知始终读取隐藏的当前月毛利，不受用户选择影响；月份选项只在跨月时维护 |
+| 每日引流款运营建议 | `agent/send_daily_traffic_suggestion.ps1`、`agent/traffic_suggestion_rules.json` | 只读最新库存快照和最近 30 天自然订单；仅写本地去重历史并向当前授权用户发飞书私聊 | 每天 10:00 固定推荐一个库存大于 0 且售卖中的商品；按关键词品类轮换，近期自然销量只显示为参考，不能作为是否推荐的门槛；只建议标题、主图、折扣价、库存和推广状态等正常运营动作，不创建订单、不评价、不改库存 |
 | 运行守护 | `agent/ensure_lark_event_bridge.ps1`、`agent/run_hidden_watchdog.vbs` | 管理本地进程；只读检查当前 Chrome/CDP 实例 | 每 5 分钟保持消息桥常驻、修复失联 CDP 代理；新 Chrome 实例只主动触发一次 Allow，授权恢复后自动补跑一次整点同步（夜间失败则补跑夜间恢复）；全程隐藏黑色窗口，不修改美团数据 |
 | 美团在售 KW 折扣价导出 | `work/meituan_inventory_export.mjs`、`work/inspect_meituan_product_export_fields.mjs` | 美团商品页只读；本地生成 Excel | 导出时设置 `MEITUAN_EXPORT_EXTRA_FIELDS=price,discount_price_view`；折扣价为空才回退原价；多规格分行；非 KW 进入核对清单 |
 
@@ -83,6 +90,9 @@ Windows 计划任务
 | `agent/codex_response_schema.json` | Codex 动作协议的 JSON Schema |
 | `agent/configure_hidden_gateway_startup.ps1` | 预览/配置 Hermes Gateway 隐藏启动 |
 | `agent/configure_petstar_scheduled_tasks.ps1` | 预览/安装宠速星 Windows 计划任务 |
+| `agent/send_daily_traffic_suggestion.ps1` | 每天 10:00 读取库存和近期自然销量，按关键词品类轮换生成一条简洁的引流款运营建议并私聊店主；同一天幂等，不连接美团、不修改经营表 |
+| `agent/traffic_suggestion_rules.json` | 引流款关键词、标题匹配/排除词和合规运营动作配置；不包含订单创建、评价或销量干预动作 |
+| `agent/update_dashboard_month_selector.ps1` | 幂等维护驾驶舱历史月份下拉和公式；默认保留用户当前选择，跨月只扩充选项；隐藏辅助列保存系统当前月毛利供定时通知使用 |
 | `agent/ensure_lark_event_bridge.ps1` | 五分钟看门狗、消息重放、修复孤儿事件消费者，并提前检查 Chrome/CDP；代理死亡时后台重启，当前实例完成 Allow 后自动启动一次隐藏补跑；已有同步运行时不重复启动 |
 | `agent/finance_transaction.ps1` | 财务写入互斥、before-image、提交与回滚 |
 | `agent/hermes_chat_bridge.py` | 旧 Hermes 对话入口兼容层；新链路优先使用 Codex bridge |
@@ -90,6 +100,7 @@ Windows 计划任务
 | `agent/lark_cli_noexit.ps1` | Lark CLI 包装，保留原退出码且不结束宿主进程 |
 | `agent/lark_event_bridge.ps1` | 飞书事件长连接、去重、待确认队列和回执发送；普通成本账数量纠正与同条消息内补货合并预演、一次确认和原子执行；待确认补充未生成动作时不得覆盖原计划，历史零操作空计划会在下条消息进入时自动丢弃；Codex 普通调用或嵌套预览限流时均保留原消息供后台重放，并发送不泄露内部错误的幂等延后提示；所有回执返回值必须被抑制，禁止污染消息处理布尔状态 |
 | `agent/order_actual_overrides.ps1` | 保存订单实际商品、配送方式等人工覆盖 |
+| `agent/order_item_identity_mappings.json` | 保存店主已确认的“平台无货号规格→当前KW/美团商品ID”严格映射；只有商品名和规格同时匹配且平台货号为空时生效，不保存价格、成本、登录态或密钥 |
 | `agent/petstar_cli.py` | 统一命令行入口和参数分发 |
 | `agent/query_business_data.ps1` | 只读查询飞书经营数据 |
 | `agent/README.md` | Agent 部署、运行、排障说明 |
@@ -100,11 +111,11 @@ Windows 计划任务
 | `agent/run_hidden_gateway.vbs` | 无窗口启动 Gateway |
 | `agent/run_hidden_scheduled_job.vbs` | 无窗口运行计划任务并返回真实退出码 |
 | `agent/run_hidden_watchdog.vbs` | 无窗口运行消息桥看门狗 |
-| `agent/run_scheduled_job.ps1` | 计划任务统一入口；启动子任务前清除 Hermes/OpenClaw/Lark Channel 工作区路由标记，并固定使用当前 Windows 用户的 `~/.lark-cli` 授权目录，避免后台误读隔离工作区凭据；不复制或保存 OAuth token |
+| `agent/run_scheduled_job.ps1` | 计划任务统一入口；除同步/日结外，分发每天 10:00 引流款运营建议，并在日结后按月维护驾驶舱月份选项；启动子任务前清除 Hermes/OpenClaw/Lark Channel 工作区路由标记，并固定使用当前 Windows 用户的 `~/.lark-cli` 授权目录，避免后台误读隔离工作区凭据；不复制或保存 OAuth token |
 | `agent/authorize_lark_desktop.ps1` | 从普通 Windows 桌面/计划任务上下文发起一次飞书设备授权，并在同一上下文完成轮询和验证；仅在系统误把授权写入隔离注册表时人工运行，临时请求文件只含短期授权链接和 device code，不记录 token，禁止作为常驻任务 |
 | `agent/run_sync_and_notify.ps1` | 分阶段同步、事务、审计和飞书通知主编排；每小时轻量同步，00:00 复核补单/近期退款并仅刷新受影响月份；平台退款处理中或识别不清时发送按状态去重的飞书提醒并继续追踪，不触发无关重算；Chrome 新实例未 Allow 时明确提示“实例授权”而非笼统代理故障，成功同步后清除待补跑标记；飞书凭证只读探针成功后再读取 SKU 表头，表头读取受统一重试、运行记录和失败通知保护，电脑离线后重新开机可在后续计划任务自动恢复；适配 Lark CLI 1.0.98，将逗号分隔的公式范围逐个按连续区域校验；成本快照子脚本失败时保留具体错误详情；安全诊断只记录 Windows Lark 凭据注册表是否存在及条目数，不读取或输出 token 内容 |
 | `agent/run_weekly_maintenance.ps1` | 每周全历史只读审计；仅审计失败时触发原子化全量重建；不可作为普通同步入口 |
-| `agent/runtime_paths.ps1` | 解析 Python、PowerShell、Lark CLI 等本机路径 |
+| `agent/runtime_paths.ps1` | 解析 Python、PowerShell、Lark CLI 和 web-access 等本机路径；服务账户取不到 Windows Shell 用户目录时回退到继承的 `USERPROFILE`，仍缺失则在外部读取/写入前停止 |
 | `agent/sku_master_schema.ps1` | SKU 主表字段、规范化和安全访问函数 |
 | `agent/start_hidden_gateway.ps1` | 隐藏启动 Gateway 的 PowerShell 包装 |
 | `agent/sync_daily_ledger.ps1` | 同步月收入、月支出、格式和驾驶舱来源数据；在同一事务内自愈“旧月表有人工配送费但订单汇总为 0”的遗留分叉；公式校验逐个连续区域执行 |
@@ -221,6 +232,7 @@ Windows 计划任务
 | `work/test_gift_order_formula.ps1` | 赠品成本计入订单利润 |
 | `work/test_lark_event_bridge.ps1` | 飞书事件去重、待确认和重放 |
 | `work/test_pending_gifts.ps1` | 未知赠品成本保持待确认 |
+| `work/test_runtime_reliability.ps1` | 核心运行时契约；同时验证平台无货号规格映射必须严格、持久且不得覆盖平台已有货号 |
 | `work/test_replenishment_product_name.ps1` | 补货商品名按商品 ID 优先、货号兜底，自定义标题优先及事务/公式安全性 |
 | `work/test_sku_master_schema_safety.ps1` | SKU 主表字段访问和列变化安全性 |
 | `work/test_sync_new_skus.ps1` | 新 SKU 发现、重复拦截和写入 |

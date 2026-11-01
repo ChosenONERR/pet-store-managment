@@ -101,14 +101,15 @@ $settlementHeaderRows = (Get-Rows $sourceToken '月度结算' 'N1:N1' '读取月
 $currentSettlementHeader = if ($settlementHeaderRows.Count -gt 0) { [string](Get-CellValue $settlementHeaderRows[0] 0) } else { '' }
 if ($currentSettlementHeader -and $currentSettlementHeader -ne '平台推广费用') { throw "月度结算 N1 已有其他内容：$currentSettlementHeader" }
 
-$deliveryExpenseExpression = 'SUMIFS(''订单汇总''!$J$2:$J$2001,''订单汇总''!$A$2:$A$2001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''订单汇总''!$A$2:$A$2001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''订单汇总''!$E$2:$E$2001,"自然",''订单汇总''!$D$2:$D$2001,"<>已取消")+SUMIFS(''线下订单''!$E$2:$E$1001,''线下订单''!$A$2:$A$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''线下订单''!$A$2:$A$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))'
-$promotionExpenseExpression = 'SUMIFS(''月度结算''!$N$2:$N$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))'
-$allOperatingExpenseExpression = 'SUMIFS(''月度结算''!$G$2:$G$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))'
+$selectedMonthExpression = 'DATE(VALUE(LEFT($I$1,4)),VALUE(RIGHT($I$1,2)),1)'
+$deliveryExpenseExpression = 'SUMIFS(''订单汇总''!$J$2:$J$2001,''订单汇总''!$A$2:$A$2001,">="&' + $selectedMonthExpression + ',''订单汇总''!$A$2:$A$2001,"<"&EDATE(' + $selectedMonthExpression + ',1),''订单汇总''!$E$2:$E$2001,"自然",''订单汇总''!$D$2:$D$2001,"<>已取消")+SUMIFS(''线下订单''!$E$2:$E$1001,''线下订单''!$A$2:$A$1001,">="&' + $selectedMonthExpression + ',''线下订单''!$A$2:$A$1001,"<"&EDATE(' + $selectedMonthExpression + ',1))'
+$promotionExpenseExpression = 'SUMIFS(''月度结算''!$N$2:$N$25,''月度结算''!$A$2:$A$25,' + $selectedMonthExpression + ')'
+$allOperatingExpenseExpression = 'SUMIFS(''月度结算''!$G$2:$G$25,''月度结算''!$A$2:$A$25,' + $selectedMonthExpression + ')'
 $otherOperatingExpenseExpression = '(' + $allOperatingExpenseExpression + ')-(' + $promotionExpenseExpression + ')'
-$cashReceiptExpression = 'SUMIFS(''月度结算''!$B$2:$B$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))+SUMIFS(''月度结算''!$C$2:$C$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))+SUMIFS(''月度结算''!$D$2:$D$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))+SUMIFS(''月度结算''!$E$2:$E$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))'
-$otherCashExpenseExpression = 'SUMIFS(''月度结算''!$F$2:$F$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))'
-$ownerWithdrawalExpression = 'SUMIFS(''月度结算''!$H$2:$H$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))'
-$beginningCashExpression = 'SUMIFS(''月度结算''!$K$2:$K$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))'
+$cashReceiptExpression = 'SUMIFS(''月度结算''!$B$2:$B$25,''月度结算''!$A$2:$A$25,' + $selectedMonthExpression + ')+SUMIFS(''月度结算''!$C$2:$C$25,''月度结算''!$A$2:$A$25,' + $selectedMonthExpression + ')+SUMIFS(''月度结算''!$D$2:$D$25,''月度结算''!$A$2:$A$25,' + $selectedMonthExpression + ')+SUMIFS(''月度结算''!$E$2:$E$25,''月度结算''!$A$2:$A$25,' + $selectedMonthExpression + ')'
+$otherCashExpenseExpression = 'SUMIFS(''月度结算''!$F$2:$F$25,''月度结算''!$A$2:$A$25,' + $selectedMonthExpression + ')'
+$ownerWithdrawalExpression = 'SUMIFS(''月度结算''!$H$2:$H$25,''月度结算''!$A$2:$A$25,' + $selectedMonthExpression + ')'
+$beginningCashExpression = 'SUMIFS(''月度结算''!$K$2:$K$25,''月度结算''!$A$2:$A$25,' + $selectedMonthExpression + ')'
 $grossProfitFormula = '=C4-C5-(' + $deliveryExpenseExpression + ')-(' + $promotionExpenseExpression + ')'
 $operatingProfitFormula = '=C6-(' + $otherOperatingExpenseExpression + ')'
 $detailFormulas = @{

@@ -15,6 +15,7 @@ if (-not (Test-Path -LiteralPath $wscript -PathType Leaf)) { throw "Windows Scri
 
 $specs = @(
     [ordered]@{Name='Petstar-Hourly-Sync';Job='Hourly';At='09:00-22:00 hourly';Schedule='Hourly'},
+    [ordered]@{Name='Petstar-Traffic-Suggestion';Job='TrafficSuggestion';At='10:00';Schedule='Daily'},
     [ordered]@{Name='Petstar-Input-Reminder';Job='Reminder';At='23:00';Schedule='Daily'},
     [ordered]@{Name='Petstar-Promotion-Expense';Job='Promotion';At='23:55';Schedule='Daily'},
     [ordered]@{Name='Petstar-Night-Sync';Job='Night';At='00:00';Schedule='Weekly';Days=@('Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday')},

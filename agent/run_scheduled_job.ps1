@@ -1,6 +1,6 @@
 ﻿param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Hourly','Reminder','Promotion','Night','Weekly','NightRecovery')]
+    [ValidateSet('Hourly','TrafficSuggestion','Reminder','Promotion','Night','Weekly','NightRecovery')]
     [string]$Job,
     [string]$ProjectRoot
 )
@@ -30,6 +30,8 @@ $powershellExe = Get-PetstarWindowsPowerShell
 $syncScript = Join-Path $PSScriptRoot 'run_sync_and_notify.ps1'
 $promotionScript = Join-Path $PSScriptRoot 'sync_promotion_expense.ps1'
 $weeklyScript = Join-Path $PSScriptRoot 'run_weekly_maintenance.ps1'
+$trafficSuggestionScript = Join-Path $PSScriptRoot 'send_daily_traffic_suggestion.ps1'
+$dashboardMonthScript = Join-Path $PSScriptRoot 'update_dashboard_month_selector.ps1'
 $statePath = Join-Path $ProjectRoot 'agent\state\last_run.json'
 
 function Invoke-Script([string]$Path, [string[]]$Arguments) {
@@ -43,6 +45,9 @@ switch ($Job) {
     'Hourly' {
         Invoke-Script $syncScript @('-Date',$today.ToString('yyyy-MM-dd'),'-Mode','midday','-SkipInventory','-Silent','-ProjectRoot',$ProjectRoot)
     }
+    'TrafficSuggestion' {
+        Invoke-Script $trafficSuggestionScript @('-Date',$today.ToString('yyyy-MM-dd'),'-ProjectRoot',$ProjectRoot)
+    }
     'Reminder' {
         Invoke-Script $syncScript @('-Date',$today.ToString('yyyy-MM-dd'),'-Mode','reminder','-SkipInventory','-ProjectRoot',$ProjectRoot)
     }
@@ -52,6 +57,7 @@ switch ($Job) {
     'Night' {
         $targetDate = $today.AddDays(-1).ToString('yyyy-MM-dd')
         Invoke-Script $syncScript @('-Date',$targetDate,'-Mode','night','-ProjectRoot',$ProjectRoot)
+        Invoke-Script $dashboardMonthScript @('-ProjectRoot',$ProjectRoot)
     }
     'Weekly' {
         # 周一 00:00 即周日晚结束后：先完成周日常规日结，再做全历史只读审计。
@@ -59,6 +65,7 @@ switch ($Job) {
         $targetDate = $today.AddDays(-1).ToString('yyyy-MM-dd')
         Invoke-Script $syncScript @('-Date',$targetDate,'-Mode','night','-ProjectRoot',$ProjectRoot)
         Invoke-Script $weeklyScript @('-Date',$targetDate,'-ProjectRoot',$ProjectRoot)
+        Invoke-Script $dashboardMonthScript @('-ProjectRoot',$ProjectRoot)
     }
     'NightRecovery' {
         $targetDate = $today.AddDays(-1).ToString('yyyy-MM-dd')

@@ -16,6 +16,7 @@ if (-not $NaturalOrdersPath) { $NaturalOrdersPath = Join-Path $WorkRoot 'initial
 if (-not $InterventionOrdersPath) { $InterventionOrdersPath = Join-Path $WorkRoot 'intervention_orders.json' }
 $metaPath = Join-Path $WorkRoot 'simple_finance_meta.json'
 $extractorPath = Join-Path $WorkRoot 'meituan_order_extract.mjs'
+$orderItemIdentityMapPath = Join-Path $projectRoot 'agent\order_item_identity_mappings.json'
 if (-not (Test-Path -LiteralPath $metaPath)) { throw '缺少简版工作簿元数据' }
 if (-not (Test-Path -LiteralPath $extractorPath)) { throw '缺少美团订单提取脚本' }
 
@@ -340,6 +341,48 @@ function Normalize-ProductText([string]$Value) {
     return ([regex]::Replace($text, '[\s\p{P}\p{S}]+', ''))
 }
 
+function Get-ManualOrderItemIdentityKey([string]$Name, [string]$Spec) {
+    $normalizedName = [regex]::Replace(([string]$Name).Trim().ToLowerInvariant(), '[\s\p{P}\p{S}]+', '')
+    $normalizedSpec = [regex]::Replace(([string]$Spec).Trim().ToLowerInvariant(), '[\s\p{P}\p{S}]+', '')
+    return "$normalizedName|$normalizedSpec"
+}
+
+$manualOrderItemIdentityByKey = @{}
+if (Test-Path -LiteralPath $orderItemIdentityMapPath) {
+    $manualIdentityConfig = [System.IO.File]::ReadAllText($orderItemIdentityMapPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+    foreach ($mapping in @($manualIdentityConfig.mappings)) {
+        $title = [string]$mapping.title
+        $spec = [string]$mapping.spec
+        $goodsCode = ([string]$mapping.goods_code).Trim().ToLowerInvariant()
+        $productId = ([string]$mapping.product_id).Trim()
+        if (-not $title -or -not $spec -or $goodsCode -notmatch '^kw\d+$' -or -not $productId) {
+            throw '订单商品人工身份映射配置不完整'
+        }
+        if (-not $skuCodeToKw.ContainsKey($goodsCode) -or $skuCodeToKw[$goodsCode] -ne $goodsCode) {
+            throw "订单商品人工身份映射的货号无法唯一定位：$goodsCode"
+        }
+        if ($skuCodeToProductId.ContainsKey($goodsCode) -and [string]$skuCodeToProductId[$goodsCode] -ne $productId) {
+            throw "订单商品人工身份映射的商品ID与SKU主表不一致：$goodsCode"
+        }
+        $key = Get-ManualOrderItemIdentityKey $title $spec
+        if (-not $key -or $key -eq '|' -or $manualOrderItemIdentityByKey.ContainsKey($key)) {
+            throw "订单商品人工身份映射重复或无效：$title / $spec"
+        }
+        $manualOrderItemIdentityByKey[$key] = [pscustomobject]@{
+            goods_code = $goodsCode
+            product_id = $productId
+        }
+    }
+}
+
+function Resolve-ManualOrderItemIdentity([string]$GoodsCode, [string]$Name, [string]$Spec) {
+    # 平台已返回货号时始终尊重平台数据；人工映射只补足“同商品其他规格未设置货号”的场景。
+    if (([string]$GoodsCode).Trim()) { return $null }
+    $key = Get-ManualOrderItemIdentityKey $Name $Spec
+    if ($manualOrderItemIdentityByKey.ContainsKey($key)) { return $manualOrderItemIdentityByKey[$key] }
+    return $null
+}
+
 $inventoryCandidates = @{}
 foreach ($row in (Get-SheetRows '库存快照' 'B2:O2000')) {
     $productId = Get-CellValue $row 12
@@ -404,7 +447,9 @@ function Resolve-KwCode([string]$GoodsCode) {
 function Format-InterventionContents($Items) {
     $quantityByKw = [ordered]@{}
     foreach ($item in @($Items)) {
-        $kw = Resolve-KwCode ([string]$item.goodsCode)
+        $manualIdentity = Resolve-ManualOrderItemIdentity ([string]$item.goodsCode) ([string]$item.name) ([string]$item.spec)
+        $effectiveCode = if ($null -ne $manualIdentity) { [string]$manualIdentity.goods_code } else { [string]$item.goodsCode }
+        $kw = Resolve-KwCode $effectiveCode
         if (-not $kw) { continue }
         $quantity = if ($null -eq $item.quantity) { 0.0 } else { [double]$item.quantity }
         if (-not $quantityByKw.Contains($kw)) { $quantityByKw[$kw] = 0.0 }
@@ -601,10 +646,12 @@ foreach ($order in @($extract.orders)) {
     $remainingReturned = @{}
     foreach ($entry in $refundAccounting.returned_quantity_by_code.GetEnumerator()) { $remainingReturned[[string]$entry.Key] = [double]$entry.Value }
     foreach ($item in $effectiveItems) {
-        $normalizedCode = $(if ($null -ne $actualOverride) { ([string]$item.goods_code).Trim().ToLowerInvariant() } else { ([string]$item.goodsCode).Trim().ToLowerInvariant() })
         $itemName = $(if ($null -ne $actualOverride) { [string]$item.title } else { [string]$item.name })
         $itemSpec = [string]$item.spec
-        $itemProductId = $(if ($null -ne $actualOverride) { [string]$item.product_id } else { Resolve-ProductId ([string]$item.goodsCode) ([string]$item.name) ([string]$item.spec) })
+        $manualIdentity = if ($null -eq $actualOverride) { Resolve-ManualOrderItemIdentity ([string]$item.goodsCode) $itemName $itemSpec } else { $null }
+        $effectiveGoodsCode = if ($null -ne $actualOverride) { [string]$item.goods_code } elseif ($null -ne $manualIdentity) { [string]$manualIdentity.goods_code } else { [string]$item.goodsCode }
+        $normalizedCode = $effectiveGoodsCode.Trim().ToLowerInvariant()
+        $itemProductId = $(if ($null -ne $actualOverride) { [string]$item.product_id } elseif ($null -ne $manualIdentity) { [string]$manualIdentity.product_id } else { Resolve-ProductId $effectiveGoodsCode $itemName $itemSpec })
         $snapshotKey = Get-OrderItemSnapshotKey ([string]$order.orderNo) $itemProductId $normalizedCode $itemName $itemSpec
         $fallbackSnapshotKey = Get-OrderItemFallbackKey ([string]$order.orderNo) $normalizedCode $itemName $itemSpec
         $priorSnapshot = Take-CostSnapshotFromQueue $existingCostSnapshots @($snapshotKey,$fallbackSnapshotKey)
@@ -621,7 +668,7 @@ foreach ($order in @($extract.orders)) {
         }
         $itemRecords += [pscustomobject]@{
             OrderDate = [string]$order.orderDate; Platform = '美团'; OrderNo = [string]$order.orderNo; Status = $itemStatus
-            GoodsCode = $(if ($null -ne $actualOverride) { [string]$item.goods_code } else { [string]$item.goodsCode }); Name = $itemName; Spec = $itemSpec; Quantity = $item.quantity
+            GoodsCode = $effectiveGoodsCode; Name = $itemName; Spec = $itemSpec; Quantity = $item.quantity
             UnitPrice = $(if ($null -ne $actualOverride) { [double]$item.unit_price } else { $item.unitPrice })
             UnitCost = $(if ($null -ne $priorSnapshot) { $priorSnapshot.UnitCost } else { $null })
             ItemCost = $(if ($null -ne $priorSnapshot) { $priorSnapshot.ItemCost } else { $null })
