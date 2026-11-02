@@ -254,15 +254,43 @@ function Convert-DateDisplayToSerial($Value) {
     return Convert-ToExcelSerial $match.Groups[1].Value $timeText
 }
 
-try {
-$global:LASTEXITCODE = 0
-$extractLines = @(& node $extractorPath --start $StartDate --end $EndDate 2>&1 | ForEach-Object { [string]$_ })
-if ($LASTEXITCODE -ne 0) {
-    $detail = ($extractLines -join ' ').Trim()
-    if ($detail.Length -gt 1500) { $detail = $detail.Substring(0, 1500) }
-    throw "美团订单提取失败：$detail"
+function Invoke-MeituanOrderExtractorRange([string]$RangeStart,[string]$RangeEnd) {
+    $start = [datetime]::ParseExact($RangeStart,'yyyy-MM-dd',[Globalization.CultureInfo]::InvariantCulture)
+    $end = [datetime]::ParseExact($RangeEnd,'yyyy-MM-dd',[Globalization.CultureInfo]::InvariantCulture)
+    if ($end.Date -lt $start.Date) { throw '订单同步结束日期不能早于开始日期' }
+
+    $orders = [Collections.Generic.List[object]]::new()
+    $chunks = [Collections.Generic.List[object]]::new()
+    $cursor = $start.Date
+    while ($cursor -le $end.Date) {
+        $monthEnd = [datetime]::new($cursor.Year,$cursor.Month,1).AddMonths(1).AddDays(-1)
+        $chunkEnd = if ($monthEnd -lt $end.Date) { $monthEnd } else { $end.Date }
+        $chunkStartText = $cursor.ToString('yyyy-MM-dd')
+        $chunkEndText = $chunkEnd.ToString('yyyy-MM-dd')
+
+        $global:LASTEXITCODE = 0
+        $extractLines = @(& node $extractorPath --start $chunkStartText --end $chunkEndText 2>&1 | ForEach-Object { [string]$_ })
+        if ($LASTEXITCODE -ne 0) {
+            $detail = ($extractLines -join ' ').Trim()
+            if ($detail.Length -gt 1500) { $detail = $detail.Substring(0, 1500) }
+            throw "美团订单提取失败（$chunkStartText 至 $chunkEndText）：$detail"
+        }
+        $chunk = (($extractLines -join "`n").Trim()) | ConvertFrom-Json
+        if ([int]$chunk.total -ne @($chunk.orders).Count) { throw "订单提取数量不一致：$chunkStartText 至 $chunkEndText" }
+        foreach ($order in @($chunk.orders)) { $orders.Add($order) }
+        $chunks.Add([pscustomobject]@{start_date=$chunkStartText;end_date=$chunkEndText;orders=[int]$chunk.total})
+        $cursor = $chunkEnd.AddDays(1)
+    }
+
+    return [pscustomobject]@{
+        total = $orders.Count
+        orders = @($orders.ToArray())
+        chunks = @($chunks.ToArray())
+    }
 }
-$extract = (($extractLines -join "`n").Trim()) | ConvertFrom-Json
+
+try {
+$extract = Invoke-MeituanOrderExtractorRange $StartDate $EndDate
 if ($extract.total -ne @($extract.orders).Count) { throw '订单提取数量不一致' }
 $incompleteOrders = @($extract.orders | Where-Object {
     $expectedIncome = if ($null -eq $_.expectedIncome) { 0.0 } else { [double]$_.expectedIncome }
@@ -903,6 +931,7 @@ $finalResult = [pscustomobject]@{
     ok = $true
     start_date = $StartDate
     end_date = $EndDate
+    extractor_runs = @($extract.chunks)
     extracted_orders = $extract.total
     extracted_items = @($extract.orders | ForEach-Object { @($_.items).Count } | Measure-Object -Sum).Sum
     natural_orders = $naturalCount

@@ -145,6 +145,12 @@ $contracts = [ordered]@{
     pending_repair_skips_full_committed_journals = ($financeTransaction -match 'Get-FinanceTransactionStatusFast' -and $financeTransaction.Contains("if (`$status -notin @('active','rollback_pending')) { continue }"))
     order_cards_expand_before_extraction = ($orderExtractor -match 'await expandOrderCards\(targetId\)[\s\S]{0,120}extractPageExpression')
     order_retries_restart_from_first_page = ($orderExtractor -match 'function resetOrderPagination' -and $orderExtractor -match 'await resetOrderPagination\(targetId\)' -and $orderExtractor -match "querySelector\('\.roo-pagination'\)")
+    cross_month_order_windows_are_split_before_extraction = (
+        $orderSync -match 'function Invoke-MeituanOrderExtractorRange' -and
+        $orderSync -match '\.AddMonths\(1\)\.AddDays\(-1\)' -and
+        $orderSync -match 'extractor_runs = @\(\$extract\.chunks\)' -and
+        $scheduledSync -match '\$Date\.AddDays\(-7\)'
+    )
     lark_1_0_98_formula_verify_uses_continuous_ranges = ($orderSync -match "Range='E2:L2001'" -and $orderSync -match "Range='E2:P4001'" -and $inventorySync -match "--range 'H2:M2000'" -and $orderSync -notmatch "Range='[^']*,[^']*'" -and $scheduledSync -match "\$Range -split ','" -and $scheduledSync -match '--range \$continuousRange' -and $costRebuild -match "\$Range -split ','" -and $costRebuild -match '--range \$area' -and $ledgerSync -match "\$Range -split ','" -and $ledgerSync -match '--range \$area' -and $financeEvent -match "\$Range -split ','" -and $financeEvent -match '--range \$area')
     cost_rebuild_preserves_error_detail = ($scheduledSync -match '成本快照刷新失败：\$detail' -and $scheduledSync -match '\$costScript @costArguments 2>&1')
     order_page_reloads_once_before_failure = ($orderExtractor -match 'function waitForOrderPageReady' -and $orderExtractor -match '/navigate\?target=' -and $orderExtractor -match 'not ready after one safe reload')
