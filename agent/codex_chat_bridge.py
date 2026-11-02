@@ -49,7 +49,7 @@ QUERY_CACHE_SECONDS = 30
 RATE_LIMIT_BASE_SECONDS = 60
 RATE_LIMIT_MAX_SECONDS = 15 * 60
 RATE_LIMIT_RESET_SECONDS = 60 * 60
-RUNTIME_VERSION = "2026-10-27.1"
+RUNTIME_VERSION = "2026-11-02.1"
 RUNTIME_PIPE = rf"\\.\pipe\petstar_codex_runtime_{hashlib.sha256(str(PROJECT_ROOT).encode('utf-8')).hexdigest()[:16]}"
 RUNTIME_AUTHKEY = hashlib.sha256((str(PROJECT_ROOT) + "|petstar-codex-runtime-v1").encode("utf-8")).digest()
 QUERY_DATASETS = {
@@ -136,6 +136,7 @@ ACTION_GUIDE = """
 - Replenishment: date, goods_code, transition_code（消息同时给出CSX时填写）, quantity, purchase_amount, payment_amount, payment_date, production_date, shelf_life_value, shelf_life_unit, note。店主没有明确说赊账、挂账、未付款或以后付款时，默认当天已全额付款，payment_amount 填 purchase_amount，payment_date 填 date；明确未付款时 payment_amount/payment_date 留空，并在 note 保留原话。该动作只新增补货记录并更新SKU当前成本，不重算历史订单、收入、利润或经营简账
 - SetCostBookQuantity: goods_code, quantity, date, note。仅当店主明确纠正某 SKU 在本次补货前的“成本账数量”时使用；若同一请求还包含该 SKU 补货，必须把本动作放在对应 Replenishment 前面，使移动平均成本按纠正后的旧数量计算。它不代表美团库存，不修改历史订单或经营简账
 - CashExpense / OperatingExpense / OwnerWithdrawal / OwnerLabor / MarketRent / BeginningCash / ActualReceipt / AssetAmortization: date, amount, note。ActualReceipt 只表示平台资金实际打入收款账户的月度现金到账，不得用于修正某一订单的收入、退款或利润，也不得携带 order_no
+- 售后再次配送、补送的额外配送费使用 OperatingExpense（date、amount、order_no、note），note 项目为“售后追加配送费”，说明原订单号及原因。它是新增经营支出，不得用 SetOrderDeliveryFee 或 SetOrderActuals 覆盖首次配送费。普通首次配送费仍使用原订单配送费动作；采购付款、老板取款不得生成 OperatingExpense。经营利润只从月份支出汇总扣费，不另扣干预订单成本。
 - SetSkuExpiry: goods_code, expiry_date；明确无到期日时 clear_expiry=true
 - SetSkuBatchDate: goods_code, production_date, shelf_life_value, shelf_life_unit
 - SetSkuCost: goods_code, amount（每个销售单位的新成本，允许为0）, order_no（仅当店主明确指定某个历史订单并明确要求同步修正该单成本/利润时填写；既可使用平台完整订单号，也可使用只读查询返回的 OFF- 开头线下订单编号）, note；goods_code 优先 KW/CSX，也可使用 pending_costs 或 sku 查询返回且能唯一定位主表的 action_code。普通成本修改不得填写 order_no，不得额外生成 RefreshLedger

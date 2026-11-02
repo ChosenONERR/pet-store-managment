@@ -12,6 +12,7 @@ $ledgerMeta = Get-Content -LiteralPath (Join-Path $ProjectRoot 'work\daily_ledge
 $sourceToken = ([uri]$sourceMeta.workbook_url).Segments[-1].Trim('/')
 $ledgerToken = ([uri]$ledgerMeta.workbook_url).Segments[-1].Trim('/')
 . (Join-Path $ProjectRoot 'agent\intervention_record.ps1')
+. (Join-Path $ProjectRoot 'agent\expense_accounting.ps1')
 
 function Get-CellValue($Row, [int]$Index) {
     if ($null -eq $Row -or $Index -ge @($Row).Count) { return $null }
@@ -36,7 +37,7 @@ function To-Date($Value) {
     return $null
 }
 function Get-Rows([string]$Token,[string]$Sheet,[string]$Range) {
-    $raw = lark-cli sheets +cells-get --as user --spreadsheet-token $Token --sheet-name $Sheet --range $Range --include value,formula --max-chars 5000000 --format json | Out-String
+    $raw = lark-cli sheets +cells-get --as user --spreadsheet-token $Token --sheet-name $Sheet --range $Range --include 'value,formula' --max-chars 5000000 --format json | Out-String
     if ($LASTEXITCODE -ne 0) { throw "读取失败：$Sheet" }
     $result = $raw | ConvertFrom-Json
     if (-not $result.ok -or $result.data.has_more) { throw "读取不完整：$Sheet" }
@@ -243,8 +244,25 @@ foreach ($orderNo in $interventionSet.Keys) {
     }
 }
 
+$expenseSummaryErrors = @()
+$monthlyExpenseRows = (Get-Rows $sourceToken '月度结算' 'A2:R25').rows
+foreach($monthlyRow in $monthlyExpenseRows) {
+    $monthDate = To-Date (Get-CellValue $monthlyRow 0)
+    if($null -eq $monthDate -or $monthDate -gt [datetime]::Today -or -not(Test-DateInScope (Get-CellValue $monthlyRow 0))){continue}
+    $entries = @(foreach($row in $expenseRows) {
+        $expenseDate = To-Date (Get-CellValue $row 0)
+        if($null -eq $expenseDate -or $expenseDate.ToString('yyyy-MM') -ne $monthDate.ToString('yyyy-MM')){continue}
+        [pscustomobject]@{project=(Get-CellValue $row 1);fee=(Get-CellValue $row 2);order_no=(Get-CellValue $row 3);source=(Get-CellValue $row 4)}
+    })
+    $summary = Get-PetstarExpenseSummary $entries
+    foreach($pair in @(@(6,$summary.total),@(13,$summary.promotion),@(14,$summary.intervention),@(15,$summary.after_sales),@(16,$summary.other))) {
+        $actual=To-Number (Get-CellValue $monthlyRow $pair[0])
+        if($null -eq $actual -or [math]::Abs($actual-$pair[1]) -gt 0.02){$expenseSummaryErrors += "$($monthDate.ToString('yyyy-MM'))|column=$($pair[0]+1)|actual=$actual|expected=$($pair[1])"}
+    }
+}
+
 [ordered]@{
-    ok = ($duplicateSourceOrders.Count -eq 0 -and $duplicateIncomeOrders.Count -eq 0 -and $incomeSourceMismatch.Count -eq 0 -and $unmigratedManualDelivery.Count -eq 0 -and $interventionLeak.Count -eq 0 -and $arithmeticErrors.Count -eq 0 -and $sortErrors.Count -eq 0 -and $missingNaturalOrders.Count -eq 0 -and $expensePairErrors.Count -eq 0 -and $orderItemQuantityMismatches.Count -eq 0 -and $interventionDataErrors.Count -eq 0)
+    ok = ($expenseSummaryErrors.Count -eq 0 -and $duplicateSourceOrders.Count -eq 0 -and $duplicateIncomeOrders.Count -eq 0 -and $incomeSourceMismatch.Count -eq 0 -and $unmigratedManualDelivery.Count -eq 0 -and $interventionLeak.Count -eq 0 -and $arithmeticErrors.Count -eq 0 -and $sortErrors.Count -eq 0 -and $missingNaturalOrders.Count -eq 0 -and $expensePairErrors.Count -eq 0 -and $orderItemQuantityMismatches.Count -eq 0 -and $interventionDataErrors.Count -eq 0)
     scope = $(if ($selectedMonthKeys.Count -gt 0) { 'selected_months' } else { 'all_history' })
     month_filter = @($selectedMonthKeys | Sort-Object)
     source_orders = $sourceByOrder.Count
@@ -262,5 +280,6 @@ foreach ($orderNo in $interventionSet.Keys) {
     missing_natural_orders = $missingNaturalOrders
     intervention_expense_pair_errors = $expensePairErrors
     intervention_data_errors = $interventionDataErrors
+    expense_summary_errors = $expenseSummaryErrors
     order_item_quantity_mismatches = $orderItemQuantityMismatches
 } | ConvertTo-Json -Depth 8

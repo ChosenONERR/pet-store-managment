@@ -11,6 +11,7 @@ $ledgerMeta = [IO.File]::ReadAllText((Join-Path $ProjectRoot 'work\daily_ledger_
 $sourceToken = ([uri]$sourceMeta.workbook_url).Segments[-1].Trim('/')
 $ledgerToken = ([uri]$ledgerMeta.workbook_url).Segments[-1].Trim('/')
 . (Join-Path $agentRoot 'finance_transaction.ps1')
+. (Join-Path $agentRoot 'expense_accounting.ps1')
 
 function Invoke-LarkJson([scriptblock]$Action,[string]$Message) {
     $global:LASTEXITCODE = 0
@@ -104,17 +105,16 @@ if ($currentSettlementHeader -and $currentSettlementHeader -ne '平台推广费�
 $selectedMonthExpression = 'DATE(VALUE(LEFT($I$1,4)),VALUE(RIGHT($I$1,2)),1)'
 $deliveryExpenseExpression = 'SUMIFS(''订单汇总''!$J$2:$J$2001,''订单汇总''!$A$2:$A$2001,">="&' + $selectedMonthExpression + ',''订单汇总''!$A$2:$A$2001,"<"&EDATE(' + $selectedMonthExpression + ',1),''订单汇总''!$E$2:$E$2001,"自然",''订单汇总''!$D$2:$D$2001,"<>已取消")+SUMIFS(''线下订单''!$E$2:$E$1001,''线下订单''!$A$2:$A$1001,">="&' + $selectedMonthExpression + ',''线下订单''!$A$2:$A$1001,"<"&EDATE(' + $selectedMonthExpression + ',1))'
 $promotionExpenseExpression = 'SUMIFS(''月度结算''!$N$2:$N$25,''月度结算''!$A$2:$A$25,' + $selectedMonthExpression + ')'
-$allOperatingExpenseExpression = 'SUMIFS(''月度结算''!$G$2:$G$25,''月度结算''!$A$2:$A$25,' + $selectedMonthExpression + ')'
-$otherOperatingExpenseExpression = '(' + $allOperatingExpenseExpression + ')-(' + $promotionExpenseExpression + ')'
 $cashReceiptExpression = 'SUMIFS(''月度结算''!$B$2:$B$25,''月度结算''!$A$2:$A$25,' + $selectedMonthExpression + ')+SUMIFS(''月度结算''!$C$2:$C$25,''月度结算''!$A$2:$A$25,' + $selectedMonthExpression + ')+SUMIFS(''月度结算''!$D$2:$D$25,''月度结算''!$A$2:$A$25,' + $selectedMonthExpression + ')+SUMIFS(''月度结算''!$E$2:$E$25,''月度结算''!$A$2:$A$25,' + $selectedMonthExpression + ')'
 $otherCashExpenseExpression = 'SUMIFS(''月度结算''!$F$2:$F$25,''月度结算''!$A$2:$A$25,' + $selectedMonthExpression + ')'
 $ownerWithdrawalExpression = 'SUMIFS(''月度结算''!$H$2:$H$25,''月度结算''!$A$2:$A$25,' + $selectedMonthExpression + ')'
 $beginningCashExpression = 'SUMIFS(''月度结算''!$K$2:$K$25,''月度结算''!$A$2:$A$25,' + $selectedMonthExpression + ')'
-$grossProfitFormula = '=C4-C5-(' + $deliveryExpenseExpression + ')-(' + $promotionExpenseExpression + ')'
-$operatingProfitFormula = '=C6-(' + $otherOperatingExpenseExpression + ')'
+$expenseFormulas = Get-PetstarDashboardExpenseFormulas $selectedMonthExpression $deliveryExpenseExpression
+$grossProfitFormula = $expenseFormulas.gross
+$operatingProfitFormula = $expenseFormulas.profit
 $detailFormulas = @{
-    6 = '="=线上与线下收入-商品成本-配送费-平台推广费用="&TEXT(C4,"#,##0.00")&"-"&TEXT(C5,"#,##0.00")&"-"&TEXT((' + $deliveryExpenseExpression + '),"#,##0.00")&"-"&TEXT((' + $promotionExpenseExpression + '),"#,##0.00")'
-    7 = '="=经营毛利-其他经营费用（不含平台推广费用）="&TEXT(C6,"#,##0.00")&"-"&TEXT((' + $otherOperatingExpenseExpression + '),"#,##0.00")'
+    6 = $expenseFormulas.gross_detail
+    7 = $expenseFormulas.profit_detail
     9 = '="=平台与线下到账-补货付款-其他现金支出-老板取款="&TEXT((' + $cashReceiptExpression + '),"#,##0.00")&"-"&TEXT(C8,"#,##0.00")&"-"&TEXT((' + $otherCashExpenseExpression + '),"#,##0.00")&"-"&TEXT((' + $ownerWithdrawalExpression + '),"#,##0.00")'
     10 = '="=期初现金+本月现金净流入="&TEXT((' + $beginningCashExpression + '),"#,##0.00")&IF(C9>=0,"+","")&TEXT(C9,"#,##0.00")'
 }
@@ -122,8 +122,20 @@ $detailFormulas = @{
 $transaction = New-FinanceTransaction $stateRoot '调整驾驶舱经营毛利并增加计算明细' ('TX-DASHBOARD-DETAILS-' + [datetime]::Now.ToString('yyyyMMdd-HHmmss')) -AcquireLock -WorkbookTokens @{source=$sourceToken} -LarkCli $larkCli
 $closed = $false
 try {
+    $monthRowsResult = Get-Rows $sourceToken '月度结算' 'A2:N25' '锁内读取月度结算失败'
     Register-FinanceRangeBeforeImage $transaction 'source' $sourceToken '月度结算' 'N1:N25' $larkCli
     Register-FinanceRangeBeforeImage $transaction 'source' $sourceToken '驾驶舱' 'A1:G19' $larkCli
+    Register-FinanceRangeBeforeImage $transaction 'source' $sourceToken '驾驶舱' 'J2:J2' $larkCli
+
+    # Deploy only derived expense summaries; never replay historical order costs.
+    $expenseMonthResults = @()
+    foreach($monthRow in $monthRowsResult.rows) {
+        $expenseMonth = Convert-ToDate (Get-CellValue $monthRow 0)
+        if($null -eq $expenseMonth -or $expenseMonth -gt $now -or $expenseMonth -lt [datetime]'2026-08-01'){continue}
+        $summary = Update-PetstarMonthExpenses -Month $expenseMonth -SourceToken $sourceToken -LedgerToken $ledgerToken -Cli $larkCli -Transaction $transaction
+        $expenseMonthResults += $summary
+        if($expenseMonth.ToString('yyyy-MM') -eq $now.ToString('yyyy-MM')){$promotionExpense=$summary.promotion}
+    }
 
     Set-Cells '月度结算' 'N1:N1' @(@(@{value='平台推广费用'})) '设置月度结算推广费表头失败'
     Set-Cells '月度结算' "N${monthRowNumber}:N${monthRowNumber}" @(@(@{value=$promotionExpense;cell_styles=@{number_format='#,##0.00'}})) '回填当月平台推广费用失败'
@@ -145,9 +157,12 @@ try {
         @(@{formula=$operatingProfitFormula;cell_styles=@{number_format='#,##0.00'}})
     ) '更新经营毛利和经营利润失败'
     Set-Cells '驾驶舱' 'E6:E7' @(
-        @(@{value='线上与线下收入-商品成本-配送费-平台推广费用'}),
-        @(@{value='经营毛利-其他经营费用（不含平台推广费用）；不再扣老板人工、摊销折旧和市场租金机会成本'})
+        @(@{value='线上与线下扣佣后收入-商品及赠品成本-首次配送费；不含推广费'}),
+        @(@{value='经营毛利-当月支出表经营费用合计；含推广、补单、售后追加配送及其他费用，只扣一次'})
     ) '更新经营指标解释失败'
+    Set-Cells '驾驶舱' 'F7:F7' @(@(@{formula=$expenseFormulas.status})) '更新费用核对状态失败'
+    $systemGrossFormula = $grossProfitFormula.Replace($selectedMonthExpression,'DATE(YEAR(TODAY()),MONTH(TODAY()),1)')
+    Set-Cells '驾驶舱' 'J2:J2' @(@(@{formula=$systemGrossFormula})) '更新系统当月毛利失败'
     $detailCells = @()
     for ($rowNumber = 2; $rowNumber -le 19; $rowNumber++) {
         if ($detailFormulas.ContainsKey($rowNumber)) { $detailCells += ,@(@{formula=$detailFormulas[$rowNumber]}) }
@@ -167,7 +182,7 @@ try {
     $null = Invoke-LarkJson { & $larkCli sheets +cells-set-style --as user --spreadsheet-token $sourceToken --sheet-name '月度结算' --range 'N2:N25' --background-color '#FFF8E1' --number-format '#,##0.00' --format json } '设置推广费用列样式失败'
     $null = Invoke-LarkJson { & $larkCli sheets +cols-resize --as user --spreadsheet-token $sourceToken --sheet-name '月度结算' --range 'N' --width 130 --format json } '设置推广费用列宽失败'
 
-    foreach ($range in @('C6:C7','D6:D7','D9:D10')) {
+    foreach ($range in @('C6:C7','D6:D7','D9:D10','F7:F7','J2:J2')) {
         $verify = Invoke-LarkJson { & $larkCli sheets +formula-verify --as user --spreadsheet-token $sourceToken --sheet-name '驾驶舱' --range $range --format json --exit-on-error } "驾驶舱公式校验失败：$range"
         if ($verify.data.status -ne 'success') { throw "驾驶舱公式未通过：$range" }
     }
@@ -182,8 +197,8 @@ try {
     $cashFlowDetail = [string](Get-CellValue $dashboardRows[8] 3)
     $endingCashDetail = [string](Get-CellValue $dashboardRows[9] 3)
     if ($null -eq $grossProfit -or $null -eq $operatingProfit) { throw '经营毛利或经营利润未计算出数值' }
-    if ($grossDetail -notmatch '^=线上与线下收入-商品成本-配送费-平台推广费用=') { throw '经营毛利计算明细回读不正确' }
-    if ($operatingDetail -notmatch '^=经营毛利-其他经营费用') { throw '经营利润计算明细回读不正确' }
+    if ($grossDetail -notmatch '^=线上与线下收入-商品成本-首次配送费=') { throw '经营毛利计算明细回读不正确' }
+    if ($operatingDetail -notmatch '^=经营毛利-推广费-补单费用-售后追加配送费-其他经营费用=') { throw '经营利润计算明细回读不正确' }
     if ($cashFlowDetail -notmatch '^=平台与线下到账-补货付款-其他现金支出-老板取款=') { throw '现金净流入计算明细回读不正确' }
     if ($endingCashDetail -notmatch '^=期初现金\+本月现金净流入=') { throw '期末现金计算明细回读不正确' }
     $settlementReadback = (Get-Rows $sourceToken '月度结算' "N${monthRowNumber}:N${monthRowNumber}" '推广费用回读失败').rows
@@ -201,6 +216,7 @@ try {
         gross_profit = [math]::Round($grossProfit,2)
         operating_profit = [math]::Round($operatingProfit,2)
         detail_rows = @(6,7,9,10)
+        expense_months = $expenseMonthResults
     } | ConvertTo-Json -Depth 6
 } catch {
     $failure = $_.Exception.Message

@@ -16,6 +16,7 @@ $runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\r
 $runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\repair_dashboard_offline_formulas.ps1')
 $runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\repair_dashboard_and_replenishment_payments_20261025.ps1')
 $runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\update_dashboard_calculation_details.ps1')
+$runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\audit_finance_integrity.ps1')
 $runtimePowerShellFiles += Get-Item -LiteralPath (Join-Path $projectRoot 'work\ensure_replenishment_product_name.ps1')
 $runtimePowerShellFiles += @(Get-ChildItem -LiteralPath (Join-Path $projectRoot 'work') -Filter 'test_*.ps1' -File)
 
@@ -257,7 +258,7 @@ $contracts = [ordered]@{
     manual_delivery_repair_is_atomic_and_read_back = ($deliveryReconciliation -match 'New-FinanceTransaction' -and $deliveryReconciliation -match 'Register-FinanceRangeBeforeImage' -and $deliveryReconciliation -match 'Invoke-FinanceTransactionRollback' -and $deliveryReconciliation -match '配送费回读订单数量不一致')
     dashboard_includes_offline_orders_and_matches_ledger = ($dashboardFormulaRepair -match "''线下订单''" -and $dashboardFormulaRepair -match 'dashboard_gross_profit' -and $dashboardFormulaRepair -match 'ledger_profit' -and $dashboardFormulaRepair -match 'Invoke-FinanceTransactionRollback')
     dashboard_uses_current_cost_inventory_and_compact_metrics = ($simpleFinanceBuilder -match '\(D\{r\}\+IFERROR\(M\{r\}\*1,0\)\)\*H\{r\}' -and $simpleFinanceBuilder -match 'SKU成本主表.+G.2.+G.3000' -and $simpleFinanceBuilder -notmatch '本月经济利润.+\$null' -and $dashboardPaymentRepair -match 'october_purchase_amount' -and $dashboardPaymentRepair -match 'Invoke-FinanceTransactionRollback')
-    dashboard_gross_profit_includes_promotion_once = ($simpleFinanceBuilder -match '平台推广费用' -and $simpleFinanceBuilder -match '\$promotionExpenseExpression' -and $simpleFinanceBuilder -match "'=C4-C5-\('" -and $simpleFinanceBuilder -match "'=C6-\('" -and $financeEvent -match 'promotion_total' -and $ledgerSync -match '平台推广费用回读失败')
+    dashboard_expenses_have_one_source_and_one_deduction = ($simpleFinanceBuilder -match 'Get-PetstarDashboardExpenseFormulas' -and $dashboardDetailsUpdater -match 'Get-PetstarDashboardExpenseFormulas' -and $dashboardDetailsUpdater -match 'Update-PetstarMonthExpenses' -and $ledgerSync -match 'Update-PetstarMonthExpenses' -and $financeEvent -match 'Update-PetstarMonthExpenses' -and $businessQuery -match 'expenseSummary.total')
     dashboard_calculation_details_are_targeted_and_verified = ($dashboardDetailsUpdater -match "detailFormulas = @\{" -and $dashboardDetailsUpdater -match '6 = ' -and $dashboardDetailsUpdater -match '7 = ' -and $dashboardDetailsUpdater -match '9 = ' -and $dashboardDetailsUpdater -match '10 = ' -and $dashboardDetailsUpdater -match "D6:D7" -and $dashboardDetailsUpdater -match "D9:D10" -and $dashboardDetailsUpdater -match "计算明细.*解释" -and $dashboardDetailsUpdater -match 'Invoke-FinanceTransactionRollback')
     dashboard_month_selector_is_verified_and_preserves_current_notifications = (
         $dashboardMonthSelector -match 'DATE\(VALUE\(LEFT\(\$I\$1,4\)\),VALUE\(RIGHT\(\$I\$1,2\)\),1\)' -and
@@ -277,6 +278,9 @@ $contracts = [ordered]@{
         $trafficSuggestion -match '\$fallbackCandidates' -and
         $trafficSuggestion -match 'suggestion already sent' -and
         $trafficSuggestion -match '\+messages-send' -and
+        $trafficSuggestion -match '--text \$suggestionText' -and
+        $trafficSuggestion -match '\[string\]\$FailureMessage' -and
+        $trafficSuggestion -notmatch '\[string\]\$Message' -and
         $trafficSuggestion -notmatch 'sync_meituan|修改库存|评价订单|创建订单' -and
         [string]$trafficSuggestionRules.recent_sales_note -match '不作为是否推荐的门槛' -and
         [string]$trafficSuggestionRules.fallback_keyword -eq '宠物用品' -and

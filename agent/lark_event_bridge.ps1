@@ -1351,7 +1351,11 @@ function Format-ConfirmationPreview([string]$ChangeId, $Operations, [string]$Fal
                 $lines.Add("当前货号：$($details.old_code) → $($details.new_code)")
                 $null = $impacts.Add('SKU成本主表及成本快照')
             }
-            { $_ -in @('CashExpense','OperatingExpense','OwnerWithdrawal','OwnerLabor','MarketRent','BeginningCash','ActualReceipt','AssetAmortization') } {
+            'OperatingExpense' {
+                $lines.Add("经营支出｜$($args.date)｜金额 ¥$($args.amount)$(if($args.note){'｜'+$args.note}else{''})$(if($args.order_no){'｜关联订单'+$args.order_no}else{''})；不改原订单首次配送费")
+                $null = $impacts.Add('对应月份支出及驾驶舱费用汇总')
+            }
+            { $_ -in @('CashExpense','OwnerWithdrawal','OwnerLabor','MarketRent','BeginningCash','ActualReceipt','AssetAmortization') } {
                 $lines.Add("月度结算｜$($args.date)｜$($operation.action)｜金额 ¥$($args.amount)$(if($args.note){'｜'+$args.note}else{''})")
                 $null = $impacts.Add('月度结算及驾驶舱')
             }

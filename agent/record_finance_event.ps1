@@ -63,6 +63,7 @@ if (Test-Path -LiteralPath $ledgerMetaPath) {
 . (Join-Path $PSScriptRoot 'intervention_record.ps1')
 . (Join-Path $PSScriptRoot 'refund_adjustments.ps1')
 . (Join-Path $PSScriptRoot 'order_actual_overrides.ps1')
+. (Join-Path $PSScriptRoot 'expense_accounting.ps1')
 $skuSchema = Get-SkuMasterSchema -SpreadsheetToken $spreadsheetToken
 $script:financeTransaction = $null
 $script:financeTransactionOwner = $false
@@ -622,6 +623,7 @@ function Get-OperatingExpenseState([datetime]$TargetDate, [double]$TargetAmount,
         $rowProject = Get-CellValue $row 1
         $rowAmount = Convert-ToNumber (Get-CellValue $row 2)
         if ($null -ne $rowDate -and $rowDate.Date -eq $TargetDate.Date -and
+            ([string](Get-CellValue $row 3) -eq [string]$OrderNo) -and
             (Normalize-BusinessText $rowProject) -eq (Normalize-BusinessText $project)) {
             $item = [pscustomobject]@{row_number=2+$index;cells=$row;amount=$rowAmount}
             $projectMatches.Add($item)
@@ -633,6 +635,7 @@ function Get-OperatingExpenseState([datetime]$TargetDate, [double]$TargetAmount,
 
     $month = Get-MonthRow $TargetDate
     $entry = "$($TargetDate.ToString('MM-dd')) 其他经营费用 $TargetAmount：$project"
+    if ($OrderNo) { $entry += "｜订单$OrderNo" }
     $entryKey = Normalize-BusinessText $entry
     $noteParts = @([regex]::Split([string](Get-CellValue $month.cells 11), '[；;]') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     $monthNoteCount = @($noteParts | Where-Object { (Normalize-BusinessText $_) -eq $entryKey }).Count
@@ -701,7 +704,7 @@ function Invoke-OperatingExpenseWrite([datetime]$TargetDate, [double]$TargetAmou
             }
 
             Set-LedgerOneRow $state.sheet_name "A$($existing.row_number):F$($existing.row_number)" @(
-                (Convert-ToExcelSerial $TargetDate), $state.project, $TargetAmount, $null, $ExpenseSource, $ExpenseMemo
+                (Convert-ToExcelSerial $TargetDate), $state.project, $TargetAmount, $OrderNo, $ExpenseSource, $ExpenseMemo
             )
             $currentMonthlyValue = Convert-ToNumber (Get-CellValue $state.month.cells 6)
             $newMonthlyValue = [math]::Round($currentMonthlyValue + $delta, 2)
@@ -768,7 +771,7 @@ function Invoke-OperatingExpenseWrite([datetime]$TargetDate, [double]$TargetAmou
         (Convert-ToExcelSerial $TargetDate),
         $state.project,
         $TargetAmount,
-        $null,
+        $OrderNo,
         $ExpenseSource,
         $ExpenseMemo
     )
@@ -2486,6 +2489,7 @@ switch ($Action) {
     }
     'OperatingExpense' {
         Assert-Positive $Amount '其他经营费用'
+        if ($OrderNo -and $OrderNo -notmatch '^(?:\d{10,30}|OFF-\d{8}-[A-Za-z0-9-]+)$') { throw '经营费用关联订单号格式无效' }
         $writeResult = Invoke-OperatingExpenseWrite $Date ([double]$Amount) $Note -PreviewOnly:$DryRun
         $reference = [string]([double]$Amount)
         if ($DryRun) {
@@ -2493,6 +2497,7 @@ switch ($Action) {
             Complete-CurrentFinanceTransaction
             exit 0
         }
+        $null = Update-PetstarMonthExpenses -Month $Date -SourceToken $spreadsheetToken -LedgerToken $ledgerSpreadsheetToken -Cli $larkCli -Transaction $script:financeTransaction
     }
     'OwnerWithdrawal' {
         Assert-Positive $Amount '老板取款'

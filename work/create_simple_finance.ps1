@@ -150,8 +150,8 @@ $dashboardData += ,@('经营结果','本月自然订单数',$null,'','线上自�
 $dashboardData += ,@('经营结果','本月自然商品销售额',$null,'','线上订单实际商品小计加线下成交收入；不是商品目录标价',$null,'')
 $dashboardData += ,@('经营结果','本月预计结算收入',$null,'','线上商家预计收入加线下成交收入；取消单排除，已确认退款按退款后金额',$null,'')
 $dashboardData += ,@('经营结果','本月商品成本',$null,'','线上与线下订单货物成本合计',$null,'')
-$dashboardData += ,@('经营结果','本月经营毛利',$null,'','线上与线下收入-商品成本-配送费-平台推广费用',$null,'')
-$dashboardData += ,@('经营结果','本月经营利润',$null,'','经营毛利-其他经营费用（不含平台推广费用）；不再扣老板人工、摊销折旧和市场租金机会成本',$null,'')
+$dashboardData += ,@('经营结果','本月经营毛利',$null,'','线上与线下扣佣后收入-商品及赠品成本-首次配送费',$null,'')
+$dashboardData += ,@('经营结果','本月经营利润',$null,'','经营毛利-当月支出表经营费用合计，只扣一次',$null,'')
 $dashboardData += ,@('现金与库存','本月补货付款',$null,'','来自补货记录付款金额',$null,'')
 $dashboardData += ,@('现金与库存','本月现金净流入',$null,'','平台与线下到账-补货付款-其他现金支出-老板取款',$null,'')
 $dashboardData += ,@('现金与库存','本月期末现金',$null,'','期初现金+本月现金净流入',$null,'')
@@ -274,8 +274,8 @@ $currentMonth = 'DATE(YEAR(TODAY()),MONTH(TODAY()),1)'
 $nextMonth = 'EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1)'
 $deliveryExpenseExpression = 'SUMIFS(''订单汇总''!$J$2:$J$2001,''订单汇总''!$A$2:$A$2001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''订单汇总''!$A$2:$A$2001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''订单汇总''!$E$2:$E$2001,"自然",''订单汇总''!$D$2:$D$2001,"<>已取消")+SUMIFS(''线下订单''!$E$2:$E$1001,''线下订单''!$A$2:$A$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''线下订单''!$A$2:$A$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))'
 $promotionExpenseExpression = 'SUMIFS(''月度结算''!$N$2:$N$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))'
-$allOperatingExpenseExpression = 'SUMIFS(''月度结算''!$G$2:$G$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))'
-$otherOperatingExpenseExpression = '(' + $allOperatingExpenseExpression + ')-(' + $promotionExpenseExpression + ')'
+. (Join-Path $PSScriptRoot '..\agent\expense_accounting.ps1')
+$expenseFormulas = Get-PetstarDashboardExpenseFormulas $currentMonth $deliveryExpenseExpression
 $cashReceiptExpression = 'SUMIFS(''月度结算''!$B$2:$B$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))+SUMIFS(''月度结算''!$C$2:$C$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))+SUMIFS(''月度结算''!$D$2:$D$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))+SUMIFS(''月度结算''!$E$2:$E$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))'
 $otherCashExpenseExpression = 'SUMIFS(''月度结算''!$F$2:$F$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))'
 $ownerWithdrawalExpression = 'SUMIFS(''月度结算''!$H$2:$H$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))'
@@ -285,8 +285,8 @@ $dashboardFormulas = @(
     '=SUMIFS(''订单汇总''!$F$2:$F$2001,''订单汇总''!$A$2:$A$2001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''订单汇总''!$A$2:$A$2001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''订单汇总''!$E$2:$E$2001,"自然",''订单汇总''!$D$2:$D$2001,"<>已取消")+SUMIFS(''线下订单''!$D$2:$D$1001,''线下订单''!$A$2:$A$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''线下订单''!$A$2:$A$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))',
     '=SUMIFS(''订单汇总''!$H$2:$H$2001,''订单汇总''!$A$2:$A$2001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''订单汇总''!$A$2:$A$2001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''订单汇总''!$E$2:$E$2001,"自然",''订单汇总''!$D$2:$D$2001,"<>已取消")+SUMIFS(''线下订单''!$D$2:$D$1001,''线下订单''!$A$2:$A$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''线下订单''!$A$2:$A$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))',
     '=SUMIFS(''订单汇总''!$K$2:$K$2001,''订单汇总''!$A$2:$A$2001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''订单汇总''!$A$2:$A$2001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1),''订单汇总''!$E$2:$E$2001,"自然",''订单汇总''!$D$2:$D$2001,"<>已取消")+SUMIFS(''线下订单''!$F$2:$F$1001,''线下订单''!$A$2:$A$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''线下订单''!$A$2:$A$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))',
-    ('=C4-C5-(' + $deliveryExpenseExpression + ')-(' + $promotionExpenseExpression + ')'),
-    ('=C6-(' + $otherOperatingExpenseExpression + ')'),
+    $expenseFormulas.gross,
+    $expenseFormulas.profit,
     '=SUMIFS(''补货记录''!$M$2:$M$1001,''补货记录''!$L$2:$L$1001,">="&DATE(YEAR(TODAY()),MONTH(TODAY()),1),''补货记录''!$L$2:$L$1001,"<"&EDATE(DATE(YEAR(TODAY()),MONTH(TODAY()),1),1))',
     '=SUMIFS(''月度结算''!$B$2:$B$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))+SUMIFS(''月度结算''!$C$2:$C$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))+SUMIFS(''月度结算''!$D$2:$D$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))+SUMIFS(''月度结算''!$E$2:$E$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))-C8-SUMIFS(''月度结算''!$F$2:$F$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))-SUMIFS(''月度结算''!$H$2:$H$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))',
     '=C9+SUMIFS(''月度结算''!$K$2:$K$25,''月度结算''!$A$2:$A$25,DATE(YEAR(TODAY()),MONTH(TODAY()),1))',
@@ -308,8 +308,8 @@ for ($i = 0; $i -lt $dashboardFormulas.Count; $i++) { $dashboardCells += ,@(@{fo
 Set-Cells '驾驶舱' 'C2:C19' $dashboardCells
 
 $dashboardDetailFormulas = @{
-    6 = '="=线上与线下收入-商品成本-配送费-平台推广费用="&TEXT(C4,"#,##0.00")&"-"&TEXT(C5,"#,##0.00")&"-"&TEXT((' + $deliveryExpenseExpression + '),"#,##0.00")&"-"&TEXT((' + $promotionExpenseExpression + '),"#,##0.00")'
-    7 = '="=经营毛利-其他经营费用（不含平台推广费用）="&TEXT(C6,"#,##0.00")&"-"&TEXT((' + $otherOperatingExpenseExpression + '),"#,##0.00")'
+    6 = $expenseFormulas.gross_detail
+    7 = $expenseFormulas.profit_detail
     9 = '="=平台与线下到账-补货付款-其他现金支出-老板取款="&TEXT((' + $cashReceiptExpression + '),"#,##0.00")&"-"&TEXT(C8,"#,##0.00")&"-"&TEXT((' + $otherCashExpenseExpression + '),"#,##0.00")&"-"&TEXT((' + $ownerWithdrawalExpression + '),"#,##0.00")'
     10 = '="=期初现金+本月现金净流入="&TEXT((' + $beginningCashExpression + '),"#,##0.00")&IF(C9>=0,"+","")&TEXT(C9,"#,##0.00")'
 }
@@ -322,6 +322,7 @@ for ($rowNumber = 2; $rowNumber -le 19; $rowNumber++) {
     else { $dashboardDetailCells += ,@(@{value=''}) }
 }
 Set-Cells '驾驶舱' 'D2:D19' $dashboardDetailCells
+Set-Cells '驾驶舱' 'F7:F7' @(@(@{formula=$expenseFormulas.status.Replace($currentMonth,$dashboardSelectedMonthExpression)}))
 Set-Cells '驾驶舱' 'J1:J2' @(@(@{value='系统当月经营毛利'}),@(@{formula=$systemCurrentGrossProfitFormula}))
 $null = lark-cli sheets +dim-hide --as user --spreadsheet-token $token --sheet-name '驾驶舱' --range 'J:J' --format json | Out-String
 if ($LASTEXITCODE -ne 0) { throw '隐藏驾驶舱系统辅助列失败' }

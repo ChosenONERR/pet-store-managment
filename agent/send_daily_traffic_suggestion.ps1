@@ -29,7 +29,7 @@ $openId = [string]$identity.open_id
 if (-not $openId) { throw 'Cached Lark recipient identity has no open_id' }
 $dateKey = $Date.ToString('yyyy-MM-dd')
 
-function Invoke-LarkJson([scriptblock]$Action,[string]$Message,[int]$MaxAttempts=3) {
+function Invoke-LarkJson([scriptblock]$Action,[string]$FailureMessage,[int]$MaxAttempts=3) {
     $last = $null
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         $global:LASTEXITCODE = 0
@@ -39,7 +39,7 @@ function Invoke-LarkJson([scriptblock]$Action,[string]$Message,[int]$MaxAttempts
         $last = $raw
         if ($attempt -lt $MaxAttempts) { Start-Sleep -Seconds ([math]::Min(8,2*$attempt)) }
     }
-    throw "$Message`: $last"
+    throw "$FailureMessage`: $last"
 }
 
 function Get-CellValue($Row,[int]$Index) {
@@ -145,7 +145,7 @@ if ($null -eq $selected) { $selected = @($candidates | Sort-Object @{Expression=
 
 $stockText = if ([math]::Abs($selected.stock - [math]::Round($selected.stock)) -lt 0.000001) { [string][int][math]::Round($selected.stock) } else { '{0:0.##}' -f $selected.stock }
 $salesText = if ([math]::Abs($selected.recent_natural - [math]::Round($selected.recent_natural)) -lt 0.000001) { [string][int][math]::Round($selected.recent_natural) } else { '{0:0.##}' -f $selected.recent_natural }
-$message = @(
+$suggestionText = @(
     [string]$config.message_title,
     "\u641c\u7d22\u8bcd\uff1a$($selected.keyword)",
     "\u5546\u54c1\uff1a$($selected.code)\uff5c$($selected.name)",
@@ -153,16 +153,20 @@ $message = @(
     "\u53c2\u8003\uff1a\u8fd130\u5929\u81ea\u7136\u552e\u51fa$salesText\u4ef6\uff08$($config.recent_sales_note)\uff09",
     "\u4eca\u5929\uff1a$($selected.action)"
 ) -join "`n"
-$message = [regex]::Unescape($message)
+$suggestionText = [regex]::Unescape($suggestionText)
 
-$result = [ordered]@{date=$dateKey;keyword=$selected.keyword;code=$selected.code;name=$selected.name;stock=$selected.stock;recent_30d_natural_sales=$selected.recent_natural;action=$selected.action;inventory_snapshot=$latestInventoryDate.ToString('yyyy-MM-dd');message=$message}
+$result = [ordered]@{date=$dateKey;keyword=$selected.keyword;code=$selected.code;name=$selected.name;stock=$selected.stock;recent_30d_natural_sales=$selected.recent_natural;action=$selected.action;inventory_snapshot=$latestInventoryDate.ToString('yyyy-MM-dd');message=$suggestionText}
 if ($DryRun) {
     [ordered]@{ok=$true;dry_run=$true;suggestion=$result} | ConvertTo-Json -Depth 8
     exit 0
 }
 
-$idempotencyKey = "petstar-traffic-$($Date.ToString('yyyyMMdd'))"
-$send = Invoke-LarkJson { & $larkCli im +messages-send --as bot --user-id $openId --text $message --idempotency-key $idempotencyKey --format json } 'Send traffic suggestion failed' 2
+$idempotencyKey = if ($Force) {
+    "petstar-traffic-$($Date.ToString('yyyyMMdd'))-repair-$([datetime]::Now.ToString('HHmmss'))"
+} else {
+    "petstar-traffic-$($Date.ToString('yyyyMMdd'))"
+}
+$send = Invoke-LarkJson { & $larkCli im +messages-send --as bot --user-id $openId --text $suggestionText --idempotency-key $idempotencyKey --format json } 'Send traffic suggestion failed' 2
 $keptHistory = @($history.items | Where-Object {
     try { ([datetime]$_.date).Date -ge $Date.Date.AddDays(-90) } catch { $false }
 })

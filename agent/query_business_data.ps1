@@ -19,6 +19,7 @@ $ledgerMetaPath = Join-Path $ProjectRoot 'work\daily_ledger_meta.json'
 $lastRunPath = Join-Path $PSScriptRoot 'state\last_run.json'
 $transactionRoot = Join-Path $PSScriptRoot 'state\transactions'
 . (Join-Path $PSScriptRoot 'intervention_record.ps1')
+. (Join-Path $PSScriptRoot 'expense_accounting.ps1')
 
 function Get-WorkbookToken([string]$MetaPath) {
     if (-not (Test-Path -LiteralPath $MetaPath)) { throw "缺少工作簿元数据：$MetaPath" }
@@ -365,18 +366,23 @@ switch ($Dataset) {
         $interventionCost = [math]::Round((($interventionExpenses | ForEach-Object { Convert-Number (Get-PropertyValue $_ '费用') } | Measure-Object -Sum).Sum),2)
         $promotionCost = [math]::Round((($promotionExpenses | ForEach-Object { Convert-Number (Get-PropertyValue $_ '费用') } | Measure-Object -Sum).Sum),2)
         $otherCost = [math]::Round((($otherOperatingExpenses | ForEach-Object { Convert-Number (Get-PropertyValue $_ '费用') } | Measure-Object -Sum).Sum),2)
+        $expenseSummary = Get-PetstarExpenseSummary @(foreach($expense in $expenses) {
+            [pscustomobject]@{project=(Get-PropertyValue $expense '项目');fee=(Get-PropertyValue $expense '费用');order_no=(Get-PropertyValue $expense '订单编号');source=(Get-PropertyValue $expense '来源')}
+        })
         $payload = [ordered]@{
             date_range = [ordered]@{ start=$effectiveStart; end=$effectiveEnd }
             completed_order_count = $income.Count
             net_order_income = $netIncome
             product_and_gift_cost = $productCost
             order_delivery_fee = $deliveryFee
-            intervention_cost = $interventionCost
-            promotion_cost = $promotionCost
-            other_operating_expense = $otherCost
+            intervention_cost = $expenseSummary.intervention
+            promotion_cost = $expenseSummary.promotion
+            after_sales_delivery = $expenseSummary.after_sales
+            other_operating_expense = $expenseSummary.other
+            expense_status = $expenseSummary.status
             excluded_cash_or_management_expense = [math]::Round((($excludedExpenses | ForEach-Object { Convert-Number (Get-PropertyValue $_ '费用') } | Measure-Object -Sum).Sum),2)
-            operating_net_profit = [math]::Round($netIncome-$productCost-$deliveryFee-$interventionCost-$promotionCost-$otherCost,2)
-            formula = '真实订单扣佣后收入-货物及赠品成本-真实订单配送费-干预单成本-推广费用-其他经营费用'
+            operating_net_profit = [math]::Round($netIncome-$productCost-$deliveryFee-$expenseSummary.total,2)
+            formula = '真实订单扣佣后收入-货物及赠品成本-首次配送费-月份支出表经营费用合计（推广、补单、售后追加配送、其他费用，只扣一次）'
             note = '不扣老板人工、折旧摊销、市场租金机会成本、采购付款或老板取款；货物成本已含自然/线下订单赠品成本。'
             intervention_breakdown = @(Limit-Rows $interventionExpenses)
             promotion_breakdown = @(Limit-Rows $promotionExpenses)

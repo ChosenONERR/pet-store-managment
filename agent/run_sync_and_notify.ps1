@@ -571,6 +571,7 @@ function Assert-TargetDateInterventionCoverage {
 }
 
 function Get-DailyNetProfit {
+    . (Join-Path $PSScriptRoot 'expense_accounting.ps1')
     $incomeSheet = "$($Date.Month)月收入"
     $expenseSheet = "$($Date.Month)月支出"
     $incomeRows = Get-LedgerRows $incomeSheet 'A2:K1001'
@@ -581,22 +582,19 @@ function Get-DailyNetProfit {
         $value = Convert-ToNumber (Get-CellValue $row 6)
         if ($null -ne $value) { $orderProfit += $value }
     }
-    $expenseTotal = 0.0
-    $promotionExpense = 0.0
-    foreach ($row in $expenseRows) {
+    $expenseSummary = Get-PetstarExpenseSummary @(foreach($row in $expenseRows) {
         if (-not (Test-RowDate (Get-CellValue $row 0) $Date)) { continue }
-        $value = Convert-ToNumber (Get-CellValue $row 2)
-        if ($null -ne $value) {
-            $expenseTotal += $value
-            $project = [string](Get-CellValue $row 1)
-            if ($project -match '推广|广告|竞价') { $promotionExpense += $value }
-        }
-    }
+        [pscustomobject]@{project=(Get-CellValue $row 1);fee=(Get-CellValue $row 2);order_no=(Get-CellValue $row 3);source=(Get-CellValue $row 4)}
+    })
+    $expenseTotal = $expenseSummary.total
+    $promotionExpense = $expenseSummary.promotion
     return [pscustomobject]@{
         order_profit = [math]::Round($orderProfit, 2)
         expense_total = [math]::Round($expenseTotal, 2)
         promotion_expense = [math]::Round($promotionExpense, 2)
         net_profit = [math]::Round($orderProfit - $expenseTotal, 2)
+        expense_status = $expenseSummary.status
+        pending_expenses = $expenseSummary.pending
     }
 }
 
@@ -1602,6 +1600,7 @@ try {
     # 当日利润与推广费是账目提交条件；通知卡片中的库存、临期和提醒信息不是。
     # 先完成关键财务回读，避免纯通知读取故障把已通过完整性审计的整套账目回滚。
     $stage = Invoke-WithRetry 'daily_profit_readback' { Get-DailyNetProfit } 3
+    foreach($pendingExpense in @($stage.value.pending_expenses)) { $syncWarnings.Add("费用待核对，利润暂估：$pendingExpense") }
     $dailyProfit = $stage.value
 
     if ($null -ne $promotionCapture) {

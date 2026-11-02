@@ -32,6 +32,7 @@ $larkCli = Join-Path $PSScriptRoot 'lark_cli_noexit.ps1'
 . (Join-Path $PSScriptRoot 'finance_transaction.ps1')
 . (Join-Path $PSScriptRoot 'intervention_record.ps1')
 . (Join-Path $PSScriptRoot 'refund_adjustments.ps1')
+. (Join-Path $PSScriptRoot 'expense_accounting.ps1')
 $stateRoot = Join-Path $ProjectRoot 'agent\state'
 $script:financeTransaction = Join-FinanceTransaction $stateRoot
 $script:financeTransactionOwner = $false
@@ -771,6 +772,8 @@ foreach ($monthSheet in $monthSheets) {
     if ($expenseMatrix.Count -gt 0) { $checkExpense = (Get-SheetRows $ledgerToken $monthSheet.expense "A2:F$($expenseMatrix.Count+1)").rows }
     if (@($checkIncome).Count -ne $incomeMatrix.Count) { throw "$($monthSheet.income) 回读行数不一致" }
     if (@($checkExpense).Count -ne $expenseMatrix.Count) { throw "$($monthSheet.expense) 回读行数不一致" }
+    # One source of truth: expense rows, never a second intervention deduction.
+    $expenseSummary = Update-PetstarMonthExpenses -Month $monthStart -SourceToken $sourceToken -LedgerToken $ledgerToken -Cli $larkCli -Transaction $script:financeTransaction -Entries $expenseEntries
     for ($checkIndex = 0; $checkIndex -lt $checkIncome.Count; $checkIndex++) {
         $row = $checkIncome[$checkIndex]
         $orderNo = Get-CellValue $row 1
@@ -846,6 +849,7 @@ foreach ($monthSheet in $monthSheets) {
         automatic_intervention_expense_rows = $autoExpenseCount
         preserved_manual_expense_rows = $expenseMatrix.Count - $autoExpenseCount
         promotion_expense = $promotionExpenseTotal
+        operating_expenses = $expenseSummary
     }
 }
 
