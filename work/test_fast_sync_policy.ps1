@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path $PSScriptRoot -Parent
 $syncPath = Join-Path $projectRoot 'agent\run_sync_and_notify.ps1'
 $orderSyncPath = Join-Path $projectRoot 'work\sync_meituan_orders.ps1'
@@ -108,7 +108,7 @@ $orderTokens = $null
 $orderErrors = $null
 $orderAst = [Management.Automation.Language.Parser]::ParseFile($orderSyncPath, [ref]$orderTokens, [ref]$orderErrors)
 if (@($orderErrors).Count -gt 0) { throw "sync_meituan_orders.ps1 parse failed: $(@($orderErrors).Message -join '; ')" }
-$requiredFunctions = @('Convert-ToExcelSerial','Convert-DateDisplayToSerial','Convert-ToComparableText','Convert-ToComparableNumber','Convert-ToComparableDate','Get-RecordsFingerprint','New-SummaryBusinessRecord')
+$requiredFunctions = @('Convert-ToExcelSerial','Convert-DateDisplayToSerial','Convert-ToComparableText','Convert-ToComparableNumber','Convert-ToComparableDate','Convert-ToComparableCalendarDate','Get-RecordsFingerprint','New-SummaryBusinessRecord','New-InterventionBusinessRecord')
 foreach ($functionName in $requiredFunctions) {
     $matches = @($orderAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName }, $true))
     if ($matches.Count -ne 1) { throw "Expected exactly one $functionName function" }
@@ -129,6 +129,44 @@ if ($baseFingerprint -ne $sameFingerprint) { throw 'identical business data must
 if ($baseFingerprint -eq $changedFingerprint) { throw 'changed business data must have a different fingerprint' }
 
 $orderSyncSource = [IO.File]::ReadAllText($orderSyncPath, [Text.Encoding]::UTF8)
+. (Join-Path $projectRoot 'agent\intervention_record.ps1')
+$dateBlockStart = $orderSyncSource.IndexOf('$interventionUpdated = 0')
+$dateBlockEnd = $orderSyncSource.IndexOf('$interventionCells = @()', $dateBlockStart)
+if($dateBlockStart -lt 0 -or $dateBlockEnd -le $dateBlockStart){throw 'Cannot locate intervention date reconciliation'}
+$dateBlock = $orderSyncSource.Substring($dateBlockStart,$dateBlockEnd-$dateBlockStart)
+function Format-InterventionContents($Items){ return 'known contents' }
+$testDateCases = @(
+    @{value='2026-11-02';repair=$false},
+    @{value='2026-11-02 14:30';repair=$false},
+    @{value=(Convert-ToExcelSerial '2026-11-02' '14:30');repair=$false},
+    @{value=$null;repair=$true},
+    @{value='2026-11-01 23:59';repair=$true},
+    @{value='2026-10-31 23:59';repair=$true}
+)
+foreach($case in $testDateCases){
+    $id='1234567890123456789'
+    $record=[pscustomobject]@{DateTime=$case.value;OrderNo=$id;DailyOrderNo='test 1';Person='test';Amount=20;DeliveryType='自配送';PlatformFee=2;DeliveryFee=0;RestoreState='已恢复';Reviewed='';Contents='known contents';Note=''}
+    $before=Get-RecordsFingerprint @((New-InterventionBusinessRecord $record))
+    $interventionRecords=[ordered]@{};$interventionRecords[$id]=$record
+    $interventionSet=[Collections.Generic.HashSet[string]]::new();$null=$interventionSet.Add($id)
+    $summaryById=[ordered]@{};$summaryById[$id]=[pscustomobject]@{OrderDate='2026-11-02';DailyOrderNo='test 1';CustomerPay=20;PlatformFees=2;ItemCount=1}
+    $changedOrderNumbers=[Collections.Generic.HashSet[string]]::new()
+    $extract=[pscustomobject]@{orders=@([pscustomobject]@{orderNo=$id;orderDate='2026-11-02';orderTime='14:30';dailyOrderNo=$null;customerPay=20;platformFees=2;deliveryFee=0;status='已完成';items=@()})}
+    $itemRecords=@()
+    Invoke-Expression $dateBlock
+    if($interventionIssues.Count -ne 0){throw 'Complete intervention incorrectly flagged'}
+    if($case.repair){
+        if($interventionRepairs.Count -ne 1 -or @($interventionRepairs[0].fields) -notcontains '日期' -or $changedOrderNumbers.Count -ne 1){throw 'Missing/wrong business day was not repaired'}
+        if((Convert-ToComparableCalendarDate $record.DateTime) -ne (Convert-ToComparableCalendarDate '2026-11-02')){throw 'Repair picked the wrong date'}
+    }else{
+        $after=Get-RecordsFingerprint @((New-InterventionBusinessRecord $record))
+        if($interventionRepairs.Count -ne 0 -or $changedOrderNumbers.Count -ne 0 -or $before -ne $after){throw 'Same-day time difference caused a false repair or needless month refresh'}
+        if([string]$record.DateTime -ne [string]$case.value){throw 'Existing order time was overwritten'}
+    }
+    if($record.DeliveryFee -ne 0 -or $record.PlatformFee -ne 2 -or $record.RestoreState -ne '已恢复'){throw 'Date reconciliation changed expenses or inventory state'}
+    Invoke-Expression $dateBlock
+    if($interventionRepairs.Count -ne 0 -or $changedOrderNumbers.Count -ne [int]$case.repair){throw 'Second run repeated a date repair'}
+}
 if ($orderSyncSource -notmatch '\$dataChanged\s*=.+\$summaryChanged.+\$itemsChanged.+\$interventionsChanged') {
     throw 'order data_changed must include summary, item and intervention changes'
 }
@@ -154,6 +192,8 @@ if ($cliSource -notmatch '--full-rebuild' -or $cliSource -notmatch '\("FullRebui
 
 [ordered]@{
     ok = $true
-    cases = 27
+    cases = 33
+    date_reconciliation_cases = 6
+    date_reconciliation_external_writes = 0
     covered = @('midday_no_change_skips','reminder_no_change_skips','night_no_change_uses_light_audit','manual_no_change_skips','explicit_full_does_not_skip','order_change_is_targeted','gift_change_is_targeted','missing_evidence_does_not_skip','order_missing_ok_does_not_skip','order_ok_false_does_not_skip','gift_missing_ok_does_not_skip','gift_ok_false_does_not_skip','new_order_uses_incremental','manual_recovery_uses_incremental','night_change_is_targeted','explicit_full_retains_full','refund_is_targeted','intervention_is_targeted','gift_is_targeted','existing_order_change_is_targeted','same_data_same_fingerprint','changed_data_different_fingerprint','all_order_domains_compared','writes_guarded_by_change','incremental_cost_writes_are_targeted','full_cost_repair_is_preserved','cli_full_rebuild_escape_hatch')
 } | ConvertTo-Json -Depth 4

@@ -182,6 +182,15 @@ function Convert-ToComparableDate($Value) {
     return Convert-ToComparableNumber $serial $false
 }
 
+function Convert-ToComparableCalendarDate($Value) {
+    # Intervention dates are business days, not delivery/order timestamps.
+    # Keep the stored time, but ignore it when detecting a date repair.
+    if ($null -eq $Value -or [string]$Value -eq '') { return '' }
+    $serial = Convert-ToComparableDate $Value
+    $number = [double]::Parse($serial, [Globalization.CultureInfo]::InvariantCulture)
+    return [math]::Floor($number).ToString('0', [Globalization.CultureInfo]::InvariantCulture)
+}
+
 function Get-RecordsFingerprint($Records) {
     $lines = @($Records | ForEach-Object { ConvertTo-Json -InputObject $_ -Depth 6 -Compress } | Sort-Object)
     $payload = $lines -join "`n"
@@ -761,7 +770,8 @@ foreach ($order in @($extract.orders)) {
         $interventionRecords[$id] = [ordered]@{DateTime=$null;DailyOrderNo=$null;Person=$null;OrderNo=$id;Amount=$null;DeliveryType=$null;PlatformFee=$null;DeliveryFee=$null;RestoreState='待恢复';Reviewed=$null;Contents=$null;Note='用户确认的历史干预订单'}
     }
     $record = $interventionRecords[$id]
-    $record.DateTime = Convert-ToExcelSerial ([string]$order.orderDate) ([string]$order.orderTime)
+    # Reconcile the persisted date against the order summary below. Do not
+    # replace it with the extraction time and then report that as a repair.
     $record.Contents = Format-InterventionContents $order.items
     if ($order.dailyOrderNo) { $record.DailyOrderNo = "美团$($order.dailyOrderNo)号单" }
     $record.Amount = $order.customerPay
@@ -796,7 +806,7 @@ foreach ($record in $interventionRecords.Values) {
     $repairedFields = [Collections.Generic.List[string]]::new()
     if ($summaryById.Contains($orderNo)) {
         $summary = $summaryById[$orderNo]
-        if ($summary.OrderDate -and (Convert-ToComparableDate $record.DateTime) -ne (Convert-ToComparableDate $summary.OrderDate)) {
+        if ($summary.OrderDate -and (Convert-ToComparableCalendarDate $record.DateTime) -ne (Convert-ToComparableCalendarDate $summary.OrderDate)) {
             $record.DateTime = $summary.OrderDate
             $repairedFields.Add('日期')
         }
