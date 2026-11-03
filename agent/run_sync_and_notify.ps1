@@ -71,7 +71,7 @@ if ($Mode -ne 'manual' -and (Test-Path -LiteralPath $interactivePriorityPath)) {
 }
 
 if (-not (Test-Path -LiteralPath $metaPath)) { throw '缺少飞书经营驾驶舱元数据' }
-$meta = Get-Content -LiteralPath $metaPath -Raw | ConvertFrom-Json
+$meta = Get-Content -LiteralPath $metaPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $spreadsheetToken = ([uri]$meta.workbook_url).Segments[-1].Trim('/')
 . (Join-Path $PSScriptRoot 'finance_transaction.ps1')
 . (Join-Path $PSScriptRoot 'sku_master_schema.ps1')
@@ -606,6 +606,19 @@ function Assert-FormulaRange([string]$SheetName, [string]$Range) {
         $result = Invoke-LarkJson { lark-cli sheets +formula-verify --as user --spreadsheet-token $spreadsheetToken --sheet-name $SheetName --range $continuousRange --format json --exit-on-error } "公式校验调用失败：$SheetName $continuousRange"
         if ($result.data.status -ne 'success') { throw "公式存在错误：$SheetName $continuousRange" }
     }
+}
+
+function Get-DeliveryFeeFailureWarning([string]$Reason) {
+    $cause = if ($Reason -match 'DELIVERY_LOCAL_JSON_FAILED|Invalid object passed|ConvertFrom-Json') {
+        '本地配置或待查数据读取失败，请检查本机UTF-8配置文件；不是平台登录判断'
+    } elseif ($Reason -match '(?i)MEITUAN_CDP|DevTools|CDP.*(?:unavailable|未连接|未就绪)|Could not connect to Chrome') {
+        '浏览器连接未就绪，请保持已授权Chrome打开'
+    } elseif ($Reason -match '(?i)AUTH_REQUIRED|login required|登录(?:态)?(?:已)?失效|未登录') {
+        '配送平台需要登录，请检查麦芽田、青云聚信登录状态'
+    } else {
+        '配送费查询或处理失败，具体原因已保留在本机分阶段日志；不能据此判断为登录失效'
+    }
+    return "配送费待核对：$cause；原费用不动，下一小时自动重查。"
 }
 
 function Invoke-JsonPowerShellScript([string]$Path, [hashtable]$Arguments) {
@@ -1545,7 +1558,7 @@ try {
             # roll back the shared transaction, never commit partial updates.
             if ($_.Exception.Message -match 'DELIVERY_WRITE_FAILED:') { throw }
             $operationalDegraded = $true
-            $syncWarnings.Add('配送费待核对：配送平台查询未完成，请检查麦芽田、青云聚信登录状态；原费用不动，下一小时自动重查。')
+            $syncWarnings.Add((Get-DeliveryFeeFailureWarning $_.Exception.Message))
         }
     }
 

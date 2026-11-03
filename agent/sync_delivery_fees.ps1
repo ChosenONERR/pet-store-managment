@@ -12,7 +12,11 @@ if (-not $ProjectRoot) { $ProjectRoot = Split-Path $PSScriptRoot -Parent }
 . (Join-Path $PSScriptRoot 'intervention_record.ps1')
 . (Join-Path $PSScriptRoot 'order_actual_overrides.ps1')
 $lark = Join-Path $PSScriptRoot 'lark_cli_noexit.ps1'
-$meta = Get-Content -Raw (Join-Path $ProjectRoot 'work\simple_finance_meta.json') | ConvertFrom-Json
+function Read-DeliveryJson([string]$Path,[string]$Label) {
+    try { return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json) }
+    catch { throw "DELIVERY_LOCAL_JSON_FAILED: $Label 无法按UTF-8读取或解析；请检查该本地文件，原配送费保持不动" }
+}
+$meta = Read-DeliveryJson (Join-Path $ProjectRoot 'work\simple_finance_meta.json') '经营工作簿绑定'
 $token = ([uri]$meta.workbook_url).Segments[-1].Trim('/')
 $stateRoot = Join-Path $ProjectRoot 'agent\state'
 $pendingPath = Join-Path $stateRoot 'delivery_fee_pending.json'
@@ -63,10 +67,10 @@ try {
         if(Test-ActiveInterventionOrderNo $id){$interventions[$id]=$true}
     }
     $seedPath=Join-Path $ProjectRoot 'work\intervention_orders.json'
-    if(Test-Path -LiteralPath $seedPath){foreach($id in @((Get-Content -Raw $seedPath|ConvertFrom-Json).intervention_order_ids)){$interventions[[string]$id]=$true}}
+    if(Test-Path -LiteralPath $seedPath){foreach($id in @((Read-DeliveryJson $seedPath '干预订单种子').intervention_order_ids)){$interventions[[string]$id]=$true}}
     $overrides=@{};foreach($o in @(Get-OrderActualOverrides $ProjectRoot)){$overrides[[string]$o.order_no]=$o}
     $pending=@()
-    if(Test-Path -LiteralPath $pendingPath){$pending=@((Get-Content -Raw $pendingPath|ConvertFrom-Json).orders)}
+    if(Test-Path -LiteralPath $pendingPath){$pending=@((Read-DeliveryJson $pendingPath '配送费待查队列').orders)}
     $pendingIds=@{};foreach($p in $pending){$pendingIds[[string]$p.order_no]=$true}
     $orders=[Collections.Generic.List[object]]::new();$byId=@{};$monthKeys=@{}
     for($i=0;$i -lt $rows.Count;$i++){
@@ -87,7 +91,7 @@ try {
     }
     # Income-sheet direct edits have priority even before the old manual-fee
     # migration has copied them into the authoritative summary.
-    $ledgerMeta=Get-Content -Raw (Join-Path $ProjectRoot 'work\daily_ledger_meta.json')|ConvertFrom-Json
+    $ledgerMeta=Read-DeliveryJson (Join-Path $ProjectRoot 'work\daily_ledger_meta.json') '每日经营简账绑定'
     $ledgerToken=([uri]$ledgerMeta.workbook_url).Segments[-1].Trim('/')
     $book=Invoke-DeliveryLark { & $lark sheets +workbook-info --as user --spreadsheet-token $ledgerToken --format json }
     $sheetNames=@($book.data.sheets|ForEach-Object {$_.sheet_name})

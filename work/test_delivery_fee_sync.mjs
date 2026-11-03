@@ -62,7 +62,15 @@ try{
   let result=await readProviderPage('maiyatian',['2026-11-03'],[id]);assert.equal(result[0].amount,6.78);assert.equal(result[0].state,'complete');cases++;
   assert.equal(JSON.stringify(result).includes('token'),false);cases++;
   respond=u=>u.pathname==='/order/detail/'?{errno:1,data:{source_id:id,delivery:{id:'123',status:50,send_fee:678,discount_fee:100}}}:{errno:1,data:[row]};
-  result=await readProviderPage('maiyatian',['2026-11-03'],[id]);assert.equal(result[0].state,'ambiguous');cases++;
+  result=await readProviderPage('maiyatian',['2026-11-03'],[id]);assert.equal(result[0].state,'complete');assert.equal(result[0].amount,6.78);cases++;
+  // Real incident: the displayed delivery charge is 3.87, discount metadata
+  // is 0.38. Neither block it nor incorrectly turn the charge into 3.49.
+  respond=u=>u.pathname==='/order/detail/'?{errno:1,data:{source_id:id,delivery:{id:'123',status:'50',send_fee:'387',discount_fee:'38',premium_fee:'0',damage_fee:'0',tip:'0'}}}:{errno:1,data:[{...row,delivery:{id:'123',status:50,send_fee:387,tip:0}}]};
+  result=await readProviderPage('maiyatian',['2026-11-03'],[id]);assert.equal(result[0].state,'complete');assert.equal(result[0].amount,3.87);cases++;
+  for(const extra of [{premium_fee:20},{damage_fee:20},{tip:20},{discount_fee:'unknown'}]){
+    respond=u=>u.pathname==='/order/detail/'?{errno:1,data:{source_id:id,delivery:{id:'123',status:50,send_fee:678,...extra}}}:{errno:1,data:[row]};
+    result=await readProviderPage('maiyatian',['2026-11-03'],[id]);assert.equal(result[0].state,'ambiguous');cases++;
+  }
   respond=()=>({errno:1,data:[{...row,delivery:{id:'123',status:20,send_fee:678}}]});
   result=await readProviderPage('maiyatian',['2026-11-03'],[id]);assert.equal(result[0].state,'pending');assert.equal(result[0].amount,null);cases++;
   respond=()=>({errno:1,data:[{...row,order_date:'2026-11-02'}]});

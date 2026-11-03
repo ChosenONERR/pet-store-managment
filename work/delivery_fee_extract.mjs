@@ -85,9 +85,12 @@ export async function readProviderPage(provider, dates, ids) {
             if(detail.errno!==1 || String(detail.data?.source_id)!==orderNo)throw Error('Detail identity mismatch');
             const d=detail.data.delivery;
             ambiguous ||= String(d?.id)!==deliveryId || Number(d?.status)!==50 || yuan(d?.send_fee)!==amount;
-            // Nonzero discounts/insurance/surcharges need a bill-level check;
-            // do not invent whether these are already included in send_fee.
-            ambiguous ||= ['discount_fee','premium_fee','damage_fee','tip'].some(k=>Number(d?.[k] || 0)!==0) || Number(delivery?.tip || 0)!==0;
+            // The merchant page's data-detail-goods-template renders its
+            // "配送费用" as delivery.send_fee / 100, even when discount_fee
+            // is positive. Use that displayed charge; never subtract the
+            // discount again. Other paid extras still require a bill check.
+            ambiguous ||= yuan(d?.discount_fee ?? 0)===null ||
+              ['premium_fee','damage_fee','tip'].some(k=>Number(d?.[k] || 0)!==0) || Number(delivery?.tip || 0)!==0;
           }
         } else {
           delivery=r.orderDeliveryInfo;deliveryId=String(r.deliveryId || '');

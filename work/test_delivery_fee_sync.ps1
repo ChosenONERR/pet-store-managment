@@ -6,7 +6,7 @@ $errors=$null;$tokens=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile($file,[ref]$tokens,[ref]$errors)
 if(@($errors).Count){throw ($errors.Message -join ';')}
 if('WorkRoot' -notin @($ast.ParamBlock.Parameters|ForEach-Object {$_.Name.VariablePath.UserPath})){throw 'Scheduled child helper always supplies WorkRoot'}
-foreach($name in @('Convert-DeliveryDay','Set-DeliveryCell','Get-DeliveryCell')){
+foreach($name in @('Convert-DeliveryDay','Set-DeliveryCell','Get-DeliveryCell','Read-DeliveryJson')){
     $f=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true))
     if($f.Count -ne 1){throw "Missing $name"};Invoke-Expression $f[0].Extent.Text
 }
@@ -15,6 +15,19 @@ if((Convert-DeliveryDay '2026-11-03 19:00') -ne '2026-11-03'){throw 'Calendar da
 Set-StrictMode -Version 2
 if($null -ne (Get-DeliveryCell @([pscustomobject]@{}) 0)){throw 'Empty cell should remain unknown'}
 if($null -ne (Get-DeliveryCell @([pscustomobject]@{value='x'}) 3)){throw 'Missing cell should remain unknown'}
+# Exercise the real decoder with a no-BOM UTF-8 file and Chinese path, as used
+# by the Windows 5.1 scheduled job. Only these self-created temp files are removed.
+$fixture=Join-Path ([IO.Path]::GetTempPath()) ('petstar-delivery-utf8-'+[guid]::NewGuid().ToString('N')+'.json')
+$chineseFixture=$fixture.Replace('.json','-中文配置.json')
+try {
+    $expected='宠速星｜每日经营简账'
+    [IO.File]::WriteAllText($chineseFixture,('{"title":"'+$expected+'","orders":[]}'),[Text.UTF8Encoding]::new($false))
+    $parsed=Read-DeliveryJson $chineseFixture '离线配置'
+    if($parsed.title -ne $expected){throw 'No-BOM Chinese UTF-8 JSON was corrupted'}
+    [IO.File]::WriteAllText($fixture,'{"private_marker":"never-display-this", BROKEN}',[Text.UTF8Encoding]::new($false))
+    $caught='';try{$null=Read-DeliveryJson $fixture '离线配置'}catch{$caught=$_.Exception.Message}
+    if($caught -notmatch 'DELIVERY_LOCAL_JSON_FAILED' -or $caught -match 'never-display-this|private_marker'){throw 'Invalid local JSON must fail safely without leaking content'}
+}finally{foreach($path in @($fixture,$chineseFixture)){if(Test-Path -LiteralPath $path){Remove-Item -LiteralPath $path -Force}}}
 function Register-FinanceRangeBeforeImage {param($a,$b,$c,$d,$e,$f)$script:captured=$e}
 function Invoke-DeliveryLark {param($Command)$null}
 $transaction=[pscustomobject]@{id='offline-test'};$token='offline-test';$lark='offline-test'
@@ -27,9 +40,15 @@ foreach($contract in @('Join-FinanceTransaction','人工确认配送费','manual
     if($source -notmatch $contract){throw "Missing safety contract: $contract"}
 }
 $run=[IO.File]::ReadAllText((Join-Path $root 'agent\run_sync_and_notify.ps1'),[Text.Encoding]::UTF8)
+$runAst=[Management.Automation.Language.Parser]::ParseInput($run,[ref]$null,[ref]$null)
+$formatter=$runAst.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-DeliveryFeeFailureWarning'},$true)
+Invoke-Expression $formatter.Extent.Text
+if((Get-DeliveryFeeFailureWarning 'DELIVERY_LOCAL_JSON_FAILED: fixture') -notmatch '本地配置' -or (Get-DeliveryFeeFailureWarning 'unexpected bug') -match '请检查.*登录状态'){throw 'Local/runtime errors must not be mislabeled as login expiration'}
+if((Get-DeliveryFeeFailureWarning 'Could not connect to Chrome DevTools') -notmatch '浏览器连接'){throw 'CDP error category lost'}
+if((Get-DeliveryFeeFailureWarning 'login required') -notmatch '平台需要登录'){throw 'Explicit auth error category lost'}
 if($run.IndexOf("'delivery_fee_sync'") -ge $run.IndexOf('$useNoChangeFastPath = Test-UseNoChangeFastPath')){throw 'Fee check skipped on no-change runs'}
 if($run -notmatch '\$deliveryOnlyChange -and \[int\]\$giftReconcileResult.updated_cells -eq 0'){throw 'Fee-only updates rebuild costs'}
 if($run -notmatch 'DELIVERY_WRITE_FAILED:' -or $run -notmatch 'delivery_fee_alert'){throw 'No rollback/notification handling'}
 $order=[IO.File]::ReadAllText((Join-Path $root 'work\sync_meituan_orders.ps1'),[Text.Encoding]::UTF8)
 if($order -notmatch '\$automaticDeliveryMarker' -or $order -notmatch '\$existingSummary.DeliveryFee-\$automaticDelivery'){throw 'Automatic fee does not survive later Meituan sync/manual edit'}
-[ordered]@{ok=$true;cases=20;external_writes=0}|ConvertTo-Json -Compress
+[ordered]@{ok=$true;cases=25;external_writes=0;utf8_without_bom=$true}|ConvertTo-Json -Compress
