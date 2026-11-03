@@ -1,4 +1,4 @@
-param(
+﻿param(
     [datetime]$Date = [datetime]::Today,
     [string]$ProjectRoot,
     [switch]$DryRun,
@@ -28,6 +28,7 @@ $spreadsheetToken = ([uri]$meta.workbook_url).Segments[-1].Trim('/')
 $openId = [string]$identity.open_id
 if (-not $openId) { throw 'Cached Lark recipient identity has no open_id' }
 $dateKey = $Date.ToString('yyyy-MM-dd')
+. (Join-Path $agentRoot 'keyword_library.ps1')
 
 function Invoke-LarkJson([scriptblock]$Action,[string]$FailureMessage,[int]$MaxAttempts=3) {
     $last = $null
@@ -69,7 +70,7 @@ if (Test-Path -LiteralPath $historyPath -PathType Leaf) {
     try { $history = [IO.File]::ReadAllText($historyPath,[Text.Encoding]::UTF8) | ConvertFrom-Json } catch {}
 }
 $existingToday = @($history.items | Where-Object { [string]$_.date -eq $dateKey })
-if ($existingToday.Count -gt 0 -and -not $Force) {
+if ($existingToday.Count -gt 0 -and -not $Force -and -not $DryRun) {
     [ordered]@{ok=$true;skipped=$true;reason='suggestion already sent';suggestion=$existingToday[-1]} | ConvertTo-Json -Depth 8
     exit 0
 }
@@ -79,6 +80,12 @@ $orderResult = Invoke-LarkJson { & $larkCli sheets +cells-get --as user --spread
 if ($inventoryResult.data.has_more -or $orderResult.data.has_more) { throw 'Lark read was incomplete' }
 $inventoryRows = @($inventoryResult.data.ranges[0].cells)
 $orderRows = @($orderResult.data.ranges[0].cells)
+$keywordResult = Invoke-LarkJson { & $larkCli sheets +cells-get --as user --spreadsheet-token $spreadsheetToken --sheet-name $config.keyword_sheet --range 'A1:D1001' --include value --max-chars 1000000 --format json } '读取关键词库失败，请检查关键词库工作表'
+if($keywordResult.data.has_more){throw '关键词库读取不完整，已停止推荐，未回退固定关键词'}
+$keywordRows=@($keywordResult.data.ranges[0].cells)
+if($keywordRows.Count -ge 1001 -and (@($keywordRows[1000]|Where-Object {$_.value}).Count -gt 0)){throw '关键词库超过1000行读取范围，请先扩展读取范围'}
+$library=@(ConvertFrom-KeywordLibrary $keywordRows)
+$rotatedKeywords=@(Get-RotatedKeywords $library @($history.items) $Date)
 
 $latestInventoryDate = [datetime]::MinValue
 foreach ($row in $inventoryRows) {
@@ -119,29 +126,22 @@ foreach ($row in $inventoryRows) {
     $daysSince = if ($lastHistory.Count -gt 0) { ($Date.Date - ([datetime]$lastHistory[0].date).Date).TotalDays } else { 999.0 }
     $score = ([math]::Min($stock,100.0) * 0.2) + ([math]::Min($monthSales,30.0) * 0.1) + ([math]::Min($recentNatural,30.0) * 0.05) + ([math]::Min($daysSince,60.0) * 0.5)
     $fallbackCandidates.Add([pscustomobject]@{code=$code;name=$name;stock=$stock;month_sales=$monthSales;recent_natural=$recentNatural;rule_index=-1;keyword=[string]$config.fallback_keyword;action=[string]$config.fallback_action;score=$score})
-    for ($ruleIndex = 0; $ruleIndex -lt @($config.rules).Count; $ruleIndex++) {
-        $rule = @($config.rules)[$ruleIndex]
-        $matched = $false
-        foreach ($pattern in @($rule.include)) { if ($name -like "*$pattern*") { $matched = $true; break } }
-        if (-not $matched) { continue }
-        foreach ($pattern in @($rule.exclude)) { if ($name -like "*$pattern*") { $matched = $false; break } }
-        if (-not $matched) { continue }
-        $candidates.Add([pscustomobject]@{code=$code;name=$name;stock=$stock;month_sales=$monthSales;recent_natural=$recentNatural;rule_index=$ruleIndex;keyword=[string]$rule.keyword;action=[string]$rule.action;score=$score})
+    foreach ($entry in $library) {
+        if(-not (Test-KeywordProductMatch $entry $code $name $config)){continue}
+        $action='检查商品展示是否准确对应“{0}”，并复核主图、折扣价、库存和推广状态。' -f $entry.keyword
+        $candidates.Add([pscustomobject]@{code=$code;name=$name;stock=$stock;month_sales=$monthSales;recent_natural=$recentNatural;rule_index=$entry.index;keyword=$entry.keyword;action=$action;score=$score})
     }
 }
-if ($candidates.Count -eq 0) {
-    foreach ($candidate in $fallbackCandidates) { $candidates.Add($candidate) }
-}
-if ($candidates.Count -eq 0) { throw 'No in-stock selling product is available for the daily traffic suggestion' }
-
-$primaryRule = $Date.DayOfYear % @($config.rules).Count
 $selected = $null
-for ($offset = 0; $offset -lt @($config.rules).Count; $offset++) {
-    $ruleIndex = ($primaryRule + $offset) % @($config.rules).Count
+foreach ($entry in $rotatedKeywords) {
+    $ruleIndex = $entry.index
     $pool = @($candidates | Where-Object { $_.rule_index -eq $ruleIndex } | Sort-Object @{Expression='score';Descending=$true},code)
     if ($pool.Count -gt 0) { $selected = $pool[0]; break }
 }
-if ($null -eq $selected) { $selected = @($candidates | Sort-Object @{Expression='score';Descending=$true},code)[0] }
+if ($null -eq $selected) {
+    $nextKeyword=if($rotatedKeywords.Count){$rotatedKeywords[0].keyword}else{''}
+    $selected=[pscustomobject]@{keyword=$nextKeyword;code='';name='请在关键词库填写关联货号，或核对对应商品的在售状态与库存';stock=0;recent_natural=0;action=$(if($library.Count){'关键词暂未关联到在售有库存商品，请维护关键词库或核对库存。'}else{'关键词库没有启用词，请新增关键词并把“启用”设为“是”。'})}
+}
 
 $stockText = if ([math]::Abs($selected.stock - [math]::Round($selected.stock)) -lt 0.000001) { [string][int][math]::Round($selected.stock) } else { '{0:0.##}' -f $selected.stock }
 $salesText = if ([math]::Abs($selected.recent_natural - [math]::Round($selected.recent_natural)) -lt 0.000001) { [string][int][math]::Round($selected.recent_natural) } else { '{0:0.##}' -f $selected.recent_natural }
@@ -154,8 +154,11 @@ $suggestionText = @(
     "\u4eca\u5929\uff1a$($selected.action)"
 ) -join "`n"
 $suggestionText = [regex]::Unescape($suggestionText)
+if(-not $selected.code){
+    $suggestionText=(@([string]$config.message_title,$(if($selected.keyword){'搜索词：'+$selected.keyword}),'提醒：'+$selected.action) -join "`n")
+}
 
-$result = [ordered]@{date=$dateKey;keyword=$selected.keyword;code=$selected.code;name=$selected.name;stock=$selected.stock;recent_30d_natural_sales=$selected.recent_natural;action=$selected.action;inventory_snapshot=$latestInventoryDate.ToString('yyyy-MM-dd');message=$suggestionText}
+$result = [ordered]@{date=$dateKey;keyword=$selected.keyword;keyword_source=[string]$config.keyword_sheet;enabled_keyword_count=$library.Count;code=$selected.code;name=$selected.name;stock=$selected.stock;recent_30d_natural_sales=$selected.recent_natural;action=$selected.action;inventory_snapshot=$latestInventoryDate.ToString('yyyy-MM-dd');message=$suggestionText}
 if ($DryRun) {
     [ordered]@{ok=$true;dry_run=$true;suggestion=$result} | ConvertTo-Json -Depth 8
     exit 0

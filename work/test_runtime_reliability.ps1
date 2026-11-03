@@ -276,6 +276,10 @@ $contracts = [ordered]@{
         $trafficSuggestion -match '\$stock -le 0' -and
         $trafficSuggestion -match 'recent_natural' -and
         $trafficSuggestion -match '\$fallbackCandidates' -and
+        $trafficSuggestion -match 'config.keyword_sheet' -and
+        $trafficSuggestion -match 'ConvertFrom-KeywordLibrary' -and
+        $trafficSuggestion -match 'Get-RotatedKeywords' -and
+        [string]$trafficSuggestionRules.keyword_sheet -eq '关键词库' -and
         $trafficSuggestion -match 'suggestion already sent' -and
         $trafficSuggestion -match '\+messages-send' -and
         $trafficSuggestion -match '--text \$suggestionText' -and

@@ -1,6 +1,7 @@
 {
   "inventory_sheet": "库存快照",
   "order_items_sheet": "订单商品",
+  "keyword_sheet": "关键词库",
   "message_title": "📌 今日引流款运营建议",
   "recent_sales_note": "仅作参考，不作为是否推荐的门槛",
   "fallback_keyword": "宠物用品",
