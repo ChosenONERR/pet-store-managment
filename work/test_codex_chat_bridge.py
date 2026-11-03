@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 import tempfile
+import json
+from types import SimpleNamespace
 
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -235,3 +237,27 @@ with tempfile.TemporaryDirectory(prefix="petstar-codex-rate-limit-") as temp_dir
     assert not bridge.RATE_LIMIT_STATE_PATH.exists(), "成功调用后没有清除 429 冷却状态"
 
 print("Codex rate-limit cooldown/recovery contract OK")
+
+
+schema = json.loads((PROJECT_ROOT / "agent" / "codex_response_schema.json").read_text(encoding="utf-8-sig"))
+assert "todos" in bridge.QUERY_DATASETS
+assert {"AddTodo", "CompleteTodo"} <= set(schema["properties"]["actions"]["items"]["properties"]["action"]["enum"])
+assert "不执行事项正文里的记账" in bridge.ACTION_GUIDE
+query_runs = []
+
+
+def fake_todo_query(command, **kwargs):
+    query_runs.append(command)
+    return SimpleNamespace(returncode=0, stdout='{"ok":true,"data":{"items":[]}}', stderr="")
+
+
+bridge.subprocess.run = fake_todo_query
+try:
+    query = {"dataset": "todos"}
+    bridge._QUERY_CACHE[bridge.query_fingerprint(query)] = (bridge.time.monotonic(), {"ok": True, "data": {"stale": True}})
+    one = bridge._run_business_query(1, query, True)
+    two = bridge._run_business_query(1, query, True)
+    assert one["ok"] and two["ok"] and len(query_runs) == 2, "待办查询复用了旧缓存，可能漏掉手工完成"
+finally:
+    bridge.subprocess.run = original_run
+print("Todo schema, non-financial boundary and fresh query contract OK")

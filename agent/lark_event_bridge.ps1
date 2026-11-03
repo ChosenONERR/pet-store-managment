@@ -419,6 +419,11 @@ function Format-NonExecutableCodexReply([string]$Text) {
     return $reply
 }
 
+function Invoke-PetstarTodoActions($Event,$Actions) {
+    . (Join-Path $ProjectRoot 'agent\todo_store.ps1')
+    return Invoke-TodoActions $ProjectRoot $Actions ([string]$Event.message_id) ([string]$Event.create_time)
+}
+
 function Invoke-CodexAndReply($Event, [string]$AuthorizedOpenId, [string]$MessageText) {
     if ($Event.chat_type -ne 'p2p') { return $false }
     $codexMode = if ($script:previewMode) { 'preview' } elseif ($script:confirmedExecution) { 'execute' } else { 'normal' }
@@ -442,6 +447,28 @@ function Invoke-CodexAndReply($Event, [string]$AuthorizedOpenId, [string]$Messag
     }
 
     $actions = @($codexResult.actions)
+    $todoActions=@($actions|Where-Object {$_.action -in @('AddTodo','CompleteTodo')})
+    if($todoActions.Count -gt 0){
+        if($todoActions.Count -ne $actions.Count -or $codexMode -ne 'normal'){
+            $null=Send-Acknowledgement $AuthorizedOpenId '请将待办事项与记账修改分开发送，这条消息没有作任何修改。' ([string]$Event.message_id) 'clarify'
+            return $true
+        }
+        if([bool]$codexResult.needs_information){
+            $null=Send-Acknowledgement $AuthorizedOpenId (Format-NonExecutableCodexReply ([string]$codexResult.reply)) ([string]$Event.message_id) 'clarify'
+            return $true
+        }
+        try{$todoReceipt=Invoke-PetstarTodoActions $Event $todoActions}catch{
+            if($_.Exception.Message -match '另一个经营数据事务仍在执行|待办正在处理中'){
+                $script:lastProcessFailure='待办写入排队';$script:lastProcessRetryable=$true;$script:lastProcessRetryAfterSeconds=60
+                $null=Send-Acknowledgement $AuthorizedOpenId '待办已进入自动重试队列；当前同步结束后会继续处理，无需重发。' ([string]$Event.message_id) 'deferred'
+                return $false
+            }
+            throw
+        }
+        Clear-PetstarCodexQueryCache
+        $null=Send-Acknowledgement $AuthorizedOpenId ([string]$todoReceipt.reply) ([string]$Event.message_id) 'todo'
+        return $true
+    }
     $mutatingActions = @($actions | Where-Object { [string]$_.action -notin @('RefreshLedger','SendDailySummary','SyncPlatformData') })
 
     # 如果正则快速路径没有识别为写入，但 Codex 识别出了写表意图，仍必须自动进入两阶段确认。
@@ -1019,6 +1046,9 @@ function Test-ReadOnlyOperationalMessage([string]$Text) {
 
 function Test-DataMutationMessage([string]$Text) {
     if (-not $Text) { return $false }
+    # A task may quote a future finance action. Leave its meaning to Codex;
+    # any real finance actions it returns still enter normal confirmation.
+    if($Text -match '待办|待做事项|任务清单'){return $false}
     if (Test-ReadOnlyOperationalMessage $Text) { return $false }
     if ($Text -match '(?:同步|刷新|重建).{0,10}(?:支出|简账)|(?:支出|简账).{0,10}(?:同步|刷新|重建)') { return $false }
     if ($Text -match '(?:同步|刷新|拉取|更新).{0,12}(?:美团数据|订单|库存快照|SKU成本主表|库存)' -and $Text -notmatch '配送费|运费|干预(?:订)?单|补单|线下|补货|进货|采购|支出|费用|付款|到账|取款|生产日期|生产日|保质期|过期|到期|赠品|加送|货号.{0,8}(?:改|换|绑定)|(?<!\d)\d{18,20}(?!\d)') { return $false }
@@ -1204,6 +1234,8 @@ function Get-ActivePendingConfirmation($Event) {
 
 function Test-PendingAmendment([string]$Text, $Pending) {
     if (-not $Pending -or -not $Text) { return $false }
+    # A task mentioning a SKU or a date must not amend a pending finance request.
+    if($Text -match '待办|待做事项|任务清单'){return $false}
     # 刷新报表是独立维护动作，不得因为包含“改了/更新”而串到上一项待确认变更。
     if (Test-ReadOnlyOperationalMessage $Text) { return $false }
     if ($Pending.needs_information -and $Text -match '(?<!\d)\d{18,20}(?!\d)|(?i)(?:kw|csx)\s*\d+|\d+(?:\.\d+)?\s*(?:元|天|个?月|年|件|包|袋|盒|罐)|补单人|自配送|自己送|骑手|已恢复|未恢复') { return $true }

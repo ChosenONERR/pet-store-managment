@@ -40,6 +40,10 @@ $cut = $source.LastIndexOf($marker)
 if ($start -lt 0 -or $cut -le $start) { throw '无法定位监听器函数区' }
 $escapedRoot = $projectRoot.Replace("'", "''")
 Invoke-Expression ("`$ProjectRoot='$escapedRoot';" + $source.Substring($start, $cut - $start))
+# Keep the exact transaction implementation, but isolate its mutex from live
+# scheduled writes so an offline test neither blocks them nor spuriously queues.
+$testFinanceBody=(Get-Command New-FinanceTransaction).Definition.Replace("'Local\PetstarFinanceMutationV2'",("'Local\PetstarFinanceMutationTest_"+$PID+"'"))
+Set-Item -Path function:New-FinanceTransaction -Value ([scriptblock]::Create($testFinanceBody))
 
 $prettySuccess = @(
     'diagnostic line'
@@ -448,6 +452,31 @@ try {
     if ($rateLimitResult -ne 'failed_retryable' -or $rateLimitAck -notmatch '约 2 分钟后自动重试' -or $rateLimitAck -match '无法生成待确认预览') { throw "预览阶段限流没有转入安全重试：result=$rateLimitResult ack=$rateLimitAck" }
 
     if (@($script:testCodexCalls | Where-Object {$_.text -match '3402294620217435837'}).Count -eq 0) { throw '干预单自然语言没有经过 Codex' }
+
+    # Task routing is tested with an in-memory adapter; never touch Feishu.
+    $script:todoTestCalls=0
+    function Invoke-PetstarTodoActions($Event,$Actions){
+        if($script:todoTestBusy){throw '另一个经营数据事务仍在执行，本次未写入'}
+        $script:todoTestCalls++
+        return [pscustomobject]@{ok=$true;needs_information=$false;reply='已新增待办：明天补货KW1106'}
+    }
+    function Invoke-PetstarCodex($Text,$MessageId,$Mode){
+        if($Mode -ne 'normal'){throw '待办不应进入财务预览'}
+        $actions=@((New-TestCodexAction 'AddTodo' @{todo_text='明天补货KW1106';todo_date='tomorrow'}))
+        if($Text -match '混合'){$actions+=New-TestCodexAction 'SetSkuCost' @{goods_code='kw1106';amount=21}}
+        return [pscustomobject]@{ok=$true;actions=$actions;needs_information=$false;reply='尚未执行'}
+    }
+    $script:todoTestBusy=$false
+    $script:testCalls.Clear()
+    $todoAck=Invoke-TestMessage 'todo-add' '新增待办事项：明天补货KW1106'
+    if(-not $todoAck.ok -or $todoAck.ack -notmatch '已新增待办' -or $script:todoTestCalls -ne 1 -or $script:testCalls.Count -ne 0 -or (Read-PendingConfirmation)){throw '纯待办没有直接登记或误触发记账'}
+    $mixedAck=Invoke-TestMessage 'todo-mixed' '混合待办与成本修改'
+    if($mixedAck.ack -notmatch '分开发送' -or $script:todoTestCalls -ne 1 -or $script:testCalls.Count -ne 0){throw '混合消息不应执行任何部分'}
+    if(Test-PendingAmendment '待办：明天改KW1106成本' ([pscustomobject]@{})){throw '待办误当成财务待确认项补充'}
+    $script:todoTestBusy=$true
+    $todoBusyEvent=$baseEvent.Clone();$todoBusyEvent.message_id='todo-lock-busy';$todoBusyEvent.content='待办事项是核对进货单'
+    $todoBusy=Process-EventWithLedger ($todoBusyEvent|ConvertTo-Json -Compress) 'user-1' 'test'
+    if($todoBusy -ne 'failed_retryable' -or $script:todoTestCalls -ne 1){throw '待办锁忙未持久保留为可重试'}
     [ordered]@{ok=$true;command_json='multiline-supported';ack_idempotency='max-50';ack_outbox='queue-and-retry';routing='codex-first';manual_sync='codex-dispatched';intervention='preview-confirm';intervention_correction='remove-add-atomic';non_executable_reply='not-pending';confirmation_execution='stored-plan-no-reparse';confirmation_failure='atomic-rollback-and-full-retry';delivery_fee='preview-amend-confirm';pending_amendment='zero-action-retains-original';stale_pending='auto-recovered';preview_rate_limit='deferred-retry';batch_date='calculated-preview-cancel';zero_cost_new_sku='preview-confirm';codex_question='direct-reply';pending_gift='preview-confirm-auto-match';sku_cost='explicit-preview-confirm';batch_sku_maintenance='preview-and-execute-single-call';pending_queue='fifo-preserved'} | ConvertTo-Json -Depth 5
 } finally {
     if (Test-Path -LiteralPath $testStateRoot) { Remove-Item -LiteralPath $testStateRoot -Recurse -Force }

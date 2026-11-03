@@ -18,7 +18,7 @@
         "properties": {
           "dataset": {
             "type": "string",
-            "enum": ["overview", "orders", "order_items", "pending_costs", "interventions", "sku", "inventory", "replenishments", "income", "expenses", "profit", "status"]
+            "enum": ["overview", "orders", "order_items", "pending_costs", "interventions", "sku", "inventory", "replenishments", "income", "expenses", "profit", "status", "todos"]
           },
           "start_date": { "type": ["string", "null"] },
           "end_date": { "type": ["string", "null"] },
@@ -65,13 +65,18 @@
               "SetRefundDisposition",
               "RefreshLedger",
               "SendDailySummary",
-              "SyncPlatformData"
+              "SyncPlatformData",
+              "AddTodo",
+              "CompleteTodo"
             ]
           },
           "arguments": {
             "type": "object",
             "properties": {
               "date": { "type": ["string", "null"] },
+              "todo_text": { "type": ["string", "null"] },
+              "todo_date": { "type": ["string", "null"] },
+              "todo_ref": { "type": ["string", "null"] },
               "order_no": { "type": ["string", "null"] },
               "daily_order_no": { "type": ["string", "null"] },
               "person": { "type": ["string", "null"] },
@@ -98,6 +103,7 @@
             },
             "required": [
               "date",
+              "todo_text", "todo_date", "todo_ref",
               "order_no",
               "daily_order_no",
               "person",

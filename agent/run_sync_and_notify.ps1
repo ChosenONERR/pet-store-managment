@@ -1283,6 +1283,14 @@ function Build-Message($Snapshot, [bool]$Succeeded, [string]$FailureReason = '')
         $lines.Add('')
         $lines.Add('距离 00:00 日结还有 1 小时，请检查今天是否都已告诉经营管家：')
         $lines.Add('')
+        try{
+            . (Join-Path $projectRoot 'agent\todo_store.ps1')
+            $todoItems=@(Get-PetstarTodos $projectRoot)
+            $lines.Add((Get-TodoReminderText $todoItems $dateText))
+        }catch{
+            $lines.Add('⚠️ 待办清单读取失败，请打开“待办事项”表核对；这不代表没有未完成事项。')
+        }
+        $lines.Add('')
         $lines.Add('1. 🚚 每一单配送费')
         $lines.Add('逐单确认配送费；自己送也要确认，按 0 元记录。')
         $lines.Add('')

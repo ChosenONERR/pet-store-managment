@@ -1,6 +1,6 @@
 ﻿param(
     [Parameter(Mandatory=$true)]
-    [ValidateSet('overview','orders','order_items','pending_costs','interventions','sku','inventory','replenishments','income','expenses','profit','status')]
+    [ValidateSet('overview','orders','order_items','pending_costs','interventions','sku','inventory','replenishments','income','expenses','profit','status','todos')]
     [string]$Dataset,
     [string]$StartDate,
     [string]$EndDate,
@@ -141,6 +141,15 @@ $effectiveEnd = if ($EndDate) { $EndDate } else { [datetime]::Today.ToString('yy
 $payload = $null
 
 switch ($Dataset) {
+    'todos' {
+        . (Join-Path $PSScriptRoot 'todo_store.ps1')
+        $tasks=@(Get-PetstarTodos $ProjectRoot|Where-Object {
+            (-not $Search -or $_.text.IndexOf($Search,[StringComparison]::OrdinalIgnoreCase) -ge 0) -and
+            (-not $StartDate -or -not $_.date -or $_.date -ge $StartDate) -and
+            (-not $EndDate -or -not $_.date -or $_.date -le $EndDate)
+        })
+        $payload=[ordered]@{total=$tasks.Count;items=@($tasks|Select-Object -First $Limit);has_more=($tasks.Count -gt $Limit);source='待办事项'}
+    }
     'overview' {
         $orders = @(Get-SheetTable $sourceToken '订单汇总' 'A1:Q2001' | Where-Object { Test-DateRange $_ '下单日期' })
         $interventions = @(Get-SheetTable $sourceToken '干预订单' 'A1:M1001' | Where-Object {
