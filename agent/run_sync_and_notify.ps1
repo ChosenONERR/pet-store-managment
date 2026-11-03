@@ -31,6 +31,7 @@ $inventoryScript = Join-Path $workRoot 'sync_meituan_inventory.ps1'
 $ledgerScript = Join-Path $projectRoot 'agent\sync_daily_ledger.ps1'
 $costScript = Join-Path $projectRoot 'agent\rebuild_cost_snapshots.ps1'
 $giftReconcileScript = Join-Path $projectRoot 'agent\reconcile_pending_gifts.ps1'
+$deliveryFeeScript = Join-Path $projectRoot 'agent\sync_delivery_fees.ps1'
 $integrityAuditScript = Join-Path $workRoot 'audit_finance_integrity.ps1'
 $ledgerMetaPath = Join-Path $workRoot 'daily_ledger_meta.json'
 $larkIdentityCachePath = Join-Path $stateRoot 'lark_user_identity.json'
@@ -1409,6 +1410,8 @@ $promotionCaptureError = $null
 $integrityAuditResult = $null
 $useNoChangeFastPath = $false
 $useIncrementalChangePath = $false
+$deliveryFeeResult = $null
+$deliveryOnlyChange = $false
 $executionPath = 'full'
 $executionPathReason = $null
 $syncWarnings = [Collections.Generic.List[string]]::new()
@@ -1504,6 +1507,40 @@ try {
         Start-SyncFinanceTransaction
     }
 
+    # Fees are independently rechecked for EVERY target-day natural order,
+    # before the no-change shortcut; zero/previously read is never a skip key.
+    if (-not $SkipSync -and -not $SkipOrders -and $null -ne $orderResult) {
+        $ordersChangedBeforeDelivery = [bool]$orderResult.data_changed
+        try {
+            $stage = Invoke-WithRetry 'delivery_fee_sync' {
+                Invoke-JsonPowerShellScript $deliveryFeeScript @{Date=$dateText;ProjectRoot=$projectRoot;Apply=(-not [bool]$DryRun)}
+            } 1
+            $deliveryFeeResult = $stage.value
+            if ($deliveryFeeResult.providers.maiyatian.ok -ne $true -or $deliveryFeeResult.providers.cyanclouds.ok -ne $true) {
+                $operationalDegraded = $true
+            }
+            foreach ($decision in @($deliveryFeeResult.decisions)) {
+                if ($decision.state -in @('pending','conflict')) {
+                    $syncWarnings.Add("配送费待核对：订单 $($decision.order_no)｜$($decision.reason)。原费用保持不动。")
+                }
+            }
+            if (@($deliveryFeeResult.changed_order_nos).Count -gt 0 -and -not $DryRun) {
+                $deliveryOnlyChange = -not $ordersChangedBeforeDelivery
+                $orderResult.data_changed = $true
+                $orderResult.writes_skipped = $false
+                $orderResult.change_details.summary = $true
+                $orderResult.changed_order_nos = @(@($orderResult.changed_order_nos)+@($deliveryFeeResult.changed_order_nos)|Sort-Object -Unique)
+                $orderResult.affected_months = @(@($orderResult.affected_months)+@($deliveryFeeResult.affected_months)|Sort-Object -Unique)
+            }
+        } catch {
+            # Read failures are isolated; any failure after a fee write must
+            # roll back the shared transaction, never commit partial updates.
+            if ($_.Exception.Message -match 'DELIVERY_WRITE_FAILED:') { throw }
+            $operationalDegraded = $true
+            $syncWarnings.Add('配送费待核对：配送平台查询未完成，请检查麦芽田、青云聚信登录状态；原费用不动，下一小时自动重查。')
+        }
+    }
+
     if ($Mode -eq 'night') {
         $null = Invoke-WithRetry 'intervention_reconciliation' { Assert-TargetDateInterventionCoverage } 1
     }
@@ -1576,7 +1613,7 @@ try {
     } elseif ($useIncrementalChangePath) {
         $executionPath = 'targeted'
         $executionPathReason = "只处理变化订单及相关月份：$($targetedMonthKeys -join '、')"
-        if ($targetedOrderNumbers.Count -gt 0) {
+        if ($targetedOrderNumbers.Count -gt 0 -and -not ($deliveryOnlyChange -and [int]$giftReconcileResult.updated_cells -eq 0)) {
             $stage = Invoke-WithRetry 'cost_snapshot' { Invoke-CostSnapshotRebuild $targetedOrderNumbers $true } 3
             $costResult = $stage.value
         } else {
@@ -1646,6 +1683,14 @@ try {
         $alertStage = Invoke-WithRetry 'refund_observation_alert' { Send-FeishuMessage $refundAlertText $null $refundAlertKey } 2
         $refundAlertResult = $alertStage.value
     }
+    $deliveryAlertResult = $null
+    $deliveryAlerts = @($syncWarnings | Where-Object { $_ -match '^配送费待核对：' })
+    if ($Silent -and $deliveryAlerts.Count -gt 0) {
+        $deliveryAlertText = "🚚 配送费需要确认`n" + (($deliveryAlerts | Select-Object -First 12) -join "`n")
+        $deliveryAlertKey = "petstar-delivery-alert-$(Get-TextFingerprint ($deliveryAlerts -join '|'))"
+        $alertStage = Invoke-WithRetry 'delivery_fee_alert' { Send-FeishuMessage $deliveryAlertText $null $deliveryAlertKey } 2
+        $deliveryAlertResult = $alertStage.value
+    }
     $sendResult = if ($Silent) {
         [pscustomobject]@{ sent = $false; dry_run = [bool]$DryRun; format = 'silent' }
     } else {
@@ -1673,6 +1718,8 @@ try {
         dry_run = [bool]$sendResult.dry_run
         preflight = $preflightResult
         order_sync = $orderResult
+        delivery_fee_sync = $deliveryFeeResult
+        delivery_fee_alert = $deliveryAlertResult
         inventory_sync = $inventoryResult
         pending_gift_reconciliation = $giftReconcileResult
         pending_gift_alert = $giftAlertResult

@@ -548,9 +548,21 @@ foreach ($order in @($extract.orders)) {
     $existingSummary = if ($summaryById.Contains([string]$order.orderNo)) { $summaryById[[string]$order.orderNo] } else { $null }
     $manualDelivery = $null
     $manualDeliveryMarker = $null
+    $automaticDelivery = $null
+    $automaticDeliveryMarker = $null
     if ($existingSummary -and $existingSummary.Note -match '人工确认配送费：?\s*(\d+(?:\.\d+)?)\s*元?') {
         $manualDelivery = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture)
         $manualDeliveryMarker = "人工确认配送费：$($manualDelivery.ToString('0.00',[Globalization.CultureInfo]::InvariantCulture))元"
+    }
+    if ($existingSummary -and $existingSummary.Note -match '自动配送费\[(?:maiyatian|cyanclouds):\d+\]=(\d+(?:\.\d+)?)元') {
+        $automaticDeliveryMarker = $Matches[0]
+        $automaticDelivery = [double]::Parse($Matches[1],[Globalization.CultureInfo]::InvariantCulture)
+        if ($null -ne $existingSummary.DeliveryFee -and [math]::Abs([double]$existingSummary.DeliveryFee-$automaticDelivery) -gt 0.0049) {
+            # A direct edit of the authoritative cell wins over the old import.
+            $manualDelivery = [double]$existingSummary.DeliveryFee
+            $manualDeliveryMarker = "人工确认配送费：$($manualDelivery.ToString('0.00',[Globalization.CultureInfo]::InvariantCulture))元"
+            $automaticDeliveryMarker = $null
+        }
     }
     $refundAccounting = $refundAccountingByOrder[[string]$order.orderNo]
     $refundEvents = @($refundAccounting.events)
@@ -582,7 +594,7 @@ foreach ($order in @($extract.orders)) {
             $refundNoteParts += "退款补偿[$($event.record_id)]：顾客退款¥$([double]$event.customer_refund_amount)；$itemText"
         }
     }
-    $effectiveDeliveryFee = if ($null -ne $manualDelivery) { $manualDelivery } else { $order.deliveryFee }
+    $effectiveDeliveryFee = if ($null -ne $manualDelivery) { $manualDelivery } elseif ($null -ne $automaticDelivery) { $automaticDelivery } else { $order.deliveryFee }
     $actualOverrideNote = $null
     if ($null -ne $actualOverride) {
         $effectiveExpectedIncome = [double]$actualOverride.actual_income
@@ -609,7 +621,7 @@ foreach ($order in @($extract.orders)) {
         ItemCount = $itemCount
         Source = '美团订单页'
         SyncTime = $syncTime
-        Note = ((@("原始状态：$($order.rawStatus)",$manualDeliveryMarker,$actualOverrideNote) + $refundNoteParts | Where-Object { $_ }) -join '；')
+        Note = ((@("原始状态：$($order.rawStatus)",$manualDeliveryMarker,$automaticDeliveryMarker,$actualOverrideNote) + $refundNoteParts | Where-Object { $_ }) -join '；')
         DailyOrderNo = if ($order.dailyOrderNo) { "美团$($order.dailyOrderNo)号单" } else { $null }
         SortKey = "$($order.orderDate) $($order.orderTime)|$($order.orderNo)"
     }
