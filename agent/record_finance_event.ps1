@@ -979,7 +979,9 @@ function Invoke-BatchSkuMaintenance([object[]]$Operations) {
         $purchaseAmountValue = Convert-ToNullableNumber (Get-BatchArgument $arguments 'purchase_amount')
         $paymentAmountValue = Convert-ToNullableNumber (Get-BatchArgument $arguments 'payment_amount')
         $noteValue = [string](Get-BatchArgument $arguments 'note')
-        if (-not $goodsCode -or $goodsCode -notmatch '(?i)^(?:kw|csx)\d+$') { throw "第$($operationIndex+1)项补货必须提供有效的 KW 或 CSX 货号" }
+        $isSkuReference = $goodsCode -match '(?i)^sku_ref:\d+:[a-z0-9_-]+$'
+        if (-not $goodsCode -or ($goodsCode -notmatch '(?i)^(?:kw|csx)\d+$' -and -not $isSkuReference)) { throw "第$($operationIndex+1)项补货必须提供有效的 KW、CSX 或查询返回的SKU安全定位符" }
+        if ($isSkuReference -and $transitionCode) { throw '指定SKU安全定位符的补货不能同时改绑过渡货号' }
         if ($transitionCode -and $transitionCode -notmatch '(?i)^csx\d+$') { throw "第$($operationIndex+1)项补货关联的过渡货号无效" }
         Assert-Positive $quantityValue "第$($operationIndex+1)项补货数量"
         Assert-NonNegative $purchaseAmountValue "第$($operationIndex+1)项实际采购金额"
@@ -996,7 +998,12 @@ function Invoke-BatchSkuMaintenance([object[]]$Operations) {
         $requestedCsx = if ($normalizedTransition) { $normalizedTransition } elseif ($normalizedCode -match '^csx') { $normalizedCode } else { $null }
         $candidateRows = @{}
         $duplicateResolutionRows = [Collections.Generic.HashSet[int]]::new()
-        foreach ($lookupCode in @($normalizedCode,$normalizedTransition | Where-Object { $_ } | Select-Object -Unique)) {
+        if ($isSkuReference) {
+            $confirmedTarget = Resolve-UniqueSkuReference $skuRows $normalizedCode
+            $candidateRows[[string]$confirmedTarget.row_number] = $confirmedTarget
+        }
+        $lookupCodes = if ($isSkuReference) { @() } else { @($normalizedCode,$normalizedTransition | Where-Object { $_ } | Select-Object -Unique) }
+        foreach ($lookupCode in $lookupCodes) {
             $matches = @(Get-SkuCodeCandidates $skuRows $lookupCode)
             if ($matches.Count -gt 1) {
                 $activeMatches = @($matches | Where-Object {
