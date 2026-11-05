@@ -412,6 +412,65 @@ function Resolve-UniqueSkuReference($Rows, [string]$RequestedCode) {
     return $matches[0]
 }
 
+function New-OrderGiftPlan([string]$Items, $SkuRows, $ResolvedOrder, [bool]$PendingOrder, [string]$GiftNote, [string]$GiftEventId) {
+    $pattern = '(?i)(?<![\w:])((?:(?:kw|csx)\d+|sku_ref:\d+:[a-z0-9_-]+))\s*[×xX*]\s*(\d+(?:\.\d+)?)'
+    $matches = @([regex]::Matches($Items,$pattern))
+    if ($matches.Count -eq 0) { throw '没有识别到赠品“货号×数量”或具体规格安全定位符，例如 kw4189×1' }
+    # Never accept only the valid tail of a malformed safety reference.
+    $remaining = [regex]::Replace($Items,$pattern,'')
+    if ($remaining -match '(?i)sku_ref:') { throw '赠品SKU安全定位符格式无效，请重新查询具体规格' }
+    if ($GiftNote -match '(?i)\[gift_sku_id') { throw '赠品商品身份标记由系统生成，备注不能自行指定' }
+    $skuByCode = Get-CanonicalSkuMap $SkuRows
+    $quantities = [ordered]@{}
+    foreach ($match in $matches) {
+        $raw = $match.Groups[1].Value.ToLowerInvariant()
+        $quantity = [double]::Parse($match.Groups[2].Value,[Globalization.CultureInfo]::InvariantCulture)
+        if ($quantity -le 0 -or [double]::IsInfinity($quantity) -or [double]::IsNaN($quantity)) { throw "赠品数量必须为有效正数：$raw" }
+        if (-not $quantities.Contains($raw)) { $quantities[$raw] = 0.0 }
+        $quantities[$raw] += $quantity
+    }
+    $rows = @(); $parts = @(); $pending = @(); $details = @(); $total = 0.0
+    foreach ($entry in $quantities.GetEnumerator()) {
+        $raw = [string]$entry.Key; $quantity = [double]$entry.Value
+        $target = $null
+        if ($raw.StartsWith('sku_ref:')) { $target = Resolve-UniqueSkuReference $SkuRows $raw }
+        elseif ($skuByCode.ContainsKey($raw)) { $target = $skuByCode[$raw] }
+        $display = $raw; $unitCost = $null; $productId = ''; $title = ''; $spec = ''
+        if ($null -ne $target) {
+            $row = $target.cells
+            $kw = Get-CellValue $row $skuSchema.CurrentKw.Index
+            if ($kw) { $display = $kw.Trim().ToLowerInvariant() }
+            $productId = [string](Get-CellValue $row $skuSchema.ProductId.Index)
+            if ($productId -and $productId -notmatch '^[a-zA-Z0-9_-]+$') { throw '赠品商品ID格式无效' }
+            $title = [string](Get-CellValue $row $skuSchema.CustomTitle.Index)
+            if (-not $title) { $title = [string](Get-CellValue $row $skuSchema.PlatformTitle.Index) }
+            $spec = [string](Get-CellValue $row $skuSchema.CurrentSpec.Index)
+            $status = [string](Get-CellValue $row $skuSchema.CostStatus.Index)
+            $cost = Get-CellValue $row $skuSchema.MovingAverageCost.Index
+            if ($null -eq $cost -or $cost -eq '') { $cost = Get-CellValue $row $skuSchema.BaselineUnitCost.Index }
+            if ($null -ne $cost -and $cost -ne '' -and $status -notin @('待人工核对','包装换算待核对','缺少成本','缺少参考成本')) {
+                $unitCost = Convert-ToNumber $cost
+                if ($unitCost -lt 0 -or [double]::IsNaN($unitCost) -or [double]::IsInfinity($unitCost)) { throw '赠品成本不是有效非负数' }
+            }
+        }
+        $giftCost = if ($null -eq $unitCost) { $null } else { [math]::Round($unitCost*$quantity,2) }
+        $costStatus = if ($null -eq $giftCost) { '成本待核对' } else { '已计成本' }
+        if ($null -eq $giftCost) { $pending += $display } else { $total += $giftCost }
+        $qty = $quantity.ToString('0.####',[Globalization.CultureInfo]::InvariantCulture)
+        $parts += "$display×$qty"
+        $note = if ($null -eq $giftCost) { "赠品成本待核对：${display}未知成本价" } else { $GiftNote }
+        if ($productId) { $note = (@($note,"[gift_sku_id=$productId]") | Where-Object { $_ }) -join '；' }
+        if ($PendingOrder) { $note = (@('等待订单同步',$note) | Where-Object { $_ }) -join '；' }
+        $rows += ,@(
+            (New-ValueCell (Convert-ToExcelSerial $ResolvedOrder.date)),(New-ValueCell $ResolvedOrder.platform),(New-ValueCell $ResolvedOrder.daily_order_no),(New-ValueCell $ResolvedOrder.order_no),
+            (New-ValueCell $display),(New-ValueCell $quantity),(New-ValueCell $unitCost),(New-ValueCell $giftCost),
+            (New-ValueCell $costStatus),(New-ValueCell $note),(New-ValueCell (Convert-ToExcelSerial ([datetime]::Now))),(New-ValueCell $GiftEventId)
+        )
+        $details += [pscustomobject]@{goods_code=$display;master_row=$(if($target){$target.row_number}else{$null});product_id=$productId;title=$title;spec=$spec;quantity=$quantity;unit_cost=$unitCost;gift_cost=$giftCost}
+    }
+    return [pscustomobject]@{rows=$rows;gift_items=($parts -join '、');gift_cost=$(if($pending.Count){$null}else{[math]::Round($total,2)});pending_cost_codes=$pending;gift_details=$details}
+}
+
 function Resolve-OrderForGift([string]$RequestedOrderNo, [string]$RequestedDailyOrderNo, [datetime]$RequestedDate) {
     $matches = [Collections.Generic.List[object]]::new()
     foreach ($row in (Get-SheetRows '订单汇总' 'A2:Q2001')) {
@@ -1738,8 +1797,6 @@ switch ($Action) {
         if (-not $OrderNo -and -not $DailyOrderNo) { throw '登记赠品必须提供完整订单编号或当天单号' }
         if ($OrderNo -and $OrderNo -notmatch '^(?:\d{10,30}|OFF-\d{8}-[A-Za-z0-9-]+)$') { throw '赠品订单编号格式无效' }
         if (-not $Items) { throw '登记赠品必须提供赠品货号和数量，例如 kw4189×1' }
-        $giftMatches = @([regex]::Matches($Items, '(?i)\b((?:kw|csx)\d+)\s*[×xX*]\s*(\d+(?:\.\d+)?)'))
-        if ($giftMatches.Count -eq 0) { throw '没有识别到赠品“货号×数量”，例如 kw4189×1' }
 
         $pendingOrder = $false
         try {
@@ -1760,12 +1817,14 @@ switch ($Action) {
             }
         }
         $giftRows = Get-SheetRows '赠品记录' 'A2:L2001'
-        if ($EventId) {
+        if ($EventId -and -not $DryRun) {
             $existingGiftRows = @($giftRows | Where-Object { (Get-CellValue $_ 11) -eq $EventId })
             if ($existingGiftRows.Count -gt 0) {
                 $reference = $resolvedOrder.order_no
-                $costResult = Invoke-CostSnapshotRebuild
-                $ledgerResult = Invoke-DailyLedgerSync ([datetime]$resolvedOrder.date)
+                if (-not $pendingOrder) {
+                    $costResult = Invoke-CostSnapshotRebuild -EligibleOrderNumbers @($resolvedOrder.order_no) -Incremental
+                    $ledgerResult = Invoke-DailyLedgerSync ([datetime]$resolvedOrder.date)
+                }
                 Save-ProcessedEvent $EventId $Action $reference
                 [ordered]@{ok=$true;duplicate=$true;event_id=$EventId;action=$Action;reference=$reference;result=[ordered]@{status=$(if($pendingOrder){'pending_order'}else{'matched'});order_no=$resolvedOrder.order_no;daily_order_no=$resolvedOrder.daily_order_no;message=$(if($pendingOrder){'赠品已暂存，等待订单同步'}else{'赠品已登记；本次完成成本和简账刷新'})};cost_snapshot_rebuild=$costResult;daily_ledger_sync=$ledgerResult;formula_verification='success';workbook_url=$meta.workbook_url} | ConvertTo-Json -Depth 8
                 Complete-CurrentFinanceTransaction
@@ -1774,55 +1833,12 @@ switch ($Action) {
         }
 
         $skuRows = Get-SheetRows 'SKU成本主表' 'A2:Z3000'
-        $skuByCode = Get-CanonicalSkuMap $skuRows
-        $quantityByCode = [ordered]@{}
-        foreach ($match in $giftMatches) {
-            $rawCode = $match.Groups[1].Value.ToLowerInvariant()
-            $quantityValue = [double]::Parse($match.Groups[2].Value, [Globalization.CultureInfo]::InvariantCulture)
-            if ($quantityValue -le 0) { throw "赠品数量必须大于0：$rawCode" }
-            if (-not $quantityByCode.Contains($rawCode)) { $quantityByCode[$rawCode] = 0.0 }
-            $quantityByCode[$rawCode] += $quantityValue
-        }
-
-        $rowsToWrite = @()
-        $giftParts = @()
-        $pendingCodes = @()
-        $totalGiftCost = 0.0
-        foreach ($entry in $quantityByCode.GetEnumerator()) {
-            $rawCode = [string]$entry.Key
-            $quantityValue = [double]$entry.Value
-            $displayCode = $rawCode
-            $unitCost = $null
-            $costStatus = '成本待核对'
-            if ($skuByCode.ContainsKey($rawCode)) {
-                $skuRow = $skuByCode[$rawCode].cells
-                $canonicalKw = Get-CellValue $skuRow 0
-                if ($canonicalKw) { $displayCode = $canonicalKw.Trim().ToLowerInvariant() }
-                $masterStatus = Get-CellValue $skuRow $skuSchema.CostStatus.Index
-                $unitCostText = Get-CellValue $skuRow $skuSchema.MovingAverageCost.Index
-                if ($null -eq $unitCostText -or $unitCostText -eq '') { $unitCostText = Get-CellValue $skuRow $skuSchema.BaselineUnitCost.Index }
-                if ($null -ne $unitCostText -and $unitCostText -ne '' -and $masterStatus -notin @('待人工核对','包装换算待核对','缺少成本','缺少参考成本')) {
-                    $unitCost = Convert-ToNumber $unitCostText
-                    $costStatus = '已计成本'
-                }
-            }
-            $giftCost = if ($null -eq $unitCost) { $null } else { [math]::Round(([double]$unitCost * $quantityValue),2) }
-            if ($null -eq $giftCost) { $pendingCodes += $displayCode } else { $totalGiftCost += [double]$giftCost }
-            $qtyText = if ([math]::Abs($quantityValue - [math]::Round($quantityValue)) -lt 0.000001) { [string][int][math]::Round($quantityValue) } else { $quantityValue.ToString('0.##',[Globalization.CultureInfo]::InvariantCulture) }
-            $giftParts += "$displayCode×$qtyText"
-            $baseNote = if ($null -eq $giftCost) { "赠品成本待核对：${displayCode}未知成本价" } else { $Note }
-            $rowNote = if ($pendingOrder) {
-                if ($baseNote) { "等待订单同步；$baseNote" } else { '等待订单同步' }
-            } else { $baseNote }
-            $rowsToWrite += ,@(
-                (New-ValueCell (Convert-ToExcelSerial $resolvedOrder.date)),(New-ValueCell $resolvedOrder.platform),(New-ValueCell $resolvedOrder.daily_order_no),(New-ValueCell $resolvedOrder.order_no),
-                (New-ValueCell $displayCode),(New-ValueCell $quantityValue),(New-ValueCell $unitCost),(New-ValueCell $giftCost),
-                (New-ValueCell $costStatus),(New-ValueCell $rowNote),(New-ValueCell (Convert-ToExcelSerial ([datetime]::Now))),(New-ValueCell $EventId)
-            )
-        }
+        $giftPlan = New-OrderGiftPlan $Items $skuRows $resolvedOrder $pendingOrder $Note $EventId
+        $rowsToWrite = @($giftPlan.rows)
+        $pendingCodes = @($giftPlan.pending_cost_codes)
 
         if ($DryRun) {
-            [ordered]@{ok=$true;dry_run=$true;action=$Action;result=[ordered]@{status=$(if($pendingOrder){'pending_order'}else{'matched'});order_no=$resolvedOrder.order_no;daily_order_no=$resolvedOrder.daily_order_no;order_type=$resolvedOrder.order_type;gift_items=($giftParts -join '、');gift_cost=$(if($pendingCodes.Count -gt 0){$null}else{[math]::Round($totalGiftCost,2)});pending_cost_codes=$pendingCodes};message=$(if($pendingOrder){'预演成功：确认后先暂存赠品，等待订单同步自动匹配'}else{'预演成功，未写入飞书'})} | ConvertTo-Json -Depth 8
+            [ordered]@{ok=$true;dry_run=$true;action=$Action;result=[ordered]@{status=$(if($pendingOrder){'pending_order'}else{'matched'});date=$resolvedOrder.date.ToString('yyyy-MM-dd');order_no=$resolvedOrder.order_no;daily_order_no=$resolvedOrder.daily_order_no;order_type=$resolvedOrder.order_type;gift_items=$giftPlan.gift_items;gift_cost=$giftPlan.gift_cost;gift_details=$giftPlan.gift_details;pending_cost_codes=$pendingCodes};message=$(if($pendingOrder){'预演成功：确认后先暂存赠品，等待订单同步自动匹配'}else{'预演成功，未写入飞书'})} | ConvertTo-Json -Depth 8
             Complete-CurrentFinanceTransaction
             exit 0
         }
@@ -1831,7 +1847,9 @@ switch ($Action) {
         if ($lastRow -gt 2001) { throw '赠品记录表容量已满' }
         Set-CellMatrix '赠品记录' "A${firstRow}:L${lastRow}" $rowsToWrite
         $reference = $resolvedOrder.order_no
+        $OrderNo = $resolvedOrder.order_no
         $writeResult = [pscustomobject]@{
+            date=$resolvedOrder.date.ToString('yyyy-MM-dd')
             status=$(if($pendingOrder){'pending_order'}else{'matched'})
             first_row=$firstRow
             last_row=$lastRow
@@ -1839,8 +1857,9 @@ switch ($Action) {
             daily_order_no=$resolvedOrder.daily_order_no
             platform=$resolvedOrder.platform
             order_type=$resolvedOrder.order_type
-            gift_items=($giftParts -join '、')
-            gift_cost=$(if($pendingCodes.Count -gt 0){$null}else{[math]::Round($totalGiftCost,2)})
+            gift_items=$giftPlan.gift_items
+            gift_cost=$giftPlan.gift_cost
+            gift_details=$giftPlan.gift_details
             pending_cost_codes=$pendingCodes
             accounting=$(if($resolvedOrder.order_type -eq '干预'){'营销赠品支出'}else{'并入货物成本'})
         }
@@ -2560,8 +2579,8 @@ if ($Action -eq 'SetSkuCost' -and $OrderNo) {
 }
 
 $ledgerResult = $null
-if ($Action -in @('AddIntervention','RemoveIntervention','SetOrderActuals','AddOrderGift','SetRefundDisposition') -and $null -eq $costResult) {
-    $orderScopedCostActions = @('AddIntervention','RemoveIntervention','SetOrderActuals','SetRefundDisposition')
+if ($Action -in @('AddIntervention','RemoveIntervention','SetOrderActuals','AddOrderGift','SetRefundDisposition') -and $null -eq $costResult -and ($Action -ne 'AddOrderGift' -or -not $pendingOrder)) {
+    $orderScopedCostActions = @('AddIntervention','RemoveIntervention','SetOrderActuals','SetRefundDisposition','AddOrderGift')
     if ($Action -in $orderScopedCostActions -and $OrderNo) {
         # These actions only change one known order. Replaying the full event
         # stream is still required to derive its final SKU state, but writes are
@@ -2571,7 +2590,7 @@ if ($Action -in @('AddIntervention','RemoveIntervention','SetOrderActuals','AddO
         $costResult = Invoke-CostSnapshotRebuild
     }
 }
-if ($Action -in @('AddIntervention','RemoveIntervention','ConfirmSelfDelivery','SetExternalDeliveryFee','SetOrderDeliveryFee','SetOrderActuals','OfflineSale','AddOrderGift','SetRefundDisposition')) {
+if ($Action -in @('AddIntervention','RemoveIntervention','ConfirmSelfDelivery','SetExternalDeliveryFee','SetOrderDeliveryFee','SetOrderActuals','OfflineSale','AddOrderGift','SetRefundDisposition') -and ($Action -ne 'AddOrderGift' -or -not $pendingOrder)) {
     # Order-local changes only require rebuilding their own month. Cost-basis changes
     # can affect FIFO snapshots across multiple months and deliberately keep the full rebuild.
     $ledgerTargetMonth = $null

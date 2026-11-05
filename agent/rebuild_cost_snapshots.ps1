@@ -130,6 +130,19 @@ function Assert-FormulaRange([string]$SheetName, [string]$Range) {
     }
 }
 
+function Resolve-GiftCanonicalIdentity([string]$RawCode,[string]$Note,$Aliases,$States) {
+    $markers = @([regex]::Matches($Note,'(?i)\[gift_sku_id=([a-z0-9_-]+)\]'))
+    if ($Note -match '(?i)\[gift_sku_id') {
+        if ($markers.Count -ne 1) { throw '赠品商品身份标记不完整或重复，请先核对' }
+        $canonical = 'sku:' + $markers[0].Groups[1].Value
+        # A frozen gift must never move to another product after KW reuse.
+        if ($States.ContainsKey($canonical)) { return $canonical }
+        return $null
+    }
+    if ($Aliases.ContainsKey($RawCode)) { return $Aliases[$RawCode] }
+    return $null
+}
+
 $masterRows = Get-SheetRows 'SKU成本主表' 'A2:Z3000'
 $states = @{}
 $aliasCandidates = @{}
@@ -199,7 +212,7 @@ for ($i=0; $i -lt $giftRows.Count; $i++) {
     $giftDate = Convert-ToDate (Get-CellValue $row 0)
     if ($dailyOrderNo -in @('待同步','订单已取消待处理')) { continue }
     if (-not $orderNo -or -not $rawCode -or $null -eq $quantity -or $quantity -le 0 -or $null -eq $giftDate) { continue }
-    $canonical = if ($aliasToCanonical.ContainsKey($rawCode)) { $aliasToCanonical[$rawCode] } else { $null }
+    $canonical = Resolve-GiftCanonicalIdentity $rawCode $giftNote $aliasToCanonical $states
     $giftEvents += [pscustomobject]@{
         row=2+$i;order_no=$orderNo;raw_code=$rawCode;canonical=$canonical;quantity=[double]$quantity;date=$giftDate.Date
         unit_cost=$giftUnitCost;gift_cost=$giftCost;cost_status=$costStatus;note=$giftNote;resolved_from_master=$false
@@ -420,7 +433,7 @@ foreach ($gift in $giftEvents) {
 
 $normalizedGiftCostRows = @($giftEvents | Where-Object { $null -ne $_.gift_cost -and $_.cost_status -ne '成本待核对' })
 $resolvedGiftCostRows = @($giftEvents | Where-Object { $_.resolved_from_master })
-foreach ($gift in @($normalizedGiftCostRows | Where-Object { -not $Incremental })) {
+foreach ($gift in @($normalizedGiftCostRows | Where-Object { -not $Incremental -or $eligibleOrderSet.Contains([string]$_.order_no) })) {
     $cleanNote = [string]$gift.note
     if($gift.resolved_from_master){
         $cleanNoteParts = @([regex]::Split([string]$gift.note, '[；;]') | ForEach-Object { $_.Trim() } | Where-Object { $_ -and $_ -notmatch '^赠品成本待核对(?:[:：]|$)' })
@@ -538,6 +551,9 @@ if ($Incremental) {
     $affectedCanonical = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($item in @($itemOutputs | Where-Object { $eligibleOrderSet.Contains([string]$_.order_no) -and $_.canonical })) {
         $null = $affectedCanonical.Add([string]$item.canonical)
+    }
+    foreach ($gift in @($giftEvents | Where-Object { $eligibleOrderSet.Contains([string]$_.order_no) -and $_.canonical })) {
+        $null = $affectedCanonical.Add([string]$gift.canonical)
     }
     foreach ($canonical in $affectedCanonical) {
         if (-not $states.ContainsKey($canonical) -or -not $masterRowByCanonical.ContainsKey($canonical)) { continue }

@@ -16,7 +16,7 @@ $skuDiscoveryPath = Join-Path $projectRoot 'agent\sync_sku_master_by_identity.ps
 $inventoryDirectory = 'D:\market-research\宠速星\商品库存情况'
 $snapshotDate = $SnapshotDate.Date
 if (-not (Test-Path -LiteralPath $metaPath)) { throw '缺少简版工作簿元数据' }
-$meta = Get-Content -LiteralPath $metaPath -Raw | ConvertFrom-Json
+$meta = Get-Content -LiteralPath $metaPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $spreadsheetToken = ([uri]$meta.workbook_url).Segments[-1].Trim('/')
 . (Join-Path $projectRoot 'agent\finance_transaction.ps1')
 $stateRoot = Join-Path $projectRoot 'agent\state'
@@ -36,15 +36,7 @@ function Close-InventorySyncTransaction([bool]$Succeeded, [string]$Reason = '') 
     Close-FinanceTransaction $script:financeTransaction
     $script:financeTransactionClosed = $true
 }
-trap {
-    $reason = [string]$_.Exception.Message
-    Close-InventorySyncTransaction $false $reason
-    # Windows PowerShell 5.1 may not pipe Console.Error from a nested .ps1
-    # back to its caller. Emit structured stdout so the parent can preserve
-    # the real stage and reason in the Feishu failure card.
-    [Console]::Out.WriteLine(([ordered]@{ok=$false;error=$reason} | ConvertTo-Json -Compress))
-    exit 1
-}
+try {
 $downloadSource = if ($InventoryPath) { 'provided_file' } else { 'new_export' }
 $degraded = $false
 $exportError = $null
@@ -316,3 +308,8 @@ $finalResult = [pscustomobject]@{
 }
 Close-InventorySyncTransaction $true
 $finalResult | ConvertTo-Json -Compress
+} catch {
+    $originalError = $_
+    Close-InventorySyncTransaction $false ([string]$originalError.Exception.Message)
+    throw $originalError
+}

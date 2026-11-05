@@ -20,6 +20,7 @@ $meta = Read-DeliveryJson (Join-Path $ProjectRoot 'work\simple_finance_meta.json
 $token = ([uri]$meta.workbook_url).Segments[-1].Trim('/')
 $stateRoot = Join-Path $ProjectRoot 'agent\state'
 $pendingPath = Join-Path $stateRoot 'delivery_fee_pending.json'
+$previousDay = ([datetime]::ParseExact($Date,'yyyy-MM-dd',[Globalization.CultureInfo]::InvariantCulture)).AddDays(-1).ToString('yyyy-MM-dd')
 $transaction = $null
 $writesStarted = $false
 function Invoke-DeliveryLark([scriptblock]$Command) {
@@ -77,7 +78,9 @@ try {
         $r=$rows[$i];$id=[string](Get-DeliveryCell $r 2)
         if(-not $id -or (Get-DeliveryCell $r 1) -ne '美团'){continue}
         $day=Convert-DeliveryDay (Get-DeliveryCell $r 0)
-        if($day -ne $Date -and -not $pendingIds.ContainsKey($id)){continue}
+        # Yesterday must be rediscovered even if the prior sync failed before
+        # it could persist a pending queue. The pure policy filters resolved fees.
+        if($day -ne $Date -and $day -ne $previousDay -and -not $pendingIds.ContainsKey($id)){continue}
         if($byId.ContainsKey($id)){throw '配送费订单号不唯一，停止费用写入'}
         $note=[string](Get-DeliveryCell $r 15);$fee=Get-DeliveryCell $r 9
         $auto=$null

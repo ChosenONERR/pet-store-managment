@@ -1321,6 +1321,9 @@ function Format-ConfirmationPreview([string]$ChangeId, $Operations, [string]$Fal
             }
             'AddOrderGift' {
                 $lines.Add("赠品：$($details.daily_order_no)｜$($details.gift_items)｜成本 $(if($null -eq $details.gift_cost){'待核对'}else{'¥'+[string][double]$details.gift_cost})")
+                foreach ($gift in @($details.gift_details)) {
+                    if ($null -ne $gift -and $gift.master_row) { $lines.Add("具体规格：SKU成本主表第$($gift.master_row)行｜$($gift.title)｜$($gift.spec)") }
+                }
                 if ($details.status -eq 'pending_order') { $lines.Add('订单尚未同步；确认后先暂存，后续自动匹配。') }
                 $null = $impacts.Add('赠品记录及订单成本')
                 $null = $impacts.Add('对应月份收入/支出')

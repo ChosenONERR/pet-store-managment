@@ -12,7 +12,7 @@ $metaPath = Join-Path $ProjectRoot 'work\simple_finance_meta.json'
 $stateRoot = Join-Path $ProjectRoot 'agent\state'
 if (-not (Test-Path -LiteralPath $metaPath)) { throw '缺少飞书经营驾驶舱元数据' }
 if (-not (Test-Path -LiteralPath $stateRoot)) { $null = New-Item -ItemType Directory -Path $stateRoot }
-$meta = Get-Content -LiteralPath $metaPath -Raw | ConvertFrom-Json
+$meta = Get-Content -LiteralPath $metaPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $spreadsheetToken = ([uri]$meta.workbook_url).Segments[-1].Trim('/')
 . (Join-Path $PSScriptRoot 'finance_transaction.ps1')
 . (Join-Path $PSScriptRoot 'sku_master_schema.ps1')
@@ -33,7 +33,7 @@ function Close-SkuSyncTransaction([bool]$Succeeded, [string]$Reason = '') {
     Close-FinanceTransaction $script:financeTransaction
     $script:financeTransactionClosed = $true
 }
-trap { $reason=[string]$_.Exception.Message; Close-SkuSyncTransaction $false $reason; [Console]::Error.WriteLine($reason); exit 1 }
+try {
 
 function Get-CellValue($Row, [int]$Index) {
     if ($null -eq $Row -or $Index -ge @($Row).Count -or $null -eq @($Row)[$Index]) { return $null }
@@ -330,3 +330,8 @@ $finalResult = [ordered]@{
 }
 Close-SkuSyncTransaction $true
 $finalResult | ConvertTo-Json -Depth 6 -Compress
+} catch {
+    $originalError = $_
+    Close-SkuSyncTransaction $false ([string]$originalError.Exception.Message)
+    throw $originalError
+}

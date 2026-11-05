@@ -8,12 +8,16 @@ export function businessDate(value) {
 
 export function selectDeliveryOrders(orders, date, pending = []) {
   const waiting = new Set(pending.map(r => String(r.order_no)));
+  const previousDay = new Date(Date.parse(date+'T00:00:00Z')-86400000).toISOString().slice(0,10);
   const seen = new Set();
   return orders.filter(r => {
     if (!/^\d{16,22}$/.test(r.order_no) || seen.has(r.order_no)) throw Error('Invalid or duplicate order identity');
     seen.add(r.order_no);
+    const day=businessDate(r.date);
+    const recentUnresolved=day===previousDay && !r.confirmed_self && !r.protected &&
+      (r.current_fee == null || Number(r.current_fee)===0);
     return r.platform === '美团' && !r.intervention && !/取消/.test(r.status || '') &&
-      (businessDate(r.date) === date || (businessDate(r.date) < date && waiting.has(r.order_no)));
+      (day === date || (day < date && (waiting.has(r.order_no) || recentUnresolved)));
   });
 }
 

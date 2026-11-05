@@ -15,24 +15,15 @@ $ProjectRoot = (Resolve-Path -LiteralPath $ProjectRoot).Path
 # inherit HERMES_HOME from the desktop agent even though this job must use the
 # owner's normal user authorization. Remove every host-routing marker in this
 # child only, then pin the local config root; never copy or expose OAuth tokens.
-foreach ($variableName in @(
-    'HERMES_HOME','HERMES_QUIET','HERMES_EXEC_ASK','HERMES_GATEWAY_TOKEN','HERMES_SESSION_KEY',
-    'OPENCLAW_CLI','OPENCLAW_HOME','OPENCLAW_STATE_DIR','OPENCLAW_CONFIG_PATH',
-    'OPENCLAW_SERVICE_MARKER','OPENCLAW_SERVICE_VERSION','OPENCLAW_GATEWAY_PORT','OPENCLAW_SHELL',
-    'LARK_CHANNEL'
-)) {
-    Remove-Item -LiteralPath "Env:$variableName" -ErrorAction SilentlyContinue
-}
-$env:LARKSUITE_CLI_CONFIG_DIR = Join-Path $env:USERPROFILE '.lark-cli'
-
 . (Join-Path $PSScriptRoot 'runtime_paths.ps1')
+Initialize-PetstarLarkUserEnvironment
 $powershellExe = Get-PetstarWindowsPowerShell
 $syncScript = Join-Path $PSScriptRoot 'run_sync_and_notify.ps1'
 $promotionScript = Join-Path $PSScriptRoot 'sync_promotion_expense.ps1'
 $weeklyScript = Join-Path $PSScriptRoot 'run_weekly_maintenance.ps1'
 $trafficSuggestionScript = Join-Path $PSScriptRoot 'send_daily_traffic_suggestion.ps1'
 $dashboardMonthScript = Join-Path $PSScriptRoot 'update_dashboard_month_selector.ps1'
-$statePath = Join-Path $ProjectRoot 'agent\state\last_run.json'
+$statePath = Join-Path $ProjectRoot 'agent\state\last_healthy_night.json'
 
 function Invoke-Script([string]$Path, [string[]]$Arguments) {
     $global:LASTEXITCODE = 0
@@ -40,10 +31,14 @@ function Invoke-Script([string]$Path, [string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
+function Invoke-CurrentDayHourlySync {
+    Invoke-Script $syncScript @('-Date',$today.ToString('yyyy-MM-dd'),'-Mode','midday','-SkipInventory','-Silent','-ProjectRoot',$ProjectRoot)
+}
+
 $today = [datetime]::Today
 switch ($Job) {
     'Hourly' {
-        Invoke-Script $syncScript @('-Date',$today.ToString('yyyy-MM-dd'),'-Mode','midday','-SkipInventory','-Silent','-ProjectRoot',$ProjectRoot)
+        Invoke-CurrentDayHourlySync
     }
     'TrafficSuggestion' {
         Invoke-Script $trafficSuggestionScript @('-Date',$today.ToString('yyyy-MM-dd'),'-ProjectRoot',$ProjectRoot)
@@ -57,6 +52,7 @@ switch ($Job) {
     'Night' {
         $targetDate = $today.AddDays(-1).ToString('yyyy-MM-dd')
         Invoke-Script $syncScript @('-Date',$targetDate,'-Mode','night','-ProjectRoot',$ProjectRoot)
+        Invoke-CurrentDayHourlySync
         Invoke-Script $dashboardMonthScript @('-ProjectRoot',$ProjectRoot)
     }
     'Weekly' {
@@ -64,6 +60,7 @@ switch ($Job) {
         # 只有审计失败时，weekly 脚本才调用全量重建。
         $targetDate = $today.AddDays(-1).ToString('yyyy-MM-dd')
         Invoke-Script $syncScript @('-Date',$targetDate,'-Mode','night','-ProjectRoot',$ProjectRoot)
+        Invoke-CurrentDayHourlySync
         Invoke-Script $weeklyScript @('-Date',$targetDate,'-ProjectRoot',$ProjectRoot)
         Invoke-Script $dashboardMonthScript @('-ProjectRoot',$ProjectRoot)
     }
@@ -79,8 +76,9 @@ switch ($Job) {
         }
         if ($healthy) {
             [ordered]@{ok=$true;skipped=$true;reason='night sync already healthy';date=$targetDate} | ConvertTo-Json -Compress
-            exit 0
+            break
         }
         Invoke-Script $syncScript @('-Date',$targetDate,'-Mode','night','-ProjectRoot',$ProjectRoot)
+        Invoke-CurrentDayHourlySync
     }
 }

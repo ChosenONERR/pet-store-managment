@@ -16,6 +16,18 @@ function Get-PetstarWindowsPowerShell {
     throw 'Windows PowerShell was not found. Check the Windows system components.'
 }
 
+function Initialize-PetstarLarkUserEnvironment {
+    # All sync entry points, including legacy Hermes catch-up, must select the
+    # same user credential workspace. Never read or copy credential contents.
+    foreach ($name in @(
+        'HERMES_HOME','HERMES_QUIET','HERMES_EXEC_ASK','HERMES_GATEWAY_TOKEN','HERMES_SESSION_KEY',
+        'OPENCLAW_CLI','OPENCLAW_HOME','OPENCLAW_STATE_DIR','OPENCLAW_CONFIG_PATH',
+        'OPENCLAW_SERVICE_MARKER','OPENCLAW_SERVICE_VERSION','OPENCLAW_GATEWAY_PORT','OPENCLAW_SHELL',
+        'LARK_CHANNEL'
+    )) { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }
+    $env:LARKSUITE_CLI_CONFIG_DIR = Join-Path (Get-PetstarUserProfile) '.lark-cli'
+}
+
 function Resolve-PetstarExecutable {
     param(
         [Parameter(Mandatory = $true)][string]$Label,

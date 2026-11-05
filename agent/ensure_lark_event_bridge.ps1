@@ -324,9 +324,10 @@ if ($now.Hour -lt 9 -and ($now.Hour -gt 0 -or $now.Minute -ge 5)) {
         $syncProcesses = @(Get-CimInstance Win32_Process | Where-Object {
             $_.CommandLine -and $_.CommandLine -match '(?i)petstar_(night_sync|night_recovery)\.py|petstar_cli\.py\s+sync'
         })
-        if ($catchUpAction -ne 'cooldown' -and $syncProcesses.Count -eq 0 -and (Test-Path -LiteralPath $nightRecoveryPath) -and (Test-Path -LiteralPath $hermesPython)) {
+        if ($catchUpAction -ne 'cooldown' -and $syncProcesses.Count -eq 0 -and (Test-Path -LiteralPath $scheduledJobPath)) {
             Save-NightRecoveryAttempt $targetNightDate
-            $started = Start-Process -FilePath $hermesPython -ArgumentList @(('"{0}"' -f $nightRecoveryPath)) -WorkingDirectory (Split-Path $nightRecoveryPath -Parent) -WindowStyle Hidden -PassThru
+            $arguments = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"{0}"' -f $scheduledJobPath),'-Job','NightRecovery','-ProjectRoot',('"{0}"' -f $ProjectRoot))
+            $started = Start-Process -FilePath $powershellExe -ArgumentList $arguments -WorkingDirectory $ProjectRoot -WindowStyle Hidden -PassThru
             Save-NightRecoveryAttempt $targetNightDate $started.Id
             $catchUpAction = 'started'
             Write-WatchdogLog "night catch-up launch requested pid=$($started.Id) target=$targetNightDate"

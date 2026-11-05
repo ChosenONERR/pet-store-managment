@@ -99,16 +99,19 @@ $contracts = [ordered]@{
     powershell_file_entry_preserves_script_root = ($petstarCli -match '"-File"' -and $petstarCli -notmatch 'ScriptBlock|EncodedCommand')
     hidden_watchdog_launcher = ($hiddenWatchdog -match 'shell\.Run\(command, 0, True\)' -and $hiddenWatchdog -match 'WScript\.Quit exitCode')
     hidden_scheduled_jobs_report_real_exit_code = ($hiddenScheduledJob -match 'shell\.Run\(command, 0, True\)' -and $hiddenScheduledJob -match 'WScript\.Quit exitCode' -and $scheduledTaskInstaller -match 'New-TimeSpan -Minutes 90')
+    all_day_schedule_avoids_midnight_and_reminder_collisions = ($scheduledTaskInstaller -match '1\.\.22' -and $scheduledTaskInstaller -notmatch '9\.\.22' -and $scheduledTaskInstaller -match '\[switch\]\$HourlyOnly' -and $scheduledJob -match 'function Invoke-CurrentDayHourlySync' -and $scheduledJob -match 'last_healthy_night.json')
     scheduled_jobs_use_local_lark_credentials = (
-        $scheduledJob -match "'HERMES_HOME'.+'HERMES_GATEWAY_TOKEN'.+'HERMES_SESSION_KEY'" -and
-        $scheduledJob -match "'OPENCLAW_CLI'.+'OPENCLAW_HOME'" -and
-        $scheduledJob -match "'LARK_CHANNEL'" -and
-        $scheduledJob -match 'Remove-Item -LiteralPath "Env:\$variableName"' -and
-        $scheduledJob.Contains("`$env:LARKSUITE_CLI_CONFIG_DIR = Join-Path `$env:USERPROFILE '.lark-cli'")
+        $runtimePaths -match "'HERMES_HOME'.+'HERMES_GATEWAY_TOKEN'.+'HERMES_SESSION_KEY'" -and
+        $runtimePaths -match "'OPENCLAW_CLI'.+'OPENCLAW_HOME'" -and
+        $runtimePaths -match "'LARK_CHANNEL'" -and
+        $runtimePaths -match 'Remove-Item -LiteralPath "Env:\$name"' -and
+        $runtimePaths.Contains("`$env:LARKSUITE_CLI_CONFIG_DIR = Join-Path (Get-PetstarUserProfile) '.lark-cli'") -and
+        $scheduledJob -match 'Initialize-PetstarLarkUserEnvironment' -and
+        $scheduledSync -match 'Initialize-PetstarLarkUserEnvironment'
     )
     desktop_lark_auth_uses_local_workspace_without_persisting_tokens = (
-        $desktopLarkAuth -match 'auth login --recommend --no-wait --json' -and
-        $desktopLarkAuth -match 'auth login --device-code \$deviceCode --json' -and
+        $desktopLarkAuth -match "'auth','login','--recommend','--no-wait','--json'" -and
+        $desktopLarkAuth -match "'auth','login','--device-code',\`$deviceCode,'--json'" -and
         $desktopLarkAuth -match 'LARKSUITE_CLI_CONFIG_DIR' -and
         $desktopLarkAuth -notmatch 'accessToken|refreshToken'
     )
@@ -161,7 +164,7 @@ $contracts = [ordered]@{
     empty_order_days_are_valid = ($orderExtractor -match 'if \(/共\\\\s\*0\\\\s\*单/\.test\(bodyText\)\) return true')
     empty_order_days_do_not_use_array_property_enumeration = ($orderSync -match '\$extractedOrderNos = @\(\$extract\.orders \| ForEach-Object' -and $orderSync -notmatch '\$extract\.orders\.orderNo')
     inventory_export_waits_for_loaded_fields = ($inventoryExporter -match 'required inventory export fields to finish loading' -and $inventoryExporter -match '!/正在加载/' -and $inventoryExporter -match 'required\.every')
-    inventory_failure_returns_structured_detail = ($inventorySync -match 'Console\]::Out\.WriteLine' -and $inventorySync -match 'ok=\$false;error=\$reason' -and $scheduledSync -match 'parsedError\.error')
+    inventory_failure_returns_structured_detail = ($inventorySync -match 'throw \$originalError' -and $inventorySync -notmatch '(?m)^\s*trap\s*\{' -and $skuIdentitySync -match 'throw \$originalError' -and $skuIdentitySync -notmatch '(?m)^\s*trap\s*\{' -and $scheduledSync -match 'parsedError\.error')
     business_warnings_do_not_mark_runtime_degraded = ($scheduledSync -match 'degraded = \[bool\]\$operationalDegraded' -and $scheduledSync -match 'sync_degraded' -and $scheduledSync -match '已完成·需核对')
     incomplete_orders_validate_quantity_sum = ($orderSync -match 'Measure-Object -Property quantity -Sum' -and $orderSync -match 'expectedItemCount')
     incomplete_orders_fail_before_sheet_read = ($orderSync.IndexOf('$incompleteOrders') -lt $orderSync.IndexOf("Get-SheetRows '订单汇总'"))
@@ -222,7 +225,7 @@ $contracts = [ordered]@{
     query_cache_is_short_and_bypassed_for_writes = ($codexBridge -match 'QUERY_CACHE_SECONDS = 30' -and $codexBridge -match 'use_cache=\(mode == "normal"\)' -and $bridge -match 'Clear-PetstarCodexQueryCache')
     message_latency_has_stage_telemetry = ($codexBridge -match 'codex_performance\.ndjson' -and $codexBridge -match 'model_seconds' -and $codexBridge -match 'query_seconds' -and $bridge -match 'message timing')
     order_local_ledger_rebuild_is_month_scoped = ($ledgerSync -match '\[string\]\$MonthFilter' -and $ledgerSync -match 'selected_months' -and $financeEvent -match 'monthLocalActions')
-    confirmed_intervention_cost_refresh_is_order_scoped = ($financeEvent -match 'function Invoke-CostSnapshotRebuild\(\[string\[\]\]\$EligibleOrderNumbers = @\(\), \[switch\]\$Incremental\)' -and $financeEvent -match "orderScopedCostActions = @\('AddIntervention','RemoveIntervention','SetOrderActuals','SetRefundDisposition'\)" -and $financeEvent -match 'Invoke-CostSnapshotRebuild -EligibleOrderNumbers @\(\$OrderNo\) -Incremental' -and $financeEvent -match 'effectiveDate\.ToString\(''yyyy-MM-dd''\)' -and $financeEvent -match 'daily_order_no=\$matchedDailyOrderNo')
+    confirmed_intervention_cost_refresh_is_order_scoped = ($financeEvent -match 'function Invoke-CostSnapshotRebuild\(\[string\[\]\]\$EligibleOrderNumbers = @\(\), \[switch\]\$Incremental\)' -and $financeEvent -match "orderScopedCostActions = @\('AddIntervention','RemoveIntervention','SetOrderActuals','SetRefundDisposition','AddOrderGift'\)" -and $financeEvent -match 'Invoke-CostSnapshotRebuild -EligibleOrderNumbers @\(\$OrderNo\) -Incremental' -and $financeEvent -match 'effectiveDate\.ToString\(''yyyy-MM-dd''\)' -and $financeEvent -match 'daily_order_no=\$matchedDailyOrderNo')
     replenishment_updates_only_local_cost_state = ($replenishmentBlock -match 'afterAverage' -and $replenishmentBlock -match "affected_tables=@\('补货记录','SKU成本主表'\)" -and $replenishmentBlock -notmatch 'Invoke-CostSnapshotRebuild|Invoke-DailyLedgerSync|库存批次')
     replenishment_defaults_to_same_day_full_payment = ($financeEvent -match 'explicitlyUnpaid' -and $financeEvent -match '未付款\|未支付\|赊账\|挂账\|欠款' -and $financeEvent -match '\$paymentAmountValue = if \(\$null -ne \$PaymentAmount\).+\$purchaseAmountValue' -and $codexBridge -match '默认当天已全额付款')
     plain_sku_cost_does_not_rebuild_history = ($setSkuCostBlock -notmatch 'Invoke-CostSnapshotRebuild' -and $setSkuCostBlock -match "historicalOrderType -eq 'platform'" -and $setSkuCostBlock -match "historicalOrderType -eq 'offline'" -and $setSkuCostBlock -match "else \{ @\('SKU成本主表'\) \}")

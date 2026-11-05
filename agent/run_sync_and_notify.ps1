@@ -14,6 +14,8 @@
 $ErrorActionPreference = 'Stop'
 $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+. (Join-Path $PSScriptRoot 'runtime_paths.ps1')
+Initialize-PetstarLarkUserEnvironment
 # 定时任务和 Hermes 子进程必须使用同一个 CLI 与凭据目录，避免 PATH 命中不同安装。
 $larkCliDirectory = Join-Path $env:APPDATA 'npm'
 $larkCliCommand = Join-Path $larkCliDirectory 'lark-cli.cmd'
@@ -1542,7 +1544,7 @@ try {
             }
             foreach ($decision in @($deliveryFeeResult.decisions)) {
                 if ($decision.state -in @('pending','conflict')) {
-                    $syncWarnings.Add("配送费待核对：订单 $($decision.order_no)｜$($decision.reason)。原费用保持不动。")
+                    $syncWarnings.Add("配送费待核对：订单 $($decision.order_no)｜$($decision.reason)。尚未确认免费，原费用保持不动，当前利润可能偏高。")
                 }
             }
             if (@($deliveryFeeResult.changed_order_nos).Count -gt 0 -and -not $DryRun) {
@@ -1677,6 +1679,11 @@ try {
     $snapshot | Add-Member -NotePropertyName today_expense_total -NotePropertyValue $dailyProfit.expense_total
     $snapshot | Add-Member -NotePropertyName today_promotion_expense -NotePropertyValue $dailyProfit.promotion_expense
     $snapshot | Add-Member -NotePropertyName today_net_profit -NotePropertyValue $dailyProfit.net_profit
+    foreach ($change in @($deliveryFeeResult.changed_orders)) {
+        if ($null -ne $change -and $change.order_no -and $change.date -and [string]$change.date -lt $dateText) {
+            $syncWarnings.Add("配送费已补录：$($change.date)订单 $($change.order_no)｜配送费 ¥$('{0:N2}' -f [double]$change.amount)，已更新原月份收入与利润，原日结暂估值应以更新后的账表为准。")
+        }
+    }
     $snapshot | Add-Member -NotePropertyName sync_warnings -NotePropertyValue @($syncWarnings)
     $snapshot | Add-Member -NotePropertyName sync_degraded -NotePropertyValue ([bool]$operationalDegraded)
     $message = Build-Message $snapshot $true
@@ -1705,9 +1712,9 @@ try {
         $refundAlertResult = $alertStage.value
     }
     $deliveryAlertResult = $null
-    $deliveryAlerts = @($syncWarnings | Where-Object { $_ -match '^配送费待核对：' })
+    $deliveryAlerts = @($syncWarnings | Where-Object { $_ -match '^配送费(?:待核对|已补录)：' })
     if ($Silent -and $deliveryAlerts.Count -gt 0) {
-        $deliveryAlertText = "🚚 配送费需要确认`n" + (($deliveryAlerts | Select-Object -First 12) -join "`n")
+        $deliveryAlertText = "🚚 配送费核对与补录`n" + (($deliveryAlerts | Select-Object -First 12) -join "`n")
         $deliveryAlertKey = "petstar-delivery-alert-$(Get-TextFingerprint ($deliveryAlerts -join '|'))"
         $alertStage = Invoke-WithRetry 'delivery_fee_alert' { Send-FeishuMessage $deliveryAlertText $null $deliveryAlertKey } 2
         $deliveryAlertResult = $alertStage.value

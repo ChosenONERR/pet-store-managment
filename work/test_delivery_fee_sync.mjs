@@ -13,6 +13,11 @@ for(const current_fee of [0,null,6.78])check(()=>assert.equal(selectDeliveryOrde
 check(()=>assert.equal(selectDeliveryOrders([{...base,date:'2026-11-02'}],'2026-11-03',[{order_no:id}]).length,1));
 check(()=>assert.equal(selectDeliveryOrders([base],'2026-11-02',[{order_no:id}]).length,0));
 check(()=>assert.equal(selectDeliveryOrders([{...base,date:'2026-10-31'}],'2026-11-03').length,0));
+check(()=>assert.equal(selectDeliveryOrders([{...base,date:'2026-11-02'}],'2026-11-03').length,1));
+check(()=>assert.equal(selectDeliveryOrders([{...base,date:'2026-11-02',current_fee:5}],'2026-11-03').length,0));
+check(()=>assert.equal(selectDeliveryOrders([{...base,date:'2026-11-02',protected:true}],'2026-11-03').length,0));
+check(()=>assert.equal(selectDeliveryOrders([{...base,date:'2026-11-02',confirmed_self:true}],'2026-11-03').length,0));
+check(()=>assert.equal(selectDeliveryOrders([{...base,date:'2026-10-31'}],'2026-11-01').length,1));
 for(const override of [{intervention:true},{status:'已取消'},{platform:'京东'}])check(()=>assert.equal(selectDeliveryOrders([{...base,...override}],'2026-11-03').length,0));
 check(()=>assert.throws(()=>selectDeliveryOrders([base,base],'2026-11-03')));
 check(()=>assert.equal(decideDeliveryFee(base,[],providers).state,'pending'));
@@ -40,6 +45,10 @@ const second=await extractDeliveryFees({date:'2026-11-03',orders:[base],pending:
 assert.equal(second.decisions[0].amount,4.51);assert.equal(second.pending.length,0);cases++;
 const crossDay=await extractDeliveryFees({date:'2026-11-04',orders:[base],pending:first.pending},async(p,dates)=>{assert.deepEqual(dates,['2026-11-03']);return p==='maiyatian'?[paid()]:[];});
 assert.equal(crossDay.decisions[0].amount,6.78);cases++;
+const lostQueue=await extractDeliveryFees({date:'2026-11-04',orders:[base],pending:[]},async(p,dates)=>{assert.deepEqual(dates,['2026-11-03']);return p==='maiyatian'?[paid()]:[];});
+assert.equal(lostQueue.decisions[0].amount,6.78);assert.equal(lostQueue.pending.length,0);cases++;
+const crossDaySelf=await extractDeliveryFees({date:'2026-11-04',orders:[{...base,protected:true,confirmed_self:true}],pending:[{order_no:id,date:'2026-11-03'}]},async()=>{throw Error('Confirmed self delivery must not query');});
+assert.equal(crossDaySelf.queried_count,0);assert.equal(crossDaySelf.pending.length,0);cases++;
 const self=await extractDeliveryFees({date:'2026-11-03',orders:[{...base,confirmed_self:true}],pending:[]},async()=>{throw Error('Self delivery must not query');});
 assert.equal(self.queried_count,0);assert.equal(self.pending.length,0);cases++;
 const outage=await extractDeliveryFees({date:'2026-11-03',orders:[base],pending:[]},async()=>{throw Error('offline');});
