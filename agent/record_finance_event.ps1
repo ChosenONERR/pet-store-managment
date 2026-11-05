@@ -124,6 +124,8 @@ trap {
     } else {
         [Console]::Error.WriteLine($reason)
     }
+    # Preserve the business reason across native stderr/stack formatting in PS5.
+    [Console]::Out.WriteLine(([ordered]@{ok=$false;error=$reason} | ConvertTo-Json -Compress))
     exit 1
 }
 
@@ -410,6 +412,25 @@ function Resolve-UniqueSkuReference($Rows, [string]$RequestedCode) {
     if ($matches.Count -eq 0) { throw "SKU成本主表中找不到货号：$RequestedCode" }
     if ($matches.Count -gt 1) { throw "SKU成本主表中标识不唯一：$RequestedCode（匹配 $($matches.Count) 行），请使用系统返回的 SKU ID 定位" }
     return $matches[0]
+}
+
+function Resolve-OrderActualSkuReference($Rows, [string]$RequestedCode, $OriginalItems) {
+    $originalMatches = @($OriginalItems | Where-Object { $_.code -ieq $RequestedCode })
+    if ($originalMatches.Count -gt 1) { throw "原订单同一货号对应多个商品行：$RequestedCode，请明确具体商品ID后再调整" }
+    if ($originalMatches.Count -eq 1 -and $originalMatches[0].product_id) {
+        # A historical line's identity outranks a KW that may now be reused.
+        $target = Resolve-UniqueSkuReference $Rows ('sku_id:' + $originalMatches[0].product_id)
+        return [pscustomobject]@{target=$target;original_item=$originalMatches[0]}
+    }
+    $target = Resolve-UniqueSkuReference $Rows $RequestedCode
+    $productId = ([string](Get-CellValue $target.cells $skuSchema.ProductId.Index)).Trim()
+    $canonicalKw = [string](Get-CellValue $target.cells $skuSchema.CurrentKw.Index)
+    $matches = @($OriginalItems | Where-Object {
+        if ($_.product_id -and $productId) { $_.product_id -ieq $productId }
+        else { $_.code -ieq $RequestedCode -or $_.code -ieq $canonicalKw }
+    })
+    if ($matches.Count -gt 1) { throw "原订单存在多个匹配规格：$RequestedCode，请先核对商品明细" }
+    return [pscustomobject]@{target=$target;original_item=$(if($matches.Count){$matches[0]}else{$null})}
 }
 
 function New-OrderGiftPlan([string]$Items, $SkuRows, $ResolvedOrder, [bool]$PendingOrder, [string]$GiftNote, [string]$GiftEventId) {
@@ -1232,7 +1253,9 @@ switch ($Action) {
         Assert-NonNegative $Amount '订单实际收入'
         if ($null -ne $DeliveryFee) { Assert-NonNegative $DeliveryFee '订单实际配送费' }
         if (-not $Items) { throw '修正订单实际履约必须提供实际售出商品，例如 kw3001×1' }
-        $actualItemMatches = @([regex]::Matches($Items, '(?i)\b((?:kw|csx)\d+)\s*[×xX*]\s*(\d+(?:\.\d+)?)'))
+        $actualItemPattern = '(?i)(?<![\w:])((?:kw|csx)\d+|sku_id:[a-z0-9_-]+|sku_ref:\d+:[a-z0-9_-]+)\s*[×xX*]\s*(\d+(?:\.\d+)?)'
+        $actualItemMatches = @([regex]::Matches($Items, $actualItemPattern))
+        if ([regex]::Replace($Items,$actualItemPattern,'') -match '(?i)sku_(?:ref|id):') { throw '实际交付商品的SKU定位符格式无效，请重新查询' }
         if ($actualItemMatches.Count -eq 0) { throw '订单实际履约修正必须明确提供最终实际交付商品，例如 kw1096×2、kw1095×1；漏送或退回商品不要写入' }
         $requestedQuantities = [ordered]@{}
         foreach ($match in $actualItemMatches) {
@@ -1282,7 +1305,8 @@ switch ($Action) {
         foreach ($requested in $requestedQuantities.GetEnumerator()) {
             $requestedCode = [string]$requested.Key
             $actualQuantity = [double]$requested.Value
-            $skuTarget = Resolve-UniqueSkuReference $skuRows $requestedCode
+            $skuResolution = Resolve-OrderActualSkuReference $skuRows $requestedCode $originalItemRecords
+            $skuTarget = $skuResolution.target
             $canonicalKw = (Get-CellValue $skuTarget.cells $skuSchema.CurrentKw.Index)
             if (-not $canonicalKw -or $canonicalKw -notmatch '(?i)^kw\d+$') { throw "SKU成本主表第$($skuTarget.row_number)行没有有效当前KW，无法登记实际售出商品" }
             $canonicalKw = $canonicalKw.ToLowerInvariant()
@@ -1293,9 +1317,6 @@ switch ($Action) {
             $unitCostText = Get-CellValue $skuTarget.cells $skuSchema.MovingAverageCost.Index
             if ($null -eq $unitCostText -or $unitCostText -eq '') { $unitCostText = Get-CellValue $skuTarget.cells $skuSchema.BaselineUnitCost.Index }
             if ($null -eq $unitCostText -or $unitCostText -eq '') { throw "$canonicalKw 当前成本为空，不能安全重算该订单" }
-            $originalMatch = @($originalItemRecords | Where-Object {
-                $_.code -ieq $requestedCode -or $_.code -ieq $canonicalKw -or ($productId -and $_.product_id -eq $productId)
-            } | Select-Object -First 1)
             $resolvedRequestedItems.Add([pscustomobject]@{
                 requested_code = $requestedCode
                 canonical_kw = $canonicalKw
@@ -1305,7 +1326,7 @@ switch ($Action) {
                 quantity = $actualQuantity
                 unit_cost = Convert-ToNumber $unitCostText
                 sku_master_row = $skuTarget.row_number
-                original_item = $(if ($originalMatch.Count -gt 0) { $originalMatch[0] } else { $null })
+                original_item = $skuResolution.original_item
             })
         }
 
@@ -1313,8 +1334,8 @@ switch ($Action) {
         $allOriginalItemsPreserved = $true
         foreach ($originalRecord in $originalItemRecords) {
             $preservedQuantity = [double](($resolvedRequestedItems | Where-Object {
-                $_.requested_code -ieq $originalRecord.code -or $_.canonical_kw -ieq $originalRecord.code -or
-                ($originalRecord.product_id -and $_.product_id -eq $originalRecord.product_id)
+                if ($originalRecord.product_id -and $_.product_id) { $_.product_id -ieq $originalRecord.product_id }
+                else { $_.requested_code -ieq $originalRecord.code -or $_.canonical_kw -ieq $originalRecord.code }
             } | Measure-Object -Property quantity -Sum).Sum)
             if ([math]::Abs($preservedQuantity - [double]$originalRecord.quantity) -gt 0.000001) {
                 $allOriginalItemsPreserved = $false
@@ -1372,6 +1393,7 @@ switch ($Action) {
         }) -join '、'
         $details = [ordered]@{
             order_no = $OrderNo
+            date = $orderDate.ToString('yyyy-MM-dd')
             order_date = $orderDate.ToString('yyyy-MM-dd')
             daily_order_no = Get-CellValue $orderMatches[0].cells 16
             order_summary_row = $orderMatches[0].row_number
