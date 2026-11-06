@@ -313,16 +313,12 @@ $catchUpAction = 'none'
 $now = [datetime]::Now
 if ($now.Hour -lt 9 -and ($now.Hour -gt 0 -or $now.Minute -ge 5)) {
     $targetNightDate = $now.Date.AddDays(-1).ToString('yyyy-MM-dd')
-    $healthyNightDate = $null
-    if (Test-Path -LiteralPath $healthyNightPath) {
-        try { $healthyNightDate = [string]((Get-Content -LiteralPath $healthyNightPath -Raw | ConvertFrom-Json).date) } catch {}
-    }
-    if ($healthyNightDate -ne $targetNightDate) {
+    if (Test-PetstarNightRecoveryRequired $stateRoot $targetNightDate) {
         if (Test-NightRecoveryCooldown $targetNightDate 30) {
             $catchUpAction = 'cooldown'
         }
         $syncProcesses = @(Get-CimInstance Win32_Process | Where-Object {
-            $_.CommandLine -and $_.CommandLine -match '(?i)petstar_(night_sync|night_recovery)\.py|petstar_cli\.py\s+sync'
+            $_.CommandLine -and $_.CommandLine -match '(?i)petstar_(night_sync|night_recovery)\.py|petstar_cli\.py\s+sync|run_sync_and_notify\.ps1|run_scheduled_job\.ps1.*-Job\s+(Night|Weekly|NightRecovery)'
         })
         if ($catchUpAction -ne 'cooldown' -and $syncProcesses.Count -eq 0 -and (Test-Path -LiteralPath $scheduledJobPath)) {
             Save-NightRecoveryAttempt $targetNightDate

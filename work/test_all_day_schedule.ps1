@@ -1,5 +1,6 @@
 $ErrorActionPreference='Stop'
 $root=Split-Path $PSScriptRoot -Parent
+. (Join-Path $root 'agent\runtime_paths.ps1')
 $installer=Join-Path $root 'agent\configure_petstar_scheduled_tasks.ps1'
 $runner=Join-Path $root 'agent\run_scheduled_job.ps1'
 $fakeStore=[pscustomobject]@{writes=0;triggers=@()};$script:cases=0
@@ -63,7 +64,9 @@ $script:failNight=$true;$failed=$false
 try{$null=Scenario Weekly ([datetime]'2026-11-02')}catch{$failed=$_.Exception.Message -match 'offline-night-failure'}
 Check ($failed -and $script:recordedCalls.Count -eq 0) 'Night failure continued into hourly or audit'
 $script:failNight=$false
-$health=Join-Path ([IO.Path]::GetTempPath()) ('petstar-health-'+[guid]::NewGuid().ToString('N')+'.json')
+$fixtureRoot=Join-Path ([IO.Path]::GetTempPath()) ('petstar-health-'+[guid]::NewGuid().ToString('N'))
+$null=New-Item -ItemType Directory -Path $fixtureRoot
+$health=Join-Path $fixtureRoot 'last_healthy_night.json'
 try{
     [IO.File]::WriteAllText($health,'{"date":"2026-11-04","mode":"night","ok":true,"degraded":false}',[Text.UTF8Encoding]::new($false))
     $calls=Scenario NightRecovery ([datetime]'2026-11-05') $health
@@ -71,7 +74,7 @@ try{
     [IO.File]::WriteAllText($health,'{"date":"2026-11-03","mode":"night","ok":true}',[Text.UTF8Encoding]::new($false))
     $calls=Scenario NightRecovery ([datetime]'2026-11-05') $health
     Check ($calls.Count -eq 2 -and 'night' -in $calls[0].arguments -and 'midday' -in $calls[1].arguments) 'Stale close did not recover then sync current day'
-}finally{if(Test-Path -LiteralPath $health){Remove-Item -LiteralPath $health}}
+}finally{if(Test-Path -LiteralPath $health){Remove-Item -LiteralPath $health};Remove-Item -LiteralPath $fixtureRoot}
 $source=[IO.File]::ReadAllText($runner)
 Check ($source -match 'agent\\state\\last_healthy_night.json' -and $source -notmatch 'agent\\state\\last_run.json') 'Recovery depends on mutable last-run record'
 [ordered]@{ok=$true;cases=$script:cases;external_writes=0;actual_tasks_changed=0;hours_covered=24}|ConvertTo-Json -Compress

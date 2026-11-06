@@ -373,6 +373,11 @@ function Save-RunState($Value) {
     }
     $historyLine = ($Value | ConvertTo-Json -Depth 16 -Compress) + [Environment]::NewLine
     [System.IO.File]::AppendAllText($historyPath, $historyLine, [System.Text.UTF8Encoding]::new($false))
+    if (Test-PetstarNightCompleted ([pscustomobject]$Value) ([string]$Value.date)) {
+        $completedPath = Join-Path $stateRoot 'last_completed_night.json'
+        [System.IO.File]::WriteAllText("$completedPath.tmp", $json, [System.Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath "$completedPath.tmp" -Destination $completedPath -Force
+    }
     if ($Value.mode -eq 'night' -and $Value.ok -eq $true -and $Value.degraded -ne $true) {
         $healthyNightPath = Join-Path $stateRoot 'last_healthy_night.json'
         $healthyNightTemp = "$healthyNightPath.tmp"
@@ -767,7 +772,7 @@ function Get-TargetedMonthKeys($OrderSyncResult, [string[]]$OrderNumbers, [bool]
 
 function Get-CurrentUserOpenId {
     try {
-        $status = Get-LarkAuthStatus -Verify
+        $status = Get-LarkAuthStatus
         $openId = $status.identities.user.openId
         if (-not $openId) { $openId = $status.identities.user.open_id }
         if ($openId) {
@@ -801,18 +806,14 @@ function Test-SyncPreflight {
     }
     $auth = $null
     $authError = $null
-    try {
-        $auth = Get-LarkAuthStatus -Verify
-    } catch {
-        $authError = $_.Exception.Message
-    }
-
-    # 本地 auth status 偶尔会在刷新瞬间误报。以最小只读请求作为最终可用性判据。
+    # Read first: the normal API client owns refresh. Metadata/status is not an
+    # additional network verification and must never trigger a second refresh.
     try {
         $null = Invoke-LarkJson {
             & $larkCliCommand sheets +cells-get --as user --spreadsheet-token $spreadsheetToken --sheet-name '驾驶舱' --range 'A1:A1' --include value --max-chars 2000 --format json
         } '飞书最小只读探针失败' 2
     } catch {
+        try { $auth = Get-LarkAuthStatus } catch { $authError = 'metadata_unavailable' }
         $userStatus = if ($null -ne $auth) { [string]$auth.identities.user.status } else { 'unknown' }
         $tokenStatus = if ($null -ne $auth) { [string]$auth.identities.user.tokenStatus } else { 'unknown' }
         $expiresAt = if ($null -ne $auth) { [string]$auth.identities.user.expiresAt } else { 'unknown' }
@@ -820,9 +821,7 @@ function Test-SyncPreflight {
         throw "飞书用户凭据暂时不可用：user_status=$userStatus；token_status=$tokenStatus；expires_at=$expiresAt；read_probe=$($_.Exception.Message)；auth_status=$authDetail"
     }
     # 只读请求会在需要时刷新用户凭据；再次读取，记录刷新后的真实状态。
-    try { $auth = Get-LarkAuthStatus -Verify } catch {
-        if ($null -eq $auth) { try { $auth = Get-LarkAuthStatus } catch {} }
-    }
+    try { $auth = Get-LarkAuthStatus } catch {}
     if ($null -ne $auth) { Save-LarkUserIdentity $auth }
     return [pscustomobject]@{
         node = 'ready'
@@ -1439,6 +1438,7 @@ $executionPath = 'full'
 $executionPathReason = $null
 $syncWarnings = [Collections.Generic.List[string]]::new()
 $operationalDegraded = $false
+$nightRecoveryRequired = $false
 try {
     $stage = Invoke-WithRetry 'preflight' { Test-SyncPreflight } 5
     $preflightResult = $stage.value
@@ -1458,6 +1458,7 @@ try {
         # 否则 23:00 之后产生的订单会一直缺失。继续同步订单和收入，但把
         # 本次日结标为降级，明确提示净利润尚未扣除待补的推广费。
         $promotionCaptureError = $_.Exception.Message
+        $nightRecoveryRequired = $true
         $operationalDegraded = $true
         $syncWarnings.Add("推广费尚未读取：订单、成本及收入已继续同步；本次赚/亏未扣除待补推广费，系统会在后续夜间任务继续补抓。详情：$promotionCaptureError")
     }
@@ -1517,6 +1518,7 @@ try {
                     $syncWarnings.Add("发现 $([int]$inventoryResult.new_kw_count) 个新KW，已加入SKU成本主表并标记为缺少成本，请补充单位成本。")
                 }
                 if ($inventoryResult.degraded) {
+                    $nightRecoveryRequired = $true
                     $operationalDegraded = $true
                     $syncWarnings.Add("库存导出未取得新文件，已使用最近一次有效文件；补货清单可能不是零点实时库存。")
                 }
@@ -1540,6 +1542,7 @@ try {
             } 1
             $deliveryFeeResult = $stage.value
             if ($deliveryFeeResult.providers.maiyatian.ok -ne $true -or $deliveryFeeResult.providers.cyanclouds.ok -ne $true) {
+                $nightRecoveryRequired = $true
                 $operationalDegraded = $true
             }
             foreach ($decision in @($deliveryFeeResult.decisions)) {
@@ -1559,6 +1562,7 @@ try {
             # Read failures are isolated; any failure after a fee write must
             # roll back the shared transaction, never commit partial updates.
             if ($_.Exception.Message -match 'DELIVERY_WRITE_FAILED:') { throw }
+            $nightRecoveryRequired = $true
             $operationalDegraded = $true
             $syncWarnings.Add((Get-DeliveryFeeFailureWarning $_.Exception.Message))
         }
@@ -1728,7 +1732,10 @@ try {
     $result = [ordered]@{
         ok = $true
         degraded = [bool]$operationalDegraded
+        recovery_required = [bool]$nightRecoveryRequired
         sync_skipped = [bool]$SkipSync
+        orders_skipped = [bool]$SkipOrders
+        inventory_skipped = [bool]$SkipInventory
         date = $dateText
         mode = $Mode
         fast_path = [ordered]@{

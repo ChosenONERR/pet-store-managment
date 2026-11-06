@@ -66,14 +66,7 @@ switch ($Job) {
     }
     'NightRecovery' {
         $targetDate = $today.AddDays(-1).ToString('yyyy-MM-dd')
-        $healthy = $false
-        if (Test-Path -LiteralPath $statePath -PathType Leaf) {
-            try {
-                $lastRun = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
-                $healthy = ([string]$lastRun.date -eq $targetDate -and [string]$lastRun.mode -eq 'night' -and
-                    [bool]$lastRun.ok -and -not [bool]$lastRun.degraded)
-            } catch {}
-        }
+        $healthy = -not (Test-PetstarNightRecoveryRequired (Split-Path $statePath -Parent) $targetDate)
         if ($healthy) {
             [ordered]@{ok=$true;skipped=$true;reason='night sync already healthy';date=$targetDate} | ConvertTo-Json -Compress
             break

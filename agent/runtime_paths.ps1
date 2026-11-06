@@ -1,3 +1,27 @@
+function Test-PetstarNightCompleted($Run, [string]$TargetDate) {
+    if ($null -eq $Run -or [string]$Run.date -ne $TargetDate -or
+        [string]$Run.mode -ne 'night' -or $Run.ok -ne $true -or
+        $Run.dry_run -eq $true -or $Run.sync_skipped -eq $true -or
+        $Run.orders_skipped -eq $true -or $Run.inventory_skipped -eq $true) { return $false }
+    # Legacy records without an explicit technical outcome are safe only when healthy.
+    if ($null -ne $Run.PSObject.Properties['recovery_required']) {
+        return ($Run.recovery_required -eq $false)
+    }
+    return ($Run.degraded -ne $true)
+}
+
+function Test-PetstarNightRecoveryRequired([string]$StateRoot, [string]$TargetDate) {
+    foreach ($name in @('last_completed_night.json','last_healthy_night.json')) {
+        $path = Join-Path $StateRoot $name
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+        try {
+            $run = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+            if (Test-PetstarNightCompleted $run $TargetDate) { return $false }
+        } catch {}
+    }
+    return $true
+}
+
 function Get-PetstarWindowsPowerShell {
     $candidates = [Collections.Generic.List[string]]::new()
     if ($env:SystemRoot) {
