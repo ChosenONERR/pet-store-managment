@@ -1195,7 +1195,7 @@ if (-not $DryRun -and $EventId -and (Test-ProcessedEvent $EventId)) {
     exit 0
 }
 
-$nativeDryRunActions = @('AddIntervention','RemoveIntervention','SetOrderDeliveryFee','SetOrderActuals','OfflineSale','AddOrderGift','Replenishment','BatchSkuMaintenance','SetCostBookQuantity','SetSkuCost','SetSkuExpiry','SetSkuBatchDate','ChangeSkuCode','OperatingExpense','SetRefundDisposition')
+$nativeDryRunActions = @('AddIntervention','RemoveIntervention','ConfirmSelfDelivery','SetOrderDeliveryFee','SetOrderActuals','OfflineSale','AddOrderGift','Replenishment','BatchSkuMaintenance','SetCostBookQuantity','SetSkuCost','SetSkuExpiry','SetSkuBatchDate','ChangeSkuCode','OperatingExpense','SetRefundDisposition')
 if ($DryRun -and $Action -notin $nativeDryRunActions) {
     throw "动作 $Action 暂不支持直接预演；已在任何写入前停止"
 }
@@ -1609,40 +1609,6 @@ switch ($Action) {
         if (-not $found) { throw "未找到干预订单：$OrderNo" }
         $reference = $OrderNo
     }
-    'ConfirmSelfDelivery' {
-        if (-not $OrderNo -or $OrderNo -notmatch '^\d{10,30}$') { throw '自配送确认必须提供有效平台订单号' }
-        $rows = Get-SheetRows '干预订单' 'A2:M1001'
-        $found = $false
-        for ($i = 0; $i -lt $rows.Count; $i++) {
-            if ((Get-CellValue $rows[$i] 3) -ne $OrderNo) { continue }
-            $rowNumber = 2 + $i
-            $platformFee = Convert-ToNumber (Get-CellValue $rows[$i] 6)
-            $totalCost = $platformFee
-            Set-OneRow '干预订单' "F${rowNumber}:F${rowNumber}" @('自配送')
-            Set-OneRow '干预订单' "H${rowNumber}:H${rowNumber}" @(0)
-            if ($Note) {
-                $oldNote = Get-CellValue $rows[$i] 12
-                $newNote = if ($oldNote) { "$oldNote；$Note" } else { $Note }
-                Set-OneRow '干预订单' "M${rowNumber}:M${rowNumber}" @($newNote)
-            }
-            $orderDate = Convert-ToDateValue (Get-CellValue $rows[$i] 0)
-            $writeResult = [pscustomobject]@{
-                row=$rowNumber
-                order_no=$OrderNo
-                date=$(if($orderDate){$orderDate.ToString('yyyy-MM-dd')}else{$null})
-                daily_order_no=(Get-CellValue $rows[$i] 1)
-                delivery_type='自配送'
-                delivery_fee=0
-                external_delivery_fee=0
-                platform_fee=$platformFee
-                total_cost=$totalCost
-            }
-            $found = $true
-            break
-        }
-        if (-not $found) { throw "未找到干预订单：$OrderNo；请先把它登记为补单" }
-        $reference = $OrderNo
-    }
     'SetExternalDeliveryFee' {
         if (-not $OrderNo -or $OrderNo -notmatch '^\d{10,30}$') { throw '配送费必须提供有效平台订单号' }
         Assert-Positive $Amount '配送费'
@@ -1679,7 +1645,10 @@ switch ($Action) {
         if (-not $found) { throw "未找到干预订单：$OrderNo；请先把它登记为补单" }
         $reference = $OrderNo
     }
-    'SetOrderDeliveryFee' {
+    { $_ -in @('ConfirmSelfDelivery','SetOrderDeliveryFee') } {
+        # Legacy self-delivery actions (including stored confirmations) are
+        # zero-fee order updates, not evidence that an order is an intervention.
+        if ($Action -eq 'ConfirmSelfDelivery') { $Amount = 0.0 }
         if (-not $OrderNo -or $OrderNo -notmatch '^\d{10,30}$') { throw '配送费必须提供有效平台订单号' }
         Assert-NonNegative $Amount '配送费'
         $amountValue = [math]::Round([double]$Amount, 2)
@@ -1723,7 +1692,7 @@ switch ($Action) {
             $oldAmount = Convert-ToNumber (Get-CellValue $row 9)
             $orderDate = Convert-ToDateValue (Get-CellValue $row 0)
             if ($DryRun) {
-                [ordered]@{ok=$true;dry_run=$true;action=$Action;result=[ordered]@{order_no=$OrderNo;order_type='自然单';date=$(if($orderDate){$orderDate.ToString('yyyy-MM-dd')}else{$null});daily_order_no=(Get-CellValue $row 16);old_delivery_fee=$oldAmount;delivery_fee=$amountValue}} | ConvertTo-Json -Depth 8
+                [ordered]@{ok=$true;dry_run=$true;action=$Action;result=[ordered]@{order_no=$OrderNo;order_type='自然单';date=$(if($orderDate){$orderDate.ToString('yyyy-MM-dd')}else{$null});daily_order_no=(Get-CellValue $row 16);old_delivery_fee=$oldAmount;delivery_fee=$amountValue;delivery_type=$(if($amountValue -eq 0){'自配送'}else{'骑手配送'})}} | ConvertTo-Json -Depth 8
                 Complete-CurrentFinanceTransaction
                 exit 0
             }
@@ -1733,7 +1702,7 @@ switch ($Action) {
             $manualMarker = "人工确认配送费：$($amountValue.ToString('0.00',[Globalization.CultureInfo]::InvariantCulture))元"
             $newNote = ((@($cleanNote,$manualMarker,$Note) | Where-Object { $_ }) -join '；')
             Set-OneRow '订单汇总' "P${rowNumber}:P${rowNumber}" @($newNote)
-            $writeResult = [pscustomobject]@{row=$rowNumber;order_no=$OrderNo;order_type='自然单';date=$(if($orderDate){$orderDate.ToString('yyyy-MM-dd')}else{$null});daily_order_no=(Get-CellValue $row 16);old_delivery_fee=$oldAmount;delivery_fee=$amountValue}
+            $writeResult = [pscustomobject]@{row=$rowNumber;order_no=$OrderNo;order_type='自然单';date=$(if($orderDate){$orderDate.ToString('yyyy-MM-dd')}else{$null});daily_order_no=(Get-CellValue $row 16);old_delivery_fee=$oldAmount;delivery_fee=$amountValue;delivery_type=$(if($amountValue -eq 0){'自配送'}else{'骑手配送'})}
         }
         $reference = $OrderNo
     }

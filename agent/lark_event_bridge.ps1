@@ -558,7 +558,7 @@ function Invoke-PetstarEvent([string[]]$Arguments) {
     $action = [string]$argumentMap.action
     if ($script:previewMode) {
         $previewResult = $null
-        if ($action -in @('RemoveIntervention','OfflineSale','AddOrderGift','Replenishment','SetCostBookQuantity','SetSkuExpiry','SetSkuBatchDate','SetSkuCost','ChangeSkuCode','SetOrderDeliveryFee','SetOrderActuals','SetRefundDisposition')) {
+        if ($action -in @('RemoveIntervention','OfflineSale','AddOrderGift','Replenishment','SetCostBookQuantity','SetSkuExpiry','SetSkuBatchDate','SetSkuCost','ChangeSkuCode','ConfirmSelfDelivery','SetOrderDeliveryFee','SetOrderActuals','SetRefundDisposition')) {
             $previewOutputLines = @(& $pythonExe $petstarCli event @Arguments --dry-run 2>&1 | ForEach-Object { [string]$_ })
             $previewExitCode = $LASTEXITCODE
             $previewResult = Convert-CommandOutputToJson $previewOutputLines
@@ -571,7 +571,6 @@ function Invoke-PetstarEvent([string[]]$Arguments) {
             switch ($action) {
                 'AddIntervention' { $previewResult = [pscustomobject]@{ok=$true;result=[pscustomobject]@{order_no=$argumentMap.order_no;person=$argumentMap.person}} }
                 'RestoreInventory' { $previewResult = [pscustomobject]@{ok=$true;result=[pscustomobject]@{order_no=$argumentMap.order_no;state='已恢复'}} }
-                'ConfirmSelfDelivery' { $previewResult = [pscustomobject]@{ok=$true;result=[pscustomobject]@{order_no=$argumentMap.order_no;delivery_type='自配送';delivery_fee=0;total_cost=0}} }
                 'SetExternalDeliveryFee' { $previewResult = [pscustomobject]@{ok=$true;result=[pscustomobject]@{order_no=$argumentMap.order_no;delivery_type='骑手配送';delivery_fee=$amount;total_cost=$amount}} }
                 default { $previewResult = [pscustomobject]@{ok=$true;result=[pscustomobject]@{}} }
             }
@@ -844,7 +843,7 @@ function Format-CodexExecutionReply($Operations) {
             'AddIntervention' { $lines.Add("干预订单第$($details.row)行：$($args.order_no)$(if($details.person){'｜补单人 '+$details.person}else{''})") }
             'RemoveIntervention' { $lines.Add("已撤销错误干预：干预订单第$($details.row)行｜$($args.order_no)；订单重新按自然单核算") }
             'RestoreInventory' { $lines.Add("干预订单第$($details.row)行：库存状态改为已恢复") }
-            'ConfirmSelfDelivery' { $lines.Add("干预订单第$($details.row)行：自配送，配送费 ¥0") }
+            'ConfirmSelfDelivery' { $lines.Add("$($details.order_type) $($details.daily_order_no)｜$($args.order_no)：自配送，配送费 ¥0") }
             'SetExternalDeliveryFee' { $lines.Add("干预订单第$($details.row)行：骑手配送费 ¥$($args.amount)") }
             'SetOrderDeliveryFee' { $lines.Add("$($details.order_type) $($details.daily_order_no)：配送费 ¥$($details.old_delivery_fee) → ¥$($details.delivery_fee)") }
             'SetOrderActuals' { $lines.Add("$($details.daily_order_no)｜订单 $($details.order_no)：实收 ¥$($details.new_income)｜实际售出 $($details.new_items)｜货物成本 ¥$($details.expected_new_cost)｜赚/亏 ¥$($details.expected_new_profit)；未修改美团库存。") }
@@ -1288,7 +1287,11 @@ function Format-ConfirmationPreview([string]$ChangeId, $Operations, [string]$Fal
                 $null = $impacts.Add('订单汇总及订单商品成本')
                 $null = $impacts.Add('对应月份收入/支出及当天赚/亏')
             }
-            'ConfirmSelfDelivery' { $lines.Add("干预订单｜按订单号定位：$($args.order_no)｜配送方式改为自配送、配送费改为 ¥0"); $null = $impacts.Add('干预订单') }
+            'ConfirmSelfDelivery' {
+                $lines.Add("$($details.order_type)｜订单 $($args.order_no)｜配送方式改为自配送、配送费 ¥$([double]$details.old_delivery_fee) → ¥0")
+                $null = $impacts.Add($(if ($details.order_type -eq '干预单') { '干预订单及月份支出' } else { '订单汇总及月份收入' }))
+                $null = $impacts.Add('单笔及当天赚/亏')
+            }
             'SetExternalDeliveryFee' { $lines.Add("干预订单｜按订单号定位：$($args.order_no)｜配送方式改为骑手配送、配送费改为 ¥$($args.amount)"); $null = $impacts.Add('干预订单') }
             'SetOrderDeliveryFee' {
                 $orderName = if ($details.daily_order_no) { [string]$details.daily_order_no } else { [string]$args.order_no }

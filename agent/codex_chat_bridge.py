@@ -131,7 +131,7 @@ ACTION_GUIDE = """
 - AddIntervention: date, order_no, person, note
 - RemoveIntervention: order_no, note。仅当店主明确说某订单不是干预单、登记错了或要求撤销干预时使用
 - RestoreInventory: order_no, note
-- ConfirmSelfDelivery: order_no, note
+- ConfirmSelfDelivery: order_no, note。旧动作兼容入口，等同于把该订单配送费设为0；不代表干预订单，优先使用下面的 SetOrderDeliveryFee
 - SetExternalDeliveryFee: order_no, amount, note
 - SetOrderDeliveryFee: order_no, amount, note
 - SetOrderActuals: order_no, amount（最终实际收入）, items（最终实际交付的KW/CSX×数量）, delivery_fee, note。用于线上订单私下退款、漏送退款、到店换货、实际成交商品变化或最终改价；漏送/退回的商品不得写入 items；该动作不修改平台库存
@@ -165,6 +165,7 @@ sku 查询的每一行也会返回 action_code。只要查询结果提供 action
 订单号必须逐字保留，不能改写、补全或猜测。KW 是可调整和复用的当前货号，不是永久商品身份；不得创建历史别名。
 店主纠正“旧订单不是干预单，真正的干预单是另一个订单”时，必须为旧订单生成 RemoveIntervention，并为正确订单生成 AddIntervention；配送方式、配送费、补单人和库存恢复状态如果是在同一纠错上下文中明确给出的，也一并迁移到正确订单。不得只解释执行层不支持，也不得把两笔都保留为干预。
 自己送、自配送、商家自配、没有配送费，都表示配送费为0元。线下单默认自提配送费0并当天到账，除非店主另有说明。
+只确认已有线上订单的自配送或首次配送费为0时，使用 SetOrderDeliveryFee（order_no、amount=0、note保留自配送原意）；自配送不等于干预单，禁止据此生成 AddIntervention。执行器会核对实际订单类型，查询不到订单时必须提示先同步，不能用合成预览声称已经找到。
 线上订单发生私下退款、漏送退款、到店换货、实际售出商品与线上订单不同，或店主明确给出该订单最终实收时，使用 SetOrderActuals，绝不能使用 ActualReceipt。amount 填最终实际收入；items 只填最终实际交付商品，漏送、退回或没有交付的商品必须排除。用户没有明确谈配送方式或配送费时 delivery_fee 必须填 null，由执行器在确认时沿用订单当前值；只有明确到店自提、自配送或给出新配送费时才填写。店主说已手工恢复美团库存时只写进 note，绝不能再生成库存修改动作。若原订单商品和数量全部保留、仅私下加购一个新商品并明确额外付款，则 amount=原商家预计收入+额外付款，items=原商品+新增商品，不要追问金额分摊；多个新增/替换商品且无法确定售价分摊时才追问，不能猜。
 干预单不计算购买商品进货成本；自然单和线下单计算货物成本。赠品成本按登记时成本快照计入。
 生产日期加保质期可推算到期日；缺少保质期不得猜。今天、昨天、前天以 Asia/Shanghai 和消息创建时间为准。
