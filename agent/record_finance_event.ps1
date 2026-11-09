@@ -414,13 +414,33 @@ function Resolve-UniqueSkuReference($Rows, [string]$RequestedCode) {
     return $matches[0]
 }
 
+function Merge-OrderActualOriginalLines($Matches, [string]$RequestedCode) {
+    $lines = @($Matches)
+    if ($lines.Count -eq 0) { return $null }
+    if ($lines.Count -eq 1) { return $lines[0] }
+    $first = $lines[0]
+    if (-not $first.product_id) { throw "原订单同一货号对应多个商品行：$RequestedCode，缺少稳定商品ID，不能合并" }
+    $quantity = 0.0
+    foreach ($line in $lines) {
+        if (-not $line.product_id -or $line.product_id -ine $first.product_id -or
+            [string]$line.spec -cne [string]$first.spec -or $null -eq $line.unit_price -or
+            $null -eq $first.unit_price -or [double]$line.unit_price -ne [double]$first.unit_price -or
+            $null -eq $line.quantity -or [double]$line.quantity -le 0) {
+            throw "原订单存在不同商品身份、规格或售价的多行：$RequestedCode，请明确具体商品后再调整"
+        }
+        $quantity += [double]$line.quantity
+    }
+    return [pscustomobject]@{code=$first.code;title=$first.title;spec=$first.spec;
+        product_id=$first.product_id;quantity=$quantity;unit_price=$first.unit_price}
+}
+
 function Resolve-OrderActualSkuReference($Rows, [string]$RequestedCode, $OriginalItems) {
     $originalMatches = @($OriginalItems | Where-Object { $_.code -ieq $RequestedCode })
-    if ($originalMatches.Count -gt 1) { throw "原订单同一货号对应多个商品行：$RequestedCode，请明确具体商品ID后再调整" }
-    if ($originalMatches.Count -eq 1 -and $originalMatches[0].product_id) {
+    $originalItem = Merge-OrderActualOriginalLines $originalMatches $RequestedCode
+    if ($null -ne $originalItem -and $originalItem.product_id) {
         # A historical line's identity outranks a KW that may now be reused.
-        $target = Resolve-UniqueSkuReference $Rows ('sku_id:' + $originalMatches[0].product_id)
-        return [pscustomobject]@{target=$target;original_item=$originalMatches[0]}
+        $target = Resolve-UniqueSkuReference $Rows ('sku_id:' + $originalItem.product_id)
+        return [pscustomobject]@{target=$target;original_item=$originalItem}
     }
     $target = Resolve-UniqueSkuReference $Rows $RequestedCode
     $productId = ([string](Get-CellValue $target.cells $skuSchema.ProductId.Index)).Trim()
@@ -429,8 +449,7 @@ function Resolve-OrderActualSkuReference($Rows, [string]$RequestedCode, $Origina
         if ($_.product_id -and $productId) { $_.product_id -ieq $productId }
         else { $_.code -ieq $RequestedCode -or $_.code -ieq $canonicalKw }
     })
-    if ($matches.Count -gt 1) { throw "原订单存在多个匹配规格：$RequestedCode，请先核对商品明细" }
-    return [pscustomobject]@{target=$target;original_item=$(if($matches.Count){$matches[0]}else{$null})}
+    return [pscustomobject]@{target=$target;original_item=(Merge-OrderActualOriginalLines $matches $RequestedCode)}
 }
 
 function New-OrderGiftPlan([string]$Items, $SkuRows, $ResolvedOrder, [bool]$PendingOrder, [string]$GiftNote, [string]$GiftEventId) {
@@ -1333,11 +1352,15 @@ switch ($Action) {
         $newRequestedItems = @($resolvedRequestedItems | Where-Object { $null -eq $_.original_item })
         $allOriginalItemsPreserved = $true
         foreach ($originalRecord in $originalItemRecords) {
+            $originalQuantity = [double](($originalItemRecords | Where-Object {
+                if ($originalRecord.product_id -and $_.product_id) { $_.product_id -ieq $originalRecord.product_id }
+                else { $_.code -ieq $originalRecord.code }
+            } | Measure-Object -Property quantity -Sum).Sum)
             $preservedQuantity = [double](($resolvedRequestedItems | Where-Object {
                 if ($originalRecord.product_id -and $_.product_id) { $_.product_id -ieq $originalRecord.product_id }
                 else { $_.requested_code -ieq $originalRecord.code -or $_.canonical_kw -ieq $originalRecord.code }
             } | Measure-Object -Property quantity -Sum).Sum)
-            if ([math]::Abs($preservedQuantity - [double]$originalRecord.quantity) -gt 0.000001) {
+            if ([math]::Abs($preservedQuantity - $originalQuantity) -gt 0.000001) {
                 $allOriginalItemsPreserved = $false
                 break
             }
