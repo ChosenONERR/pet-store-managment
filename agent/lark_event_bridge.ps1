@@ -553,6 +553,11 @@ function Convert-PetstarPlatform([string]$Value) {
     }
 }
 
+function Test-PreviewNeedsClarification([string]$Reason) {
+    if ($Reason -match '(?i)429|Too Many Requests|timeout|timed out|network|connection|temporar|读取飞书|写入飞书|读取不完整|凭据|授权|退出码.?3|事务仍在执行|队列正忙') { return $false }
+    return $Reason -match '必须提供|必须明确|没有识别到|请明确|请补充|请分别说明|格式无效|不支持动作|安全定位已失效|标识不唯一|未知成本价|找不到货号|不同商品身份、规格或售价'
+}
+
 function Invoke-PetstarEvent([string[]]$Arguments) {
     $argumentMap = Convert-PetstarArgumentsToMap $Arguments
     $action = [string]$argumentMap.action
@@ -564,6 +569,7 @@ function Invoke-PetstarEvent([string[]]$Arguments) {
             $previewResult = Convert-CommandOutputToJson $previewOutputLines
             if ($previewExitCode -ne 0 -or $null -eq $previewResult -or -not $previewResult.ok) {
                 $previewError = Get-CommandFailureDetail $previewResult $previewOutputLines
+                $script:lastProcessNeedsClarification = Test-PreviewNeedsClarification $previewError
                 throw "经营事件预览失败：$previewError"
             }
         } else {
@@ -702,6 +708,10 @@ function Invoke-PetstarSyncAction([string]$Action, $Arguments, $Event) {
 function Invoke-CodexAction($CodexAction, $Event, [int]$Index, [string]$Mode) {
     $actionName = [string]$CodexAction.action
     $arguments = $CodexAction.arguments
+    if ($actionName -eq 'SetOrderActuals' -and [string]::IsNullOrWhiteSpace([string](Get-CodexActionValue $arguments 'items'))) {
+        $script:lastProcessNeedsClarification = $true
+        throw '修改订单实收仍需明确实际交付商品和数量；仅说“没有收入”不能推断商品成本为0，请补充商品是否退回、是否仍交付。没有修改账目'
+    }
     $allowed = @(
         'AddIntervention','RemoveIntervention','RestoreInventory','ConfirmSelfDelivery','SetExternalDeliveryFee','SetOrderDeliveryFee','SetOrderActuals',
         'OfflineSale','AddOrderGift','Replenishment','CashExpense','OperatingExpense','OwnerWithdrawal',
@@ -1866,6 +1876,7 @@ function Process-Event([string]$Line, [string]$AuthorizedOpenId, [switch]$Bypass
     $script:lastProcessFailure = $null
     $script:lastProcessRetryable = $false
     $script:lastProcessRetryAfterSeconds = 0
+    $script:lastProcessNeedsClarification = $false
     if (-not $Line.Trim().StartsWith('{')) { return $false }
     try { $event = $Line | ConvertFrom-Json } catch { return $false }
     if ($event.sender_type -ne 'user' -or $event.sender_id -ne $AuthorizedOpenId) { return $false }
@@ -2134,6 +2145,7 @@ function Process-Event([string]$Line, [string]$AuthorizedOpenId, [switch]$Bypass
 
 function Process-EventWithLedger([string]$Line, [string]$AuthorizedOpenId, [string]$Source) {
     $eventStartedAt = [datetime]::UtcNow
+    $script:lastProcessNeedsClarification = $false
     if (-not $Line.Trim().StartsWith('{')) { return 'ignored' }
     try { $event = $Line | ConvertFrom-Json } catch { return 'ignored' }
     $messageId = [string]$event.message_id
@@ -2157,8 +2169,9 @@ function Process-EventWithLedger([string]$Line, [string]$AuthorizedOpenId, [stri
         if (-not $handled) {
             if ($script:lastProcessFailure) {
                 # Codex/网络临时失败不能永久吞掉原消息；回执使用固定幂等键，后台重放不会刷屏。
-                Add-HandledMessageRecord $messageId 'failed_retryable' $Source ([string]$event.create_time)
-                return 'failed_retryable'
+                $failureStatus = if ($script:lastProcessRetryable) { 'failed_retryable' } else { 'failed_replied' }
+                Add-HandledMessageRecord $messageId $failureStatus $Source ([string]$event.create_time)
+                return $failureStatus
             }
             return 'ignored'
         }
@@ -2168,6 +2181,12 @@ function Process-EventWithLedger([string]$Line, [string]$AuthorizedOpenId, [stri
         $errorText = [string]$_.Exception.Message
         Write-BridgeLog "message processing failed message_hash=$($hash.Substring(0,12)) error=$errorText"
         try {
+            if ($script:lastProcessNeedsClarification) {
+                $reply = "需要补充信息：$errorText`n本条旧消息已停止自动重试，请补充后发送新消息。系统没有根据这句话修改收入或商品成本。"
+                $null = Send-Acknowledgement $AuthorizedOpenId $reply $messageId 'clarify'
+                Add-HandledMessageRecord $messageId 'needs_clarification' $Source ([string]$event.create_time)
+                return 'needs_clarification'
+            }
             if ($script:lastProcessFailure -and $script:lastProcessRetryable) {
                 $retryAfterMinutes = [math]::Max(1,[math]::Ceiling([int]$script:lastProcessRetryAfterSeconds / 60.0))
                 $deferredReply = "Codex 当前请求较多，这条消息已安全保留。系统会在约 $retryAfterMinutes 分钟后自动重试，你不需要重发；重试成功后会正常生成待确认项，本次没有修改任何经营数据。"
