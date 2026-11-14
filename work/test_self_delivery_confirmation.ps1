@@ -11,7 +11,7 @@ function Import-TestFunction([string]$Path,[string]$Name) {
     Set-Item -Path "function:script:$Name" -Value ([scriptblock]::Create($body))
 }
 foreach($n in @('Get-CellValue','Convert-ToNumber','Convert-ToDateValue','Assert-NonNegative')){Import-TestFunction $finance $n}
-foreach($n in @('Convert-PetstarArgumentsToMap','Convert-CommandOutputToJson','Get-CommandFailureDetail','Invoke-PetstarEvent','Format-ConfirmationPreview','Format-CodexExecutionReply')){Import-TestFunction $bridge $n}
+foreach($n in @('Convert-PetstarArgumentsToMap','Convert-CommandOutputToJson','Get-CommandFailureDetail','Test-PreviewNeedsClarification','Invoke-PetstarEvent','Format-ConfirmationPreview','Format-CodexExecutionReply')){Import-TestFunction $bridge $n}
 $ast=[Management.Automation.Language.Parser]::ParseFile($finance,[ref]$null,[ref]$null)
 $dispatch=$ast.FindAll({param($n)$n -is [Management.Automation.Language.SwitchStatementAst] -and $n.Condition.Extent.Text -eq '$Action'},$true)|Select-Object -Last 1
 $case=@($dispatch.Clauses|Where-Object {$_.Item1.Extent.Text -match "'ConfirmSelfDelivery','SetOrderDeliveryFee'"})

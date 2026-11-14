@@ -130,11 +130,13 @@ try {
         $changes.Add([pscustomobject]@{order_no=$o.order_no;date=$o.date;amount=$o.current_fee;provider='manual'})
     }
     foreach($d in @($result.decisions)){
-        if($d.state -ne 'confirmed' -or -not $d.changed){continue}
+        if($d.state -notin @('confirmed','default_self') -or -not $d.changed){continue}
         $o=$byId[[string]$d.order_no]
         if($null -eq $o -or $o.intervention -or $o.protected -or $o.confirmed_self){throw '配送费写入保护触发'}
-        $marker='自动配送费[{0}:{1}]={2}元' -f $d.provider,$d.delivery_id,([double]$d.amount).ToString('0.00',[Globalization.CultureInfo]::InvariantCulture)
-        $note=([regex]::Replace($o.note,'(?:^|[；;])自动配送费\[(?:maiyatian|cyanclouds):\d+\]=\d+(?:\.\d+)?元','')).Trim('；',';',' ')
+        $isDefaultSelf = $d.state -eq 'default_self'
+        $provider = if($isDefaultSelf){'default_self'}else{[string]$d.provider}
+        $marker=if($isDefaultSelf){'默认自配送：未查到骑手配送费（0元，后续继续自动查询）'}else{'自动配送费[{0}:{1}]={2}元' -f $d.provider,$d.delivery_id,([double]$d.amount).ToString('0.00',[Globalization.CultureInfo]::InvariantCulture)}
+        $note=([regex]::Replace($o.note,'(?:^|[；;])(?:自动配送费\[(?:maiyatian|cyanclouds):\d+\]=\d+(?:\.\d+)?元|默认自配送：未查到骑手配送费（0元，后续继续自动查询）)','')).Trim('；',';',' ')
         $note=(@($note,$marker)|Where-Object {$_}) -join '；'
         if($Apply){
             $writesStarted=$true
@@ -143,7 +145,7 @@ try {
             $back=Get-DeliveryRows $token '订单汇总' "A$($o.row):Q$($o.row)"
             if($back.Count -ne 1 -or (Get-DeliveryCell $back[0] 2) -ne $d.order_no -or [math]::Abs([double](Get-DeliveryCell $back[0] 9)-[double]$d.amount) -gt 0.0049 -or (Get-DeliveryCell $back[0] 15) -ne $note){throw '配送费金额或来源回读失败'}
         }
-        $changes.Add([pscustomobject]@{order_no=$d.order_no;date=$o.date;amount=$d.amount;provider=$d.provider})
+        $changes.Add([pscustomobject]@{order_no=$d.order_no;date=$o.date;amount=$d.amount;provider=$provider})
     }
     if($Apply -and $changes.Count -gt 0){
         $verify=Invoke-DeliveryLark { & $lark sheets +formula-verify --as user --spreadsheet-token $token --sheet-name '订单汇总' --range 'K2:L2001' --exit-on-error --format json }

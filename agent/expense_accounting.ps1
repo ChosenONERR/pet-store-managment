@@ -15,11 +15,16 @@
         $amount = 0.0
         $known = -not [string]::IsNullOrWhiteSpace([string]$entry.fee) -and
             [double]::TryParse(([string]$entry.fee).Replace(',',''),[Globalization.NumberStyles]::Any,[Globalization.CultureInfo]::InvariantCulture,[ref]$amount)
+        # Old ledger rows may still say "待补录". Only missing/zero rider fees
+        # default to self delivery; platform fees and product costs never do.
+        $defaultSelf = $project -eq '补单配送费' -and
+            ([string]::IsNullOrWhiteSpace([string]$entry.fee) -or ($known -and $amount -eq 0))
+        if ($defaultSelf) { $amount = 0.0; $known = $true }
         if (-not $known -or [double]::IsNaN($amount) -or [double]::IsInfinity($amount)) {
             $pending.Add("$project $orderNo 金额待核对")
             continue
         }
-        if ([string]$entry.source -match '待补录|待识别|待核对') { $pending.Add("$project $orderNo 来源待核对") }
+        if (-not $defaultSelf -and [string]$entry.source -match '待补录|待识别|待核对') { $pending.Add("$project $orderNo 来源待核对") }
         $category = if ($project -match '采购|补货付款|进货|老板取款|老板人工|市场租金|折旧|摊销|首次配送费|已冲减收入的退款') {
             $pending.Add("非经营或已扣费用须分离：$project")
             'excluded'

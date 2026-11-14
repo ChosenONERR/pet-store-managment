@@ -27,7 +27,7 @@ export function decideDeliveryFee(order, observations, providers) {
   let awaitingDispatch = false;
   for (const provider of ['maiyatian', 'cyanclouds']) {
     const found = rows.filter(r => r.provider === provider);
-    if (!providers[provider]?.ok) return {state:'pending', reason:`${provider}查询失败，保留原费用`};
+    if (!providers[provider]?.ok) return {state:'deferred', retry:true, reason:`${provider}查询失败，保留原费用并后台重试`};
     if (found.length > 1 || found.some(r => r.state === 'ambiguous')) return {state:'conflict',reason:'配送记录不唯一或有多次派送/附加费用，需核对'};
     const row = found[0];
     if (row?.state === 'complete' && Number.isFinite(row.amount) && row.amount > 0) positive.push(row);
@@ -39,7 +39,13 @@ export function decideDeliveryFee(order, observations, providers) {
     if (source && Math.abs(Number(order.current_fee) - source.amount) > 0.0049) return {state:'conflict',reason:'平台实付与人工确认费用不一致，保留人工值'};
     return {state:'protected',reason:'保留人工确认费用',source};
   }
-  if (!source) return {state:'pending',reason:awaitingDispatch?'配送尚未完成或实付不明确，下一小时继续查':'两边未查到正数实付，请确认是否自配送；下一小时继续查'};
+  if (!source) {
+    // No positive evidence must never erase a previously known charge. Default
+    // self delivery is provisional, not a manual lock: today/yesterday are reread.
+    if (Number(order.current_fee) > 0) return {state:'retained',retry:awaitingDispatch,reason:'未查到新的正数实付，保留已有配送费'};
+    return {state:'default_self',amount:0,changed:order.current_fee == null,retry:awaitingDispatch,
+      reason:'未查到正数实付，按店主规则默认自配送0元；后续继续自动查询'};
+  }
   return {state:'confirmed', amount:source.amount, provider:source.provider, delivery_id:source.delivery_id,
     changed:order.current_fee == null || Math.abs(Number(order.current_fee)-source.amount)>0.0049};
 }

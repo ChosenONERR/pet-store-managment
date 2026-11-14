@@ -14,7 +14,17 @@ if($s.total -ne 45 -or $s.promotion -ne 20 -or $s.intervention -ne 8 -or $s.afte
 # Gross 100 contains no promotion; deduct the expense source once, not twice.
 if((100-$s.total) -ne 55){throw '重复扣费'}
 $s=Get-PetstarExpenseSummary @((Entry '补单平台扣款' $null '123456789012'),(Entry '补单配送费' 0 '123456789012' '待补录'))
-if($s.pending.Count -ne 2 -or $s.status -notmatch '利润暂估'){throw '未知费用未提示'}
+if($s.pending.Count -ne 1 -or $s.pending[0] -notmatch '平台扣款.*金额待核对' -or $s.status -notmatch '利润暂估'){throw '平台费用仍须核对，零配送费不应提示'}
+foreach($amount in @($null,0)) {
+    $s=Get-PetstarExpenseSummary @((Entry '补单配送费' $amount '123456789012' '待补录'))
+    if($s.total -ne 0 -or $s.pending.Count -ne 0 -or $s.status -ne '已核对'){throw '旧配送费待补录没有按默认自配送兼容'}
+}
+$s=Get-PetstarExpenseSummary @((Entry '补单配送费' 5 '123456789012' '人工补录'))
+if($s.total -ne 5 -or $s.intervention -ne 5){throw '已有配送费不得清零'}
+$s=Get-PetstarExpenseSummary @((Entry '营销赠品支出' $null '123456789012'))
+if($s.pending.Count -ne 1){throw '缺失赠品成本不得默认零元'}
+$s=Get-PetstarExpenseSummary @((Entry '补单配送费' 'invalid' '123456789012'))
+if($s.pending.Count -ne 1){throw '非法金额不是未查到费用，不得默认零元'}
 $s=Get-PetstarExpenseSummary @((Entry '补货付款' 200),(Entry '老板取款' 100),(Entry '首次配送费' 6),(Entry '维修' 2))
 if($s.total -ne 2 -or $s.excluded -ne 306 -or $s.pending.Count -ne 3){throw '非经营支出未隔离'}
 $duplicateBlocked=$false
@@ -57,4 +67,4 @@ $s=Update-PetstarMonthExpenses -Month ([datetime]'2026-11-01') -SourceToken test
 if($s.total-ne5 -or $s.after_sales-ne5 -or $script:expenseTestWrites.Count-ne3){throw '费用录入与汇总集成错误'}
 $headerPayload=$script:expenseTestWrites[0].json
 if(-not $headerPayload.StartsWith('[[') -or -not $headerPayload.EndsWith(']]')){throw "汇总列头不是二维矩阵：$headerPayload"}
-[pscustomobject]@{ok=$true;cases=7;external_writes=0}|ConvertTo-Json
+[pscustomobject]@{ok=$true;cases=12;external_writes=0}|ConvertTo-Json

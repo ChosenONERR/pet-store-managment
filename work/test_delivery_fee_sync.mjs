@@ -20,9 +20,9 @@ check(()=>assert.equal(selectDeliveryOrders([{...base,date:'2026-11-02',confirme
 check(()=>assert.equal(selectDeliveryOrders([{...base,date:'2026-10-31'}],'2026-11-01').length,1));
 for(const override of [{intervention:true},{status:'已取消'},{platform:'京东'}])check(()=>assert.equal(selectDeliveryOrders([{...base,...override}],'2026-11-03').length,0));
 check(()=>assert.throws(()=>selectDeliveryOrders([base,base],'2026-11-03')));
-check(()=>assert.equal(decideDeliveryFee(base,[],providers).state,'pending'));
-check(()=>assert.equal(decideDeliveryFee(base,[{...paid(),amount:0}],providers).state,'pending'));
-check(()=>assert.equal(decideDeliveryFee(base,[{...paid(),state:'pending'}],providers).state,'pending'));
+check(()=>assert.equal(decideDeliveryFee(base,[],providers).state,'default_self'));
+check(()=>assert.equal(decideDeliveryFee(base,[{...paid(),amount:0}],providers).state,'default_self'));
+check(()=>assert.equal(decideDeliveryFee(base,[{...paid(),state:'pending'}],providers).state,'default_self'));
 check(()=>assert.equal(decideDeliveryFee(base,[{...paid(),state:'ambiguous'}],providers).state,'conflict'));
 check(()=>assert.equal(decideDeliveryFee(base,[paid()],providers).amount,6.78));
 check(()=>assert.equal(decideDeliveryFee(base,[paid('cyanclouds',4.51)],providers).amount,4.51));
@@ -33,14 +33,20 @@ check(()=>assert.equal(decideDeliveryFee(base,[paid(),paid()],providers).state,'
 check(()=>assert.equal(decideDeliveryFee({...base,protected:true,current_fee:4.51},[paid('cyanclouds',4.51)],providers).state,'protected'));
 check(()=>assert.equal(decideDeliveryFee({...base,protected:true,current_fee:4.51},[paid()],providers).state,'conflict'));
 check(()=>assert.equal(decideDeliveryFee({...base,current_fee:6.78},[paid()],providers).changed,false));
-check(()=>assert.equal(decideDeliveryFee(base,[paid('cyanclouds',4.51)],{...providers,maiyatian:{ok:false}}).state,'pending'));
+check(()=>assert.equal(decideDeliveryFee(base,[paid('cyanclouds',4.51)],{...providers,maiyatian:{ok:false}}).state,'deferred'));
 // A zero at 10:00 is never a terminal status; 14:00 can still discover payment.
-check(()=>{assert.equal(decideDeliveryFee(base,[],providers).state,'pending');assert.equal(decideDeliveryFee(base,[paid()],providers).changed,true);});
+check(()=>{assert.equal(decideDeliveryFee(base,[],providers).state,'default_self');assert.equal(decideDeliveryFee(base,[paid()],providers).changed,true);});
+check(()=>{const d=decideDeliveryFee({...base,current_fee:null},[],providers);assert.equal(d.amount,0);assert.equal(d.changed,true);assert.equal(d.retry,false);});
+check(()=>{const d=decideDeliveryFee(base,[],providers);assert.equal(d.changed,false);assert.equal(d.retry,false);});
+check(()=>{const d=decideDeliveryFee({...base,current_fee:6.78},[],providers);assert.equal(d.state,'retained');assert.equal(d.amount,undefined);});
+check(()=>{const d=decideDeliveryFee({...base,current_fee:6.78},[{...paid(),amount:0}],providers);assert.equal(d.state,'retained');assert.equal(d.changed,undefined);});
+check(()=>assert.equal(decideDeliveryFee(base,[{...paid(),state:'pending',amount:null}],providers).retry,true));
+check(()=>{const d=decideDeliveryFee({...base,current_fee:6.78},[],{...providers,maiyatian:{ok:false}});assert.equal(d.state,'deferred');assert.equal(d.retry,true);assert.equal(d.amount,undefined);});
 
 // Test the real extractor orchestration with an injected read-only reader.
 const calls=[];
 const first=await extractDeliveryFees({date:'2026-11-03',orders:[base],pending:[]},async(p,dates,orders)=>{calls.push({p,dates,ids:orders.map(o=>o.order_no)});return [];});
-assert.equal(first.pending.length,1);assert.equal(calls.length,2);cases++;
+assert.equal(first.pending.length,0);assert.equal(first.decisions[0].state,'default_self');assert.equal(calls.length,2);cases++;
 const second=await extractDeliveryFees({date:'2026-11-03',orders:[base],pending:first.pending},async(p)=>p==='cyanclouds'?[paid('cyanclouds',4.51)]:[]);
 assert.equal(second.decisions[0].amount,4.51);assert.equal(second.pending.length,0);cases++;
 const crossDay=await extractDeliveryFees({date:'2026-11-04',orders:[base],pending:first.pending},async(p,dates)=>{assert.deepEqual(dates,['2026-11-03']);return p==='maiyatian'?[paid()]:[];});
@@ -52,7 +58,15 @@ assert.equal(crossDaySelf.queried_count,0);assert.equal(crossDaySelf.pending.len
 const self=await extractDeliveryFees({date:'2026-11-03',orders:[{...base,confirmed_self:true}],pending:[]},async()=>{throw Error('Self delivery must not query');});
 assert.equal(self.queried_count,0);assert.equal(self.pending.length,0);cases++;
 const outage=await extractDeliveryFees({date:'2026-11-03',orders:[base],pending:[]},async()=>{throw Error('offline');});
-assert.equal(outage.pending.length,1);assert.equal(outage.decisions[0].state,'pending');cases++;
+assert.equal(outage.pending.length,1);assert.equal(outage.decisions[0].state,'deferred');cases++;
+const booked=await extractDeliveryFees({date:'2026-11-03',orders:[base],pending:[]},async(p)=>p==='maiyatian'?[{...paid(),state:'pending',amount:null}]:[]);
+assert.equal(booked.pending.length,1);assert.equal(booked.decisions[0].state,'default_self');cases++;
+const bookedLater=await extractDeliveryFees({date:'2026-11-05',orders:[base],pending:booked.pending},async(p)=>p==='maiyatian'?[paid()]:[]);
+assert.equal(bookedLater.decisions[0].amount,6.78);assert.equal(bookedLater.pending.length,0);cases++;
+const oldMissing=await extractDeliveryFees({date:'2026-11-05',orders:[base],pending:[{order_no:id,date:base.date}]},async()=>[]);
+assert.equal(oldMissing.decisions[0].state,'default_self');assert.equal(oldMissing.pending.length,0);cases++;
+const defaultNotLocked=await extractDeliveryFees({date:'2026-11-03',orders:[{...base,note:'默认自配送：未查到骑手配送费（0元，后续继续自动查询）'}],pending:[]},async(p)=>p==='maiyatian'?[paid()]:[]);
+assert.equal(defaultNotLocked.queried_count,1);assert.equal(defaultNotLocked.decisions[0].amount,6.78);cases++;
 
 const originalPerformance=Object.getOwnPropertyDescriptor(globalThis,'performance');
 const originalXhr=globalThis.XMLHttpRequest;

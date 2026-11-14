@@ -144,7 +144,7 @@ export async function extractDeliveryFees(input, reader = readProvider) {
   }
   const decisions=candidates.map(r=>({order_no:r.order_no,date:businessDate(r.date),...(r.confirmed_self?{state:'protected',reason:'已人工确认自配送'}:decideDeliveryFee(r,observations,providers))}));
   return {ok:true,candidate_count:candidates.length,queried_count:queried.length,providers,decisions,
-    pending:decisions.filter(r=>['pending','conflict'].includes(r.state)).map(r=>({order_no:r.order_no,date:r.date}))};
+    pending:decisions.filter(r=>r.retry || r.state==='conflict').map(r=>({order_no:r.order_no,date:r.date}))};
 }
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href){
   try{const input=JSON.parse(fs.readFileSync(0,'utf8').replace(/^\uFEFF/,''));process.stdout.write(JSON.stringify(await extractDeliveryFees(input)));}

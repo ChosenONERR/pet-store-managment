@@ -793,9 +793,7 @@ foreach ($order in @($extract.orders)) {
     $deliveryFee = if ($platformDeliveryFee -gt 0) { $platformDeliveryFee } else { $existingDeliveryFee }
     $record.PlatformFee = $platformFee
     $record.DeliveryFee = $deliveryFee
-    if ($deliveryFee -gt 0) { $record.DeliveryType = '骑手配送' }
-    elseif ($record.DeliveryType -in @('美团骑手','外部配送')) { $record.DeliveryType = '骑手配送' }
-    elseif ($record.DeliveryType -notin @('自配送','骑手配送')) { $record.DeliveryType = $null }
+    $record.DeliveryType = if ($deliveryFee -gt 0) { '骑手配送' } else { '自配送' }
     if (-not $record.RestoreState) { $record.RestoreState = if ($order.status -eq '已取消') { '已恢复' } else { '待恢复' } }
     if ($order.status -eq '已取消' -and $record.RestoreState -eq '待恢复') { $record.RestoreState = '已恢复' }
     $interventionUpdated++
@@ -858,7 +856,8 @@ foreach ($record in $interventionRecords.Values) {
         if ($null -eq $record.PlatformFee) { $missingFields.Add('平台费用') }
         if ([double]$summary.ItemCount -gt 0 -and -not $record.Contents) { $missingFields.Add('购买内容') }
     }
-    if (-not $record.DeliveryType) { $missingFields.Add('配送方式/配送费确认') }
+    # Legacy blank delivery fields use the same zero/self default in expense
+    # accounting. Do not rewrite every historical intervention just to label it.
     if ($missingFields.Count -gt 0) {
         $interventionIssues.Add([pscustomobject]@{order_no=$orderNo;missing_fields=@($missingFields)})
     }

@@ -625,7 +625,7 @@ function Get-DeliveryFeeFailureWarning([string]$Reason) {
     } else {
         '配送费查询或处理失败，具体原因已保留在本机分阶段日志；不能据此判断为登录失效'
     }
-    return "配送费待核对：$cause；原费用不动，下一小时自动重查。"
+    return "配送费同步异常：$cause；原费用不动，后台自动重查，不逐单催补费用。"
 }
 
 function Invoke-JsonPowerShellScript([string]$Path, [hashtable]$Arguments) {
@@ -970,21 +970,9 @@ function Build-Snapshot {
     $naturalCount = $platformNaturalCount + $offlineCount
 
     $pendingDelivery = [Collections.Generic.List[object]]::new()
-    foreach ($row in (Get-SheetRows '干预订单' 'A2:M1001')) {
-        if (-not (Test-RowDate (Get-CellValue $row 0) $Date)) { continue }
-        $orderNo = Get-CellValue $row 3
-        if (-not (Test-ActiveInterventionOrderNo $orderNo)) { continue }
-        $deliveryType = Get-CellValue $row 5
-        $deliveryFee = Convert-ToNumber (Get-CellValue $row 7)
-        $needsConfirmation = (-not $deliveryType) -or ($deliveryType -eq '骑手配送' -and ($null -eq $deliveryFee -or $deliveryFee -eq 0))
-        if ($needsConfirmation) {
-            $pendingDelivery.Add([pscustomobject]@{
-                daily_order_no = Get-CellValue $row 1
-                order_no = $orderNo
-                delivery_type = $deliveryType
-            })
-        }
-    }
+    # Owner policy: absent/zero delivery charges are self delivery by default,
+    # not business items awaiting confirmation. Real monetary conflicts are
+    # still reported by the delivery sync; platform fees/costs remain separate.
 
     $pendingCost = [Collections.Generic.List[object]]::new()
     $incomeSheet = "$($Date.Month)月收入"
@@ -1546,8 +1534,8 @@ try {
                 $operationalDegraded = $true
             }
             foreach ($decision in @($deliveryFeeResult.decisions)) {
-                if ($decision.state -in @('pending','conflict')) {
-                    $syncWarnings.Add("配送费待核对：订单 $($decision.order_no)｜$($decision.reason)。尚未确认免费，原费用保持不动，当前利润可能偏高。")
+                if ($decision.state -eq 'conflict') {
+                    $syncWarnings.Add("配送费待核对：订单 $($decision.order_no)｜$($decision.reason)。已有费用保持不动，请核对金额冲突。")
                 }
             }
             if (@($deliveryFeeResult.changed_order_nos).Count -gt 0 -and -not $DryRun) {

@@ -1594,11 +1594,15 @@ switch ($Action) {
         }
         $effectiveDate = $Date.Date
         $matchedDailyOrderNo = $null
+        $matchedDeliveryFee = 0.0
         if ($exactOrder.Count -eq 1) {
             $matchedDate = Convert-ToDateValue (Get-CellValue $exactOrder[0] 0)
             if ($null -ne $matchedDate) { $effectiveDate = $matchedDate.Date }
             $matchedDailyOrderNo = Get-CellValue $exactOrder[0] 16
+            $existingDeliveryFee = Convert-ToNumber (Get-CellValue $exactOrder[0] 9)
+            if ($null -ne $existingDeliveryFee -and $existingDeliveryFee -gt 0) { $matchedDeliveryFee = $existingDeliveryFee }
         }
+        $matchedDeliveryType = if ($matchedDeliveryFee -gt 0) { '骑手配送' } else { '自配送' }
         $rowNumber = Get-FirstEmptyRow $rows 3 2 1001
         if ($DryRun) {
             [ordered]@{ok=$true;dry_run=$true;duplicate=$false;action=$Action;result=[ordered]@{row=$rowNumber;order_no=$OrderNo;date=$effectiveDate.ToString('yyyy-MM-dd');daily_order_no=$matchedDailyOrderNo;person=$Person;state='待恢复'};message='预演成功，未写入飞书'} | ConvertTo-Json -Depth 8
@@ -1607,7 +1611,7 @@ switch ($Action) {
         }
         $newRow = @(); $newRow += ,@(
             (New-ValueCell (Convert-ToExcelSerial $effectiveDate)),(New-ValueCell $matchedDailyOrderNo),(New-ValueCell $Person),(New-ValueCell $OrderNo),
-            (New-ValueCell $null),(New-ValueCell $null),(New-ValueCell $null),(New-ValueCell $null),
+            (New-ValueCell $null),(New-ValueCell $matchedDeliveryType),(New-ValueCell $null),(New-ValueCell $matchedDeliveryFee),
             @{formula="=IF(D$rowNumber=`"`",`"`",IFERROR(G$rowNumber*1,0)+IFERROR(H$rowNumber*1,0))"},
             (New-ValueCell '待恢复'),(New-ValueCell $null),(New-ValueCell $null),(New-ValueCell $Note)
         )

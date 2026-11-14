@@ -707,8 +707,8 @@ foreach ($monthSheet in $monthSheets) {
                 $breakdown += '自配送，确认配送费为0'
             } else {
                 $deliveryTotal = 0.0
-                $deliverySource = '待补录'
-                $breakdown += '暂未识别配送费；未知不等于确认0元'
+                $deliverySource = '默认自配送'
+                $breakdown += '按店主规则无骑手费用默认0元，不需补录'
             }
         }
         $expenseEntries += [pscustomobject]@{date=$date;project='补单配送费';fee=$deliveryTotal;order_no=$orderNo;source=$deliverySource;note=($breakdown -join '；');sort_order=2}
