@@ -579,24 +579,30 @@ function Assert-TargetDateInterventionCoverage {
 }
 
 function Get-DailyNetProfit {
+    param([datetime]$ForDate = $Date)
     . (Join-Path $PSScriptRoot 'expense_accounting.ps1')
-    $incomeSheet = "$($Date.Month)月收入"
-    $expenseSheet = "$($Date.Month)月支出"
+    $incomeSheet = "$($ForDate.Month)月收入"
+    $expenseSheet = "$($ForDate.Month)月支出"
     $incomeRows = Get-LedgerRows $incomeSheet 'A2:K1001'
     $expenseRows = Get-LedgerRows $expenseSheet 'A2:F1001'
     $orderProfit = 0.0
+    $orderCount = 0; $pendingCostCount = 0
     foreach ($row in $incomeRows) {
-        if (-not (Test-RowDate (Get-CellValue $row 2) $Date)) { continue }
+        if (-not (Test-RowDate (Get-CellValue $row 2) $ForDate)) { continue }
+        $orderCount++
         $value = Convert-ToNumber (Get-CellValue $row 6)
         if ($null -ne $value) { $orderProfit += $value }
+        else { $pendingCostCount++ }
     }
     $expenseSummary = Get-PetstarExpenseSummary @(foreach($row in $expenseRows) {
-        if (-not (Test-RowDate (Get-CellValue $row 0) $Date)) { continue }
+        if (-not (Test-RowDate (Get-CellValue $row 0) $ForDate)) { continue }
         [pscustomobject]@{project=(Get-CellValue $row 1);fee=(Get-CellValue $row 2);order_no=(Get-CellValue $row 3);source=(Get-CellValue $row 4)}
     })
     $expenseTotal = $expenseSummary.total
     $promotionExpense = $expenseSummary.promotion
     return [pscustomobject]@{
+        order_count = $orderCount
+        pending_cost_count = $pendingCostCount
         order_profit = [math]::Round($orderProfit, 2)
         expense_total = [math]::Round($expenseTotal, 2)
         promotion_expense = [math]::Round($promotionExpense, 2)
@@ -604,6 +610,13 @@ function Get-DailyNetProfit {
         expense_status = $expenseSummary.status
         pending_expenses = $expenseSummary.pending
     }
+}
+
+function Format-CrossDayCorrection([string]$Day,$Profit) {
+    $pending = [int]$Profit.pending_cost_count -gt 0 -or @($Profit.pending_expenses).Count -gt 0
+    $label = if ($pending) { '暂估，仍有成本或费用待核对' } else { '按当前已核实账表' }
+    return ("📊 {0}经营日结更新（跨日补齐）`n真实/线下订单：{1}单`n订单利润合计 ¥{2:N2}－经营支出 ¥{3:N2}＝当天赚/亏 ¥{4:N2}`n{5}；已更新原日期账表，此结果替代此前该日金额。" -f
+        $Day,$Profit.order_count,[double]$Profit.order_profit,[double]$Profit.expense_total,[double]$Profit.net_profit,$label)
 }
 
 function Assert-FormulaRange([string]$SheetName, [string]$Range) {
@@ -1464,8 +1477,9 @@ try {
         # confirmed writes even though this run cannot mutate valid data.
         Start-SyncFinanceTransaction
         if (-not $SkipOrders) {
-            # 日结回看最近 7 天，补抓顾客对旧订单发起的退款；白天整点仍只读当天。
-            $orderStartDate = if ($Mode -eq 'night') { $Date.AddDays(-7).ToString('yyyy-MM-dd') } else { $dateText }
+            # Include yesterday in hourly reads so late orders can settle after
+            # midnight. Writes remain limited to changed orders/months.
+            $orderStartDate = if ($Mode -eq 'night') { $Date.AddDays(-7).ToString('yyyy-MM-dd') } else { $Date.AddDays(-1).ToString('yyyy-MM-dd') }
             $stage = Invoke-WithRetry 'order_sync' { Invoke-JsonPowerShellScript $orderScript @{ StartDate = $orderStartDate; EndDate = $dateText } } 3
             $orderResult = $stage.value
             # A successful authenticated order read resolves the persistent login incident.
@@ -1654,6 +1668,22 @@ try {
     $stage = Invoke-WithRetry 'daily_profit_readback' { Get-DailyNetProfit } 3
     foreach($pendingExpense in @($stage.value.pending_expenses)) { $syncWarnings.Add("费用待核对，利润暂估：$pendingExpense") }
     $dailyProfit = $stage.value
+    $priorDayReports = [Collections.Generic.List[object]]::new()
+    if (-not $DryRun -and -not $SkipSync) {
+        $pastDates = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        if ($null -ne $orderResult -and $null -ne $orderResult.PSObject.Properties['affected_dates']) {
+            foreach ($day in @($orderResult.affected_dates)) {
+                if ($day -and [string]$day -lt $dateText) { $null = $pastDates.Add([string]$day) }
+            }
+        }
+        foreach ($change in @($deliveryFeeResult.changed_orders)) {
+            if ($change -and $change.date -and [string]$change.date -lt $dateText) { $null = $pastDates.Add([string]$change.date) }
+        }
+        foreach ($day in @($pastDates | Sort-Object)) {
+            $stage = Invoke-WithRetry 'prior_day_profit_readback' { Get-DailyNetProfit ([datetime]$day) } 2
+            $priorDayReports.Add([pscustomobject]@{date=$day;profit=$stage.value})
+        }
+    }
 
     if ($null -ne $promotionCapture) {
         $capturedAmount = [math]::Round([double]$promotionCapture.amount, 2)
@@ -1711,6 +1741,13 @@ try {
         $alertStage = Invoke-WithRetry 'delivery_fee_alert' { Send-FeishuMessage $deliveryAlertText $null $deliveryAlertKey } 2
         $deliveryAlertResult = $alertStage.value
     }
+    $priorDayNotifications = @()
+    foreach ($report in $priorDayReports) {
+        $correctionText = Format-CrossDayCorrection $report.date $report.profit
+        $correctionKey = "petstar-day-correction-$(Get-TextFingerprint $correctionText)"
+        $correctionStage = Invoke-WithRetry 'prior_day_correction' { Send-FeishuMessage $correctionText $null $correctionKey } 2
+        $priorDayNotifications += [pscustomobject]@{date=$report.date;profit=$report.profit;notification=$correctionStage.value}
+    }
     $sendResult = if ($Silent) {
         [pscustomobject]@{ sent = $false; dry_run = [bool]$DryRun; format = 'silent' }
     } else {
@@ -1724,6 +1761,7 @@ try {
         sync_skipped = [bool]$SkipSync
         orders_skipped = [bool]$SkipOrders
         inventory_skipped = [bool]$SkipInventory
+        prior_day_corrections = @($priorDayNotifications)
         date = $dateText
         mode = $Mode
         fast_path = [ordered]@{

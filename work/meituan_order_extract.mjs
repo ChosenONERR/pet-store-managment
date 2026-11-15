@@ -8,6 +8,16 @@ const ORDER_URL = 'https://shangoue.meituan.com/#/page/orderbusiness#/order/hist
 // run succeeded, so allow one slow render before the outer retry opens a new tab.
 const PROXY_TIMEOUT_MS = Number(process.env.MEITUAN_PROXY_TIMEOUT_MS || 60000);
 
+export function normalizeOrderStatus(raw) {
+  const text = String(raw || '').replace(/\s+/g, '');
+  if (/^(?:已取消|订单已取消|订单取消|取消订单|用户已取消|顾客已取消|商家已取消)$/.test(text)
+    || /(?:订单已取消|订单被取消|用户取消订单|顾客取消订单|商家取消订单|系统取消订单)/.test(text)) return '已取消';
+  if (/用户已收货|交易完成|订单已完成|配送完成|已送达|^已完成$/.test(text)) return '已完成';
+  // Dispatch cancellation is not order cancellation. Never leak a shipping or
+  // refund "取消" string into downstream broad cancellation filters.
+  return '处理中';
+}
+
 export function classifyRefundGroup(group = []) {
   const statusTexts = [];
   const seen = new Set();
@@ -416,11 +426,7 @@ const extractPageExpression = `(() => {
     const match = String(text || '').replace(/,/g, '').match(/-?[￥¥]?\\s*(-?\\d+(?:\\.\\d+)?)/);
     return match ? Number(match[1]) : null;
   };
-  const normalizeStatus = (raw) => {
-    if (/取消/.test(raw)) return '已取消';
-    if (/收货|完成/.test(raw)) return '已完成';
-    return raw || '处理中';
-  };
+  ${normalizeOrderStatus.toString()}
   const normalizeProductName = (value) => String(value || '')
     .replace(/\s*[\(（][^\(（\)）]*[\)）]\s*$/, '')
     .replace(/[\s\p{P}\p{S}]+/gu, '')
@@ -536,7 +542,7 @@ const extractPageExpression = `(() => {
       dailyOrderNo,
       orderDate: md.length ? selectedYear + '-' + md[1] + '-' + md[2] : null,
       orderTime: md[3] || null,
-      status: normalizeStatus(rawStatus),
+      status: normalizeOrderStatus(rawStatus),
       rawStatus,
       productSales: pairValue('商品小计'),
       customerPay: money((text.match(/顾客实际支付[￥¥]\\s*\\d+(?:\\.\\d+)?/) || [])[0]),

@@ -661,6 +661,7 @@ for ($rowIndex = 0; $rowIndex -lt $existingItemRows.Count; $rowIndex++) {
     $snapshotKey = Get-OrderItemSnapshotKey $orderNo (Get-CellValue $row 16) (Get-CellValue $row 5) (Get-CellValue $row 6) (Get-CellValue $row 7)
     $fallbackSnapshotKey = Get-OrderItemFallbackKey $orderNo (Get-CellValue $row 5) (Get-CellValue $row 6) (Get-CellValue $row 7)
     $costSnapshot = [pscustomobject]@{
+        Status = Get-CellValue $row 3
         UnitCost = Get-CellNumber $row 11
         ItemCost = Get-CellNumber $row 12
         Margin = Get-CellNumber $row 13
@@ -704,6 +705,12 @@ foreach ($order in @($extract.orders)) {
         $snapshotKey = Get-OrderItemSnapshotKey ([string]$order.orderNo) $itemProductId $normalizedCode $itemName $itemSpec
         $fallbackSnapshotKey = Get-OrderItemFallbackKey ([string]$order.orderNo) $normalizedCode $itemName $itemSpec
         $priorSnapshot = Take-CostSnapshotFromQueue $existingCostSnapshots @($snapshotKey,$fallbackSnapshotKey)
+        if ($null -ne $priorSnapshot -and $priorSnapshot.Status -eq '已取消' -and
+            [string]$order.status -ne '已取消' -and $priorSnapshot.UnitCost -eq 0 -and $priorSnapshot.ItemCost -eq 0) {
+            # A cancellation placeholder is not an actual free sale. Reinitialize
+            # only this reactivated order; never unfreeze ordinary zero-cost sales.
+            $priorSnapshot = $null
+        }
         if ($null -eq $priorSnapshot) {
             $null = $newItemOrderNumbers.Add([string]$order.orderNo)
         }
@@ -879,10 +886,14 @@ $itemsChanged = (Get-RecordsFingerprint $existingItemBusinessRecords) -ne (Get-R
 $interventionsChanged = (Get-RecordsFingerprint $existingInterventionBusinessRecords) -ne (Get-RecordsFingerprint $desiredInterventionBusinessRecords)
 $dataChanged = [bool]$Initialize -or $summaryChanged -or $itemsChanged -or $interventionsChanged
 $affectedMonthKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+$affectedDates = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($orderNo in $changedOrderNumbers) {
     if (-not $summaryById.Contains($orderNo)) { continue }
     $date = [datetime]::MinValue
-    if ([datetime]::TryParse([string]$summaryById[$orderNo].OrderDate,[ref]$date)) { $null = $affectedMonthKeys.Add($date.ToString('yyyy-MM')) }
+    if ([datetime]::TryParse([string]$summaryById[$orderNo].OrderDate,[ref]$date)) {
+        $null = $affectedMonthKeys.Add($date.ToString('yyyy-MM'))
+        $null = $affectedDates.Add($date.ToString('yyyy-MM-dd'))
+    }
 }
 
 if ($dataChanged) {
@@ -974,6 +985,7 @@ $finalResult = [pscustomobject]@{
     change_details = [ordered]@{summary=[bool]$summaryChanged;items=[bool]$itemsChanged;interventions=[bool]$interventionsChanged;initialize_forced=[bool]$Initialize}
     changed_order_nos = @($changedOrderNumbers | Sort-Object)
     affected_months = @($affectedMonthKeys | Sort-Object)
+    affected_dates = @($affectedDates | Sort-Object)
     new_item_order_nos = @($newItemOrderNumbers | Sort-Object)
     refund_orders = @($extract.orders | Where-Object { @($_.refunds).Count -gt 0 } | ForEach-Object { [string]$_.orderNo })
     pending_refund_details = @($refundMerge.state.events | Where-Object { [string]$_.order_no -in $extractedOrderNos } | ForEach-Object {
