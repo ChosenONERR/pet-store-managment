@@ -736,7 +736,9 @@ function Get-OperatingExpenseState([datetime]$TargetDate, [double]$TargetAmount,
     $entry = "$($TargetDate.ToString('MM-dd')) 其他经营费用 $TargetAmount：$project"
     if ($OrderNo) { $entry += "｜订单$OrderNo" }
     $entryKey = Normalize-BusinessText $entry
-    $noteParts = @([regex]::Split([string](Get-CellValue $month.cells 11), '[；;]') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    # A semicolon inside a project description is not a record boundary.
+    # Other monthly events share this note, so retain their date boundaries too.
+    $noteParts = @([regex]::Split([string](Get-CellValue $month.cells 11), '[；;](?=\s*\d{2}-\d{2}\s)') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     $monthNoteCount = @($noteParts | Where-Object { (Normalize-BusinessText $_) -eq $entryKey }).Count
     $projectNotePrefix = Normalize-BusinessText "$($TargetDate.ToString('MM-dd')) 其他经营费用"
     $projectNoteSuffix = Normalize-BusinessText $project
