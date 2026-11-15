@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { businessDate, selectDeliveryOrders, decideDeliveryFee } from '../agent/delivery_fee_policy.mjs';
+import { businessDate, selectDeliveryOrders, decideDeliveryFee, resolveCyanDispatchHistory } from '../agent/delivery_fee_policy.mjs';
 
 const proxyRoot = 'http://localhost:3456';
 async function proxy(route, options = {}) {
@@ -16,7 +16,7 @@ async function evaluate(id, code) {
 
 // This function is serialized into a NEW background tab. Authentication stays
 // inside Chrome. Only allowlisted read endpoints are used; return a projection.
-export async function readProviderPage(provider, dates, ids) {
+export async function readProviderPage(provider, dates, ids, resolveHistory = resolveCyanDispatchHistory) {
   const wanted = new Set(ids);
   const output = [];
   const yuan = v => {
@@ -27,7 +27,7 @@ export async function readProviderPage(provider, dates, ids) {
   const request = async (url, body) => {
     // Deliberately restrict this browser helper even if a caller passes a URL.
     const parsed=new URL(url,location.href);
-    if (parsed.origin!==new URL(location.href).origin || !['/query/list/','/order/detail/','/api/pc/order/manage/list','/api/pc/order/detail'].includes(parsed.pathname)) throw Error('Read endpoint not allowed');
+    if (parsed.origin!==new URL(location.href).origin || !['/query/list/','/order/detail/','/api/pc/order/manage/list','/api/pc/order/detail','/api/pc/delivery/progressTrack'].includes(parsed.pathname)) throw Error('Read endpoint not allowed');
     return await new Promise((resolve,reject) => {
       const x = new XMLHttpRequest();
       x.open(body ? 'POST' : 'GET', url); x.timeout=15000;
@@ -66,7 +66,7 @@ export async function readProviderPage(provider, dates, ids) {
         if(!correctStore)throw Error('Store identity mismatch');
         const actualDate=provider==='maiyatian'?r.order_date:new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(Number(r.channelOrderTime)*1000));
         if(actualDate!==date)throw Error('Order date mismatch');
-        let delivery, amount, deliveryId, ambiguous=false, final=false, cancelled=false;
+        let delivery, amount, deliveryId, ambiguityReason, historyEvidence, ambiguous=false, final=false, cancelled=false;
         if(provider==='maiyatian') {
           // Only the current COMPLETED dispatch is financial evidence. Old
           // cancelled attempts contain quotes, not additional paid amounts.
@@ -97,14 +97,23 @@ export async function readProviderPage(provider, dates, ids) {
           final=Number(r.deliveryStatus)===50;
           cancelled=Number(r.deliveryStatus)===60;
           amount=yuan(delivery?.actualDeliveryFee);
-          // Extra payments or multiple completed deliveries must not replace
-          // the first-delivery column without a separate expense decision.
-          ambiguous=Number(r.shipCount)>1 || ['totalExtFee','tipFee','insuredFee'].some(k=>Number(delivery?.[k] || 0)!==0);
+          ambiguous=['totalExtFee','tipFee','insuredFee'].some(k=>Number(delivery?.[k] || 0)!==0);
+          if (Number(r.shipCount)>1) {
+            const track=await request('/api/pc/delivery/progressTrack',new URLSearchParams({orderId:id}).toString());
+            if (track.code!==0) throw Error('Delivery history unavailable');
+            const resolved=resolveHistory(r,track.data);
+            if (resolved.state==='ambiguous') { ambiguous=true; ambiguityReason=resolved.reason; }
+            else {
+              amount=resolved.amount;final=resolved.state==='complete';cancelled=resolved.state==='missing';
+              historyEvidence=resolved.history;
+            }
+          }
           if(cancelled && amount>0)ambiguous=true;
         }
         output.push({provider,order_no:orderNo,delivery_id:deliveryId,
           state:ambiguous?'ambiguous':final&&amount>0?'complete':!delivery||amount===0||cancelled?'missing':'pending',
-          amount:final?amount:null,date});
+          amount:final?amount:null,date,
+          ...(ambiguityReason?{reason:ambiguityReason}:{}),...(historyEvidence?{history:historyEvidence}:{})});
       }
       if(provider==='cyanclouds' && seen.size===expected){complete=true;break;}
       if(rows.length<20){if(expected!==null && seen.size!==expected)throw Error('Incomplete order list');complete=true;break;}
@@ -126,7 +135,7 @@ async function readProvider(provider, dates, orders) {
       await new Promise(r=>setTimeout(r,500));
     }
     if(!ready)throw Error('Query page unavailable or login required');
-    const result=await evaluate(opened.targetId,`(async()=>{try{return {ok:true,rows:await (${readProviderPage.toString()})(${JSON.stringify(provider)},${JSON.stringify(dates)},${JSON.stringify(orders.map(r=>r.order_no))})};}catch{return {ok:false};}})()`);
+    const result=await evaluate(opened.targetId,`(async()=>{try{return {ok:true,rows:await (${readProviderPage.toString()})(${JSON.stringify(provider)},${JSON.stringify(dates)},${JSON.stringify(orders.map(r=>r.order_no))},(${resolveCyanDispatchHistory.toString()}))};}catch{return {ok:false};}})()`);
     if(result?.ok!==true || !Array.isArray(result.rows))throw Error('Provider read incomplete');
     return result.rows;
   } finally {await proxy('/close?target='+encodeURIComponent(opened.targetId)).catch(()=>{});}

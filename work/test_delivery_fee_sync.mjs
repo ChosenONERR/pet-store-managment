@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {businessDate,selectDeliveryOrders,decideDeliveryFee} from '../agent/delivery_fee_policy.mjs';
+import {businessDate,selectDeliveryOrders,decideDeliveryFee,resolveCyanDispatchHistory} from '../agent/delivery_fee_policy.mjs';
 import {readProviderPage,extractDeliveryFees} from './delivery_fee_extract.mjs';
 const id='3602371202674777015';
 const base={order_no:id,date:'2026-11-03',platform:'美团',status:'已完成',current_fee:0};
@@ -105,6 +105,82 @@ try{
   result=await readProviderPage('cyanclouds',['2026-11-03'],[id]);assert.equal(result[0].amount,4.51);assert.equal(result[0].state,'complete');cases++;
   respond=()=>({code:0,data:{total:1,pageNum:1,dataList:[{...qyRow,shipCount:2}]}});
   result=await readProviderPage('cyanclouds',['2026-11-03'],[id]);assert.equal(result[0].state,'ambiguous');cases++;
+  // Regression: two send rounds are not two charges. Cancelled waybills still
+  // contain positive quotes, but their actual cancellation/additional fees are 0.
+  const multi={...qyRow,shipCount:2,waybillId:'paid-waybill',orderDeliveryInfo:{...qyRow.orderDeliveryInfo,actualDeliveryFee:733,deliveryFee:977,discountFee:244}};
+  const fees={cancelFee:0,totalExtFee:0,insuredFee:0,tipAmount:0,allowanceFee:0};
+  const history={deliveryList:[
+    {deliveryId:'321',status:50,waybillList:[{...fees,waybillId:'paid-waybill',status:50,actualDeliveryFee:733},{...fees,waybillId:'cancelled-quote',status:99,actualDeliveryFee:999}]},
+    {deliveryId:'320',status:99,waybillList:[{...fees,waybillId:'old-quote',status:99,actualDeliveryFee:548}]}
+  ]};
+  respond=u=>u.pathname==='/api/pc/delivery/progressTrack'?{code:0,data:history}:{code:0,data:{total:1,pageNum:1,dataList:[multi]}};
+  result=await readProviderPage('cyanclouds',['2026-11-03'],[id]);assert.equal(result[0].state,'complete');assert.equal(result[0].amount,7.33);cases++;
+  check(()=>assert.deepEqual(result[0].history,{rounds:2,completed:1,cancelled:2,cancel_fee:0}));
+  const good=result[0];
+  check(()=>assert.equal(decideDeliveryFee(base,[good],providers).amount,7.33));
+  check(()=>assert.equal(decideDeliveryFee({...base,current_fee:7.33},[good],providers).changed,false));
+  check(()=>assert.equal(decideDeliveryFee({...base,current_fee:7.33,protected:true},[good],providers).state,'protected'));
+  check(()=>assert.equal(decideDeliveryFee({...base,current_fee:8,protected:true},[good],providers).state,'conflict'));
+  check(()=>assert.equal(decideDeliveryFee(base,[good,paid()],providers).state,'conflict'));
+  // The production browser receives the helper explicitly: no Node/module
+  // closure, credentials, or filesystem is available inside that context.
+  const detached=Function(`return (${readProviderPage.toString()});`)();
+  const detachedResolver=Function(`return (${resolveCyanDispatchHistory.toString()});`)();
+  result=await detached('cyanclouds',['2026-11-03'],[id],detachedResolver);
+  check(()=>assert.equal(result[0].amount,7.33));
+  const mutations=[
+    h=>{h.deliveryList.pop();},
+    h=>{h.deliveryList[1].deliveryId='321';},
+    h=>{h.deliveryList[1].waybillList[0].waybillId='paid-waybill';},
+    h=>{delete h.deliveryList[1].deliveryId;},
+    h=>{h.deliveryList[1].deliveryId=Number.MAX_SAFE_INTEGER+1;},
+    h=>{h.deliveryList[1].waybillList=[];},
+    h=>{h.deliveryList[1].status=20;},
+    h=>{h.deliveryList[1].waybillList[0].status=20;},
+    h=>{h.deliveryList[0].waybillList[0].actualDeliveryFee=999;},
+    h=>{h.deliveryList[0].waybillList[0].waybillId='wrong-current-waybill';},
+    h=>{h.deliveryList[0].waybillList[0].actualDeliveryFee=null;},
+    h=>{h.deliveryList[0].waybillList[0].actualDeliveryFee=-1;},
+    h=>{h.deliveryList[0].waybillList[0].actualDeliveryFee=733.5;},
+    h=>{h.deliveryList[0].waybillList[0].actualDeliveryFee='unknown';},
+    h=>{h.deliveryList[1].waybillList[0].status=50;},
+    h=>{h.deliveryList[1].status=50;h.deliveryList[1].waybillList[0].status=50;},
+    h=>{h.deliveryList[0].waybillList[1].status=50;},
+    ...['cancelFee','totalExtFee','insuredFee','tipAmount','allowanceFee'].map(k=>h=>{h.deliveryList[1].waybillList[0][k]=200;}),
+    ...['cancelFee','totalExtFee','insuredFee','tipAmount'].map(k=>h=>{delete h.deliveryList[1].waybillList[0][k];}),
+    ...[null,'',false,-1,'unknown'].map(v=>h=>{h.deliveryList[1].waybillList[0].cancelFee=v;})
+  ];
+  for(const mutate of mutations){
+    const h=structuredClone(history);mutate(h);
+    const resolved=resolveCyanDispatchHistory(multi,h);
+    check(()=>{assert.equal(resolved.state,'ambiguous');assert.ok(resolved.reason);});
+  }
+  for(const override of [{deliveryId:'other-round'},{waybillId:'other-waybill'},{shipCount:3},{deliveryStatus:20},{orderDeliveryInfo:{...multi.orderDeliveryInfo,actualDeliveryFee:734}},{orderDeliveryInfo:{...multi.orderDeliveryInfo,tipFee:null}}]){
+    check(()=>assert.equal(resolveCyanDispatchHistory({...multi,...override},history).state,'ambiguous'));
+  }
+  const stringHistory=structuredClone(history);
+  for(const round of stringHistory.deliveryList){round.status=String(round.status);for(const waybill of round.waybillList){waybill.status=String(waybill.status);for(const key of ['cancelFee','totalExtFee','insuredFee','tipAmount'])waybill[key]='0';}}
+  check(()=>assert.equal(resolveCyanDispatchHistory(multi,stringHistory).amount,7.33));
+  const allCancelled=structuredClone(history);
+  for(const round of allCancelled.deliveryList){round.status=99;for(const waybill of round.waybillList)waybill.status=99;}
+  check(()=>assert.equal(resolveCyanDispatchHistory({...multi,deliveryStatus:60},allCancelled).state,'missing'));
+  check(()=>assert.equal(resolveCyanDispatchHistory(multi,allCancelled).state,'ambiguous'));
+  const zero=structuredClone(history);zero.deliveryList[0].waybillList[0].actualDeliveryFee=0;
+  check(()=>assert.equal(resolveCyanDispatchHistory({...multi,orderDeliveryInfo:{...multi.orderDeliveryInfo,actualDeliveryFee:0}},zero).amount,0));
+  const requests=[];
+  respond=(u,b)=>{requests.push(u.pathname);if(u.pathname==='/api/pc/delivery/progressTrack'){assert.equal(new URLSearchParams(b).get('orderId'),'201');return{code:0,data:history};}return{code:0,data:{total:1,pageNum:1,dataList:[multi]}};};
+  result=await readProviderPage('cyanclouds',['2026-11-03'],[id]);
+  check(()=>assert.deepEqual(requests,['/api/pc/order/manage/list','/api/pc/delivery/progressTrack']));
+  const integration=await extractDeliveryFees({date:base.date,orders:[base]},async(provider)=>provider==='cyanclouds'?result:[]);
+  check(()=>{assert.equal(integration.decisions[0].state,'confirmed');assert.equal(integration.decisions[0].amount,7.33);assert.equal(integration.pending.length,0);});
+  respond=u=>u.pathname==='/api/pc/delivery/progressTrack'?{code:1}:{code:0,data:{total:1,pageNum:1,dataList:[multi]}};
+  await assert.rejects(()=>readProviderPage('cyanclouds',['2026-11-03'],[id]),/history unavailable/);cases++;
+  const deferred=await extractDeliveryFees({date:base.date,orders:[base]},async(provider)=>provider==='cyanclouds'?await readProviderPage(provider,[base.date],[id]):[]);
+  check(()=>{assert.equal(deferred.decisions[0].state,'deferred');assert.equal(deferred.pending.length,1);});
+  const charged=structuredClone(history);charged.deliveryList[1].waybillList[0].cancelFee=200;
+  respond=u=>u.pathname==='/api/pc/delivery/progressTrack'?{code:0,data:charged}:{code:0,data:{total:1,pageNum:1,dataList:[multi]}};
+  result=await readProviderPage('cyanclouds',['2026-11-03'],[id]);
+  check(()=>{assert.equal(result[0].state,'ambiguous');assert.match(decideDeliveryFee(base,result,providers).reason,/取消费/);});
   respond=()=>({code:0,data:{total:100,pageNum:1,dataList:[qyRow]}});
   await assert.rejects(()=>readProviderPage('cyanclouds',['2026-11-03'],[id]),/Incomplete/);cases++;
   respond=()=>({code:0,data:{total:40,pageNum:1,dataList:Array.from({length:20},(_,i)=>({...qyRow,orderId:String(i)}))}});
