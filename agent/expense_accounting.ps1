@@ -3,6 +3,7 @@
     $totals = @{promotion=0.0;intervention=0.0;after_sales=0.0;other=0.0;excluded=0.0}
     $pending = [Collections.Generic.List[string]]::new()
     $managedKeys = @{}
+    $riderBonus = 0.0
     foreach ($entry in @($Entries)) {
         $project = ([string]$entry.project).Trim()
         if (-not $project) { continue }
@@ -33,12 +34,15 @@
         elseif ($project -match '售后.*配送|再次配送|二次配送|补送.*配送') { 'after_sales' }
         else { 'other' }
         $totals[$category] += $amount
+        # A display subset only: existing "other" and the total must not change.
+        if ($category -eq 'other' -and $project -match '骑手.*红包|红包.*骑手') { $riderBonus += $amount }
     }
     $total = $totals.promotion + $totals.intervention + $totals.after_sales + $totals.other
     return [pscustomobject]@{
         total=[math]::Round($total,2);promotion=[math]::Round($totals.promotion,2)
         intervention=[math]::Round($totals.intervention,2);after_sales=[math]::Round($totals.after_sales,2)
         other=[math]::Round($totals.other,2);excluded=[math]::Round($totals.excluded,2)
+        rider_bonus=[math]::Round($riderBonus,2);other_without_rider_bonus=[math]::Round($totals.other-$riderBonus,2)
         pending=@($pending);status=$(if($pending.Count){'利润暂估；'+($pending -join '；')}else{'已核对'})
     }
 }

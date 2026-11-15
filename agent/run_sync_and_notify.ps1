@@ -586,10 +586,18 @@ function Get-DailyNetProfit {
     $incomeRows = Get-LedgerRows $incomeSheet 'A2:K1001'
     $expenseRows = Get-LedgerRows $expenseSheet 'A2:F1001'
     $orderProfit = 0.0
+    $incomeTotal = 0.0; $productCostTotal = 0.0; $firstDeliveryTotal = 0.0
+    $incomeMissing = $false; $costMissing = $false
     $orderCount = 0; $pendingCostCount = 0
     foreach ($row in $incomeRows) {
         if (-not (Test-RowDate (Get-CellValue $row 2) $ForDate)) { continue }
         $orderCount++
+        $incomeValue = Convert-ToNumber (Get-CellValue $row 3)
+        $costValue = Convert-ToNumber (Get-CellValue $row 4)
+        $deliveryValue = Convert-ToNumber (Get-CellValue $row 5)
+        if ($null -eq $incomeValue) { $incomeMissing = $true } else { $incomeTotal += $incomeValue }
+        if ($null -eq $costValue) { $costMissing = $true } else { $productCostTotal += $costValue }
+        if ($null -ne $deliveryValue) { $firstDeliveryTotal += $deliveryValue }
         $value = Convert-ToNumber (Get-CellValue $row 6)
         if ($null -ne $value) { $orderProfit += $value }
         else { $pendingCostCount++ }
@@ -603,20 +611,44 @@ function Get-DailyNetProfit {
     return [pscustomobject]@{
         order_count = $orderCount
         pending_cost_count = $pendingCostCount
+        income_total = $(if ($incomeMissing) { $null } else { [math]::Round($incomeTotal,2) })
+        product_cost_total = $(if ($costMissing) { $null } else { [math]::Round($productCostTotal,2) })
+        first_delivery_total = [math]::Round($firstDeliveryTotal,2)
+        gross_profit = $(if ($incomeMissing -or $costMissing -or $pendingCostCount -gt 0) { $null } else { [math]::Round($orderProfit,2) })
         order_profit = [math]::Round($orderProfit, 2)
         expense_total = [math]::Round($expenseTotal, 2)
         promotion_expense = [math]::Round($promotionExpense, 2)
+        intervention_expense = $expenseSummary.intervention
+        rider_bonus_expense = $expenseSummary.rider_bonus
+        after_sales_expense = $expenseSummary.after_sales
+        other_expense = $expenseSummary.other_without_rider_bonus
         net_profit = [math]::Round($orderProfit - $expenseTotal, 2)
         expense_status = $expenseSummary.status
         pending_expenses = $expenseSummary.pending
     }
 }
 
+function Format-DailyProfitDetails($Profit) {
+    $amount = { param($Value) if ($null -eq $Value) { '待核对' } else { '{0:N2}' -f [double]$Value } }
+    $gross = & $amount $Profit.gross_profit
+    $net = & $amount $Profit.net_profit
+    $promotionPending = $null -ne $Profit.PSObject.Properties['promotion_pending'] -and [bool]$Profit.promotion_pending
+    $pending = $null -eq $Profit.gross_profit -or @($Profit.pending_expenses).Count -gt 0 -or $promotionPending
+    $estimate = if ($pending) { '（暂估；待核对项目未齐，费用仅计已知部分）' } else { '' }
+    $grossLabel = if ($null -eq $Profit.gross_profit) { $gross } else { "${gross}元" }
+    $profitCalculation = if ($pending) { '存在待核对项目，暂不列完整数值等式；当前仅按已知金额暂估。' } else {
+        '＝{0}－{1}－{2}－{3}－{4}－{5}＝{6}元' -f $gross,(& $amount $Profit.promotion_expense),(& $amount $Profit.intervention_expense),(& $amount $Profit.rider_bonus_expense),(& $amount $Profit.after_sales_expense),(& $amount $Profit.other_expense),$net
+    }
+    return ("经营毛利＝{0}`n（线上与线下收入－商品成本－首次配送费）`n＝{1}－{2}－{3}＝{0}`n`n经营利润＝{4}元{5}`n（经营毛利－推广费－补单费用－骑手红包－售后追加配送费－其他经营费用）`n{6}" -f
+        $grossLabel,(& $amount $Profit.income_total),(& $amount $Profit.product_cost_total),(& $amount $Profit.first_delivery_total),$net,$estimate,$profitCalculation)
+}
+
 function Format-CrossDayCorrection([string]$Day,$Profit) {
     $pending = [int]$Profit.pending_cost_count -gt 0 -or @($Profit.pending_expenses).Count -gt 0
     $label = if ($pending) { '暂估，仍有成本或费用待核对' } else { '按当前已核实账表' }
-    return ("📊 {0}经营日结更新（跨日补齐）`n真实/线下订单：{1}单`n订单利润合计 ¥{2:N2}－经营支出 ¥{3:N2}＝当天赚/亏 ¥{4:N2}`n{5}；已更新原日期账表，此结果替代此前该日金额。" -f
-        $Day,$Profit.order_count,[double]$Profit.order_profit,[double]$Profit.expense_total,[double]$Profit.net_profit,$label)
+    $details = if ($null -ne $Profit.PSObject.Properties['income_total']) { "`n`n" + (Format-DailyProfitDetails $Profit) } else { '' }
+    return ("📊 {0}经营日结更新（跨日补齐）`n真实/线下订单：{1}单`n订单利润合计 ¥{2:N2}－经营支出 ¥{3:N2}＝当天赚/亏 ¥{4:N2}`n{5}；已更新原日期账表，此结果替代此前该日金额。{6}" -f
+        $Day,$Profit.order_count,[double]$Profit.order_profit,[double]$Profit.expense_total,[double]$Profit.net_profit,$label,$details)
 }
 
 function Assert-FormulaRange([string]$SheetName, [string]$Range) {
@@ -1158,6 +1190,9 @@ function Build-Card($Snapshot, [bool]$Succeeded, [string]$FailureReason = '') {
 
     if ($isNight) {
         $elements.Add([ordered]@{ tag = 'markdown'; content = "**推广费**　$(Format-Money $Snapshot.today_promotion_expense)　<font color='grey'>23:55 自动读取</font>" })
+        if ($null -ne $Snapshot.PSObject.Properties['daily_profit_details']) {
+            $elements.Add([ordered]@{ tag = 'markdown'; content = (Format-DailyProfitDetails $Snapshot.daily_profit_details) })
+        }
     }
 
     if ($hasWarnings) {
@@ -1361,6 +1396,10 @@ function Build-Message($Snapshot, [bool]$Succeeded, [string]$FailureReason = '')
         $lines.Add('')
         $lines.Add("💰 当天赚/亏（暂估）：$profitText")
         $lines.Add("📣 推广费：$(Format-Money $Snapshot.today_promotion_expense)（23:55自动读取）")
+        if ($null -ne $Snapshot.PSObject.Properties['daily_profit_details']) {
+            $lines.Add('')
+            $lines.Add((Format-DailyProfitDetails $Snapshot.daily_profit_details))
+        }
         if (@($Snapshot.sync_warnings).Count -gt 0) {
             $lines.Add('')
             $warningHeading = if ([bool]$Snapshot.sync_degraded) { '⚠️ 本次同步已自动降级处理：' } else { '⚠️ 经营事项提醒：' }
@@ -1668,6 +1707,7 @@ try {
     $stage = Invoke-WithRetry 'daily_profit_readback' { Get-DailyNetProfit } 3
     foreach($pendingExpense in @($stage.value.pending_expenses)) { $syncWarnings.Add("费用待核对，利润暂估：$pendingExpense") }
     $dailyProfit = $stage.value
+    $dailyProfit | Add-Member -NotePropertyName promotion_pending -NotePropertyValue ([bool]$promotionCaptureError)
     $priorDayReports = [Collections.Generic.List[object]]::new()
     if (-not $DryRun -and -not $SkipSync) {
         $pastDates = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -1701,6 +1741,7 @@ try {
     $snapshot | Add-Member -NotePropertyName today_expense_total -NotePropertyValue $dailyProfit.expense_total
     $snapshot | Add-Member -NotePropertyName today_promotion_expense -NotePropertyValue $dailyProfit.promotion_expense
     $snapshot | Add-Member -NotePropertyName today_net_profit -NotePropertyValue $dailyProfit.net_profit
+    $snapshot | Add-Member -NotePropertyName daily_profit_details -NotePropertyValue $dailyProfit
     foreach ($change in @($deliveryFeeResult.changed_orders)) {
         if ($null -ne $change -and $change.order_no -and $change.date -and [string]$change.date -lt $dateText) {
             $syncWarnings.Add("配送费已补录：$($change.date)订单 $($change.order_no)｜配送费 ¥$('{0:N2}' -f [double]$change.amount)，已更新原月份收入与利润，原日结暂估值应以更新后的账表为准。")

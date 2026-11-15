@@ -45,7 +45,7 @@ foreach($fixture in @(
     Check ($newItemOrderNumbers.Count -eq [int]$fixture.reset) 'Reactivation did not scope cost initialization to one order'
 }
 Check ($orderSource -match 'Status = Get-CellValue \$row 3' -and $orderSource -match 'affected_dates =') 'Snapshot status or affected dates not transported'
-foreach($name in @('Get-CellValue','Convert-ToNumber','Test-RowDate','Get-DailyNetProfit','Format-CrossDayCorrection')){
+foreach($name in @('Get-CellValue','Convert-ToNumber','Test-RowDate','Get-DailyNetProfit','Format-DailyProfitDetails','Format-CrossDayCorrection')){
     $f=$run.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true)
     Check ($null -ne $f) "Missing $name"
     $body=$f.Body.Extent.Text.Substring(1,$f.Body.Extent.Text.Length-2)
