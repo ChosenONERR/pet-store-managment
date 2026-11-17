@@ -49,7 +49,7 @@ QUERY_CACHE_SECONDS = 30
 RATE_LIMIT_BASE_SECONDS = 60
 RATE_LIMIT_MAX_SECONDS = 15 * 60
 RATE_LIMIT_RESET_SECONDS = 60 * 60
-RUNTIME_VERSION = "2026-11-03.2"
+RUNTIME_VERSION = "2026-11-17.1"
 RUNTIME_PIPE = rf"\\.\pipe\petstar_codex_runtime_{hashlib.sha256(str(PROJECT_ROOT).encode('utf-8')).hexdigest()[:16]}"
 RUNTIME_AUTHKEY = hashlib.sha256((str(PROJECT_ROOT) + "|petstar-codex-runtime-v1").encode("utf-8")).digest()
 QUERY_DATASETS = {
@@ -164,6 +164,7 @@ sku 查询的每一行也会返回 action_code。只要查询结果提供 action
 当前消息是唯一的新行动来源。历史对话仅帮助理解“这单、昨天、刚才那个”等指代，禁止重放历史动作，禁止把旧待办当成当前请求。
 订单号必须逐字保留，不能改写、补全或猜测。KW 是可调整和复用的当前货号，不是永久商品身份；不得创建历史别名。
 店主纠正“旧订单不是干预单，真正的干预单是另一个订单”时，必须为旧订单生成 RemoveIntervention，并为正确订单生成 AddIntervention；配送方式、配送费、补单人和库存恢复状态如果是在同一纠错上下文中明确给出的，也一并迁移到正确订单。不得只解释执行层不支持，也不得把两笔都保留为干预。
+上述撤销仅适用于明确否认旧订单的情况。仅说“是这一单”、仅给另一个订单号或更正补单人，不足以认定旧订单不是干预单；两笔都可能是干预单。此时保留旧分类，不生成 RemoveIntervention，先询问新订单是新增还是替换；店主明确“两笔都是干预单”时分别保留各自补单人，不能互相覆盖。
 自己送、自配送、商家自配、没有配送费，都表示配送费为0元。线下单默认自提配送费0并当天到账，除非店主另有说明。
 只确认已有线上订单的自配送或首次配送费为0时，使用 SetOrderDeliveryFee（order_no、amount=0、note保留自配送原意）；自配送不等于干预单，禁止据此生成 AddIntervention。执行器会核对实际订单类型，查询不到订单时必须提示先同步，不能用合成预览声称已经找到。
 线上订单发生私下退款、漏送退款、到店换货、实际售出商品与线上订单不同，或店主明确给出该订单最终实收时，使用 SetOrderActuals，绝不能使用 ActualReceipt。amount 填最终实际收入；items 只填最终实际交付商品，漏送、退回或没有交付的商品必须排除。用户没有明确谈配送方式或配送费时 delivery_fee 必须填 null，由执行器在确认时沿用订单当前值；只有明确到店自提、自配送或给出新配送费时才填写。店主说已手工恢复美团库存时只写进 note，绝不能再生成库存修改动作。若原订单商品和数量全部保留、仅私下加购一个新商品并明确额外付款，则 amount=原商家预计收入+额外付款，items=原商品+新增商品，不要追问金额分摊；多个新增/替换商品且无法确定售价分摊时才追问，不能猜。

@@ -1499,6 +1499,8 @@ switch ($Action) {
         if ($matches.Count -gt 1) { throw "干预订单中发现 $($matches.Count) 条重复记录：$OrderNo；为避免误删，本次未修改" }
 
         $target = $matches[0]
+        $withdrawnCostRows = @(Get-SheetRows '订单商品' 'A2:Q4001')
+        $withdrawnCostResets = @(Get-WithdrawnInterventionCostResets $withdrawnCostRows $OrderNo)
         $orderDate = Convert-ToDateValue (Get-CellValue $orderMatches[0] 0)
         $details = [ordered]@{
             row = $target.row_number
@@ -1510,6 +1512,7 @@ switch ($Action) {
             delivery_fee = Convert-ToNumber (Get-CellValue $target.cells 7)
             inventory_state = Get-CellValue $target.cells 9
             new_order_type = '自然'
+            zero_cost_rows_to_reinitialize = @($withdrawnCostResets | ForEach-Object { $_.row })
         }
         if ($DryRun) {
             [ordered]@{ok=$true;dry_run=$true;action=$Action;result=$details} | ConvertTo-Json -Depth 8
@@ -1557,6 +1560,12 @@ switch ($Action) {
         }
         if (-not $withdrawn) {
             throw "撤销干预写后校验失败：$OrderNo 未在第 $($target.row_number) 行正确标记为已撤销"
+        }
+        # These zeros were forced while this exact order was an intervention.
+        # Do not let the incremental engine freeze them as genuine sale costs.
+        foreach($reset in $withdrawnCostResets){
+            $blankCosts=@();$blankCosts+=,@(@{value=''},@{value=''},@{value=''})
+            Set-CellMatrix '订单商品' "L$($reset.row):N$($reset.row)" $blankCosts
         }
         $reference = $OrderNo
         $details['removal_mode'] = 'audit_tombstone'
