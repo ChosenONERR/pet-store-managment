@@ -71,6 +71,12 @@ Check (($script:writes -join ',') -eq 'J2:J2,P2:P2,J2:J2,P2:P2') 'Writer touched
 $byId[$id].protected=$true
 $blocked=$false;try{Invoke-Expression $writeLoop.Extent.Text}catch{$blocked=$_.Exception.Message -match '保护触发'}
 Check ($blocked -and $script:writes.Count -eq 4) 'Manual amount protection bypassed'
+$byId[$id].protected=$false
+$byId[$id].note='original note；自动配送费[maiyatian:123]=4.71元；麦芽田技术服务费：0.20元（结算2026-11-20）'
+$result.decisions=@([pscustomobject]@{order_no=$id;state='confirmed';amount=4.81;changed=$true;provider='maiyatian';delivery_id='123';technical_service_fee=0.30;technical_service_date='2026-11-20'})
+Invoke-Expression $writeLoop.Extent.Text
+Check ($script:grid[9].value -eq 4.81 -and $script:grid[15].value -match '麦芽田技术服务费：0.30元（结算2026-11-20）' -and $script:grid[15].value -notmatch '技术服务费：0.20') 'Technical settlement amount or source did not replace the prior marker'
+Check (($script:writes -join ',') -eq 'J2:J2,P2:P2,J2:J2,P2:P2,J2:J2,P2:P2') 'Technical settlement wrote outside the existing delivery fields'
 
 # A newly registered intervention defaults only its delivery fields, never
 # inventing a known platform fee or changing a natural order on its own.

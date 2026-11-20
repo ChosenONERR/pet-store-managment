@@ -87,7 +87,7 @@ try {
         if($note -match '自动配送费\[(?:maiyatian|cyanclouds):\d+\]=(\d+(?:\.\d+)?)元'){$auto=[double]::Parse($Matches[1],[Globalization.CultureInfo]::InvariantCulture)}
         $protected=$note -match '人工确认配送费' -or $overrides.ContainsKey($id) -or
           ($null -ne $fee -and [string]$fee -ne '' -and [double]$fee -gt 0 -and ($null -eq $auto -or [math]::Abs([double]$fee-$auto) -gt 0.0049))
-        $record=[pscustomobject]@{order_no=$id;date=$day;platform='美团';status=[string](Get-DeliveryCell $r 3);intervention=$interventions.ContainsKey($id);current_fee=$(if([string]$fee -eq ''){$null}else{[double]$fee});protected=[bool]$protected;confirmed_self=($note -match '人工确认配送费：?\s*0(?:\.0+)?元');row=($i+2);note=$note;auto_fee=$auto;manual_migration=$false}
+        $record=[pscustomobject]@{order_no=$id;date=$day;platform='美团';status=[string](Get-DeliveryCell $r 3);intervention=$interventions.ContainsKey($id);current_fee=$(if([string]$fee -eq ''){$null}else{[double]$fee});protected=[bool]$protected;confirmed_self=($note -match '人工确认配送费：?\s*0(?:\.0+)?元');has_technical_service_fee=($note -match '(?:^|[；;])麦芽田技术服务费：\d+(?:\.\d+)?元（结算\d{4}-\d{2}-\d{2}）');row=($i+2);note=$note;auto_fee=$auto;manual_migration=$false}
         if($overrides.ContainsKey($id)){$record.current_fee=[double]$overrides[$id].delivery_fee;if($record.current_fee -eq 0){$record.confirmed_self=$true}}
         $orders.Add($record);$byId[$id]=$record
         if(-not $record.intervention -and $record.status -notmatch '取消'){$monthKeys[$day.Substring(0,7)]=$true}
@@ -136,8 +136,9 @@ try {
         $isDefaultSelf = $d.state -eq 'default_self'
         $provider = if($isDefaultSelf){'default_self'}else{[string]$d.provider}
         $marker=if($isDefaultSelf){'默认自配送：未查到骑手配送费（0元，后续继续自动查询）'}else{'自动配送费[{0}:{1}]={2}元' -f $d.provider,$d.delivery_id,([double]$d.amount).ToString('0.00',[Globalization.CultureInfo]::InvariantCulture)}
-        $note=([regex]::Replace($o.note,'(?:^|[；;])(?:自动配送费\[(?:maiyatian|cyanclouds):\d+\]=\d+(?:\.\d+)?元|默认自配送：未查到骑手配送费（0元，后续继续自动查询）)','')).Trim('；',';',' ')
-        $note=(@($note,$marker)|Where-Object {$_}) -join '；'
+        $note=([regex]::Replace($o.note,'(?:^|[；;])(?:自动配送费\[(?:maiyatian|cyanclouds):\d+\]=\d+(?:\.\d+)?元|麦芽田技术服务费：\d+(?:\.\d+)?元（结算\d{4}-\d{2}-\d{2}）|默认自配送：未查到骑手配送费（0元，后续继续自动查询）)','')).Trim('；',';',' ')
+        $serviceMarker=if($d.PSObject.Properties['technical_service_fee'] -and $null -ne $d.technical_service_fee){'麦芽田技术服务费：{0}元（结算{1}）' -f ([double]$d.technical_service_fee).ToString('0.00',[Globalization.CultureInfo]::InvariantCulture),$d.technical_service_date}
+        $note=(@($note,$marker,$serviceMarker)|Where-Object {$_}) -join '；'
         if($Apply){
             $writesStarted=$true
             Set-DeliveryCell "J$($o.row):J$($o.row)" ([double]$d.amount)
@@ -162,7 +163,7 @@ try {
         try{[IO.File]::WriteAllText($temp,(@{orders=$next}|ConvertTo-Json -Depth 5),[Text.UTF8Encoding]::new($false));Move-Item -LiteralPath $temp -Destination $pendingPath -Force}
         finally{if(Test-Path -LiteralPath $temp){Remove-Item -LiteralPath $temp -Force}}
     }
-    [ordered]@{ok=$true;applied=[bool]$Apply;candidate_count=$result.candidate_count;queried_count=$result.queried_count;providers=$result.providers;decisions=@($result.decisions);pending_count=@($result.pending).Count;changed_orders=@($changes);changed_order_nos=@($changes|ForEach-Object {$_.order_no});affected_months=@($changes|ForEach-Object {$_.date.Substring(0,7)}|Sort-Object -Unique)}|ConvertTo-Json -Depth 10 -Compress
+    [ordered]@{ok=$true;applied=[bool]$Apply;candidate_count=$result.candidate_count;queried_count=$result.queried_count;providers=$result.providers;tech_service_settlement=$result.tech_service_settlement;decisions=@($result.decisions);pending_count=@($result.pending).Count;changed_orders=@($changes);changed_order_nos=@($changes|ForEach-Object {$_.order_no});affected_months=@($changes|ForEach-Object {$_.date.Substring(0,7)}|Sort-Object -Unique)}|ConvertTo-Json -Depth 10 -Compress
 } catch {
     if($writesStarted){throw "DELIVERY_WRITE_FAILED: $($_.Exception.Message)"}
     throw

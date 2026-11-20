@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { businessDate, selectDeliveryOrders, decideDeliveryFee, resolveCyanDispatchHistory } from '../agent/delivery_fee_policy.mjs';
+import { businessDate, selectDeliveryOrders, decideDeliveryFee, resolveCyanDispatchHistory,
+  wantsMaiyatianServiceFee, includeMaiyatianServiceFee } from '../agent/delivery_fee_policy.mjs';
 
 const proxyRoot = 'http://localhost:3456';
 async function proxy(route, options = {}) {
@@ -141,7 +142,86 @@ async function readProvider(provider, dates, orders) {
   } finally {await proxy('/close?target='+encodeURIComponent(opened.targetId)).catch(()=>{});}
 }
 
-export async function extractDeliveryFees(input, reader = readProvider) {
+// DOM column labels are part of the evidence: a recharge or dispatch quote
+// must never be treated as a paid technical service entry.
+export function verifyServiceSettlement(summary, detailRows) {
+  const cents = value => {
+    const s = String(value ?? '').trim();
+    if (!/^\d+(?:\.\d{1,2})?$/.test(s)) throw Error('Unexpected settlement amount');
+    const n = Math.round(Number(s) * 100);
+    if (!Number.isSafeInteger(n) || n <= 0) throw Error('Invalid settlement amount');
+    return n;
+  };
+  const count = /^技术服务结算\s*[（(]\s*(\d+)\s*笔\s*[）)]$/.exec(summary.description)?.[1];
+  if (!count || Number(count) !== detailRows.length || detailRows.length === 0) throw Error('Incomplete technical settlement detail');
+  const details = detailRows.map(([type, orderNo, , , status, amount]) => {
+    if (type !== '技术服务' || status !== '已完成' || !/^\d{16,22}$/.test(orderNo)) throw Error('Unknown technical settlement type or status');
+    return {order_no:orderNo, settlement_date:summary.date, cents:cents(amount)};
+  });
+  if (details.reduce((sum, row) => sum + row.cents, 0) !== cents(summary.amount)) throw Error('Technical settlement totals disagree');
+  return details;
+}
+
+export async function readMaiyatianServiceFees(orders, date) {
+  const earliest = orders.map(order => order.date).sort()[0];
+  const wanted = new Set(orders.map(order => order.order_no));
+  const target = (await proxy('/new?url='+encodeURIComponent('https://saas.maiyatian.com/service/balance/'))).targetId;
+  if (!target) throw Error('Cannot open settlement tab');
+  const waitFor = async (code) => {
+    for (let i=0; i<18; i++) {
+      const value=await evaluate(target, code);
+      if (value != null) return value;
+      await new Promise(resolve=>setTimeout(resolve,350));
+    }
+    throw Error('Settlement page or detail unavailable');
+  };
+  try {
+    const summaries = await waitFor(`(()=>{
+      const table=[...document.querySelectorAll('table')].find(t=>
+        [...t.querySelectorAll('th')].map(th=>th.innerText.trim()).join('|')==='日期|类型|描述|金额/元|操作');
+      return table ? [...table.querySelectorAll('tbody tr')].map(r=>
+        [...r.cells].map(c=>c.innerText.trim())).filter(r=>r[1]==='技术服务') : null;
+    })()`);
+    const dates = new Set();
+    const results = [];
+    for (const [day, , description, amount] of summaries) {
+      if (day < earliest || day > date) continue;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || dates.has(day)) throw Error('Technical settlement date is not unique');
+      dates.add(day);
+      const opened = await evaluate(target, `(() => {
+        const rows=[...document.querySelectorAll('tr')].filter(r=>
+          r.cells[0]?.innerText.trim()===${JSON.stringify(day)} && r.cells[1]?.innerText.trim()==='技术服务');
+        const detail=rows.length===1 && rows[0].querySelector('a.js_detail');
+        if (!detail || document.querySelector('#balance-detail table')?.getClientRects().length) return false;
+        // The page reopens the previous detail before its asynchronous response arrives.
+        globalThis.petstarPreviousSettlement = document.querySelector('#balance-detail table')?.innerHTML;
+        detail.click();
+        return true;
+      })()`);
+      if (!opened) throw Error('Cannot open an unambiguous settlement detail');
+      const detail = await waitFor(`(() => {
+        const table=document.querySelector('#balance-detail table');
+        if (!table?.getClientRects().length ||
+            table.innerHTML===globalThis.petstarPreviousSettlement ||
+            [...table.querySelectorAll('th')].map(th=>th.innerText.trim()).join('|')!=='类型|订单号|订单信息|完单时间|服务状态|金额') return null;
+        const rows=[...table.rows].filter(r=>r.cells[0]?.tagName==='TD').map(r=>[...r.cells].map(c=>c.innerText.trim()));
+        return rows.length && rows.every(r=>r.length===6) ? rows : null;
+      })()`);
+      results.push(...verifyServiceSettlement({date:day, description, amount}, detail).filter(r=>wanted.has(r.order_no)));
+      const closed = await evaluate(target, `(() => {
+        const close=document.querySelector('#balance-detail')?.closest('.full-page')?.querySelector('.close-page');
+        if (!close) return false;
+        close.click();
+        return true;
+      })()`);
+      if (!closed) throw Error('Cannot close settlement detail');
+      await waitFor("document.querySelector('#balance-detail table')?.getClientRects().length ? null : true");
+    }
+    return results;
+  } finally {await proxy('/close?target='+encodeURIComponent(target)).catch(()=>{});}
+}
+
+export async function extractDeliveryFees(input, reader = readProvider, serviceReader = readMaiyatianServiceFees) {
   const candidates=selectDeliveryOrders(input.orders,input.date,input.pending || []);
   const queried=candidates.filter(r=>!r.confirmed_self);
   const dates=[...new Set(queried.map(r=>businessDate(r.date)))].sort();
@@ -151,8 +231,15 @@ export async function extractDeliveryFees(input, reader = readProvider) {
     try{observations.push(...await reader(provider,dates,queried));providers[provider]={ok:true};}
     catch{providers[provider]={ok:false,error:'查询未完成，请检查该平台登录及订单页面；原费用保持不动'};}
   }
-  const decisions=candidates.map(r=>({order_no:r.order_no,date:businessDate(r.date),...(r.confirmed_self?{state:'protected',reason:'已人工确认自配送'}:decideDeliveryFee(r,observations,providers))}));
-  return {ok:true,candidate_count:candidates.length,queried_count:queried.length,providers,decisions,
+  const baseDecisions=candidates.map(r=>({order_no:r.order_no,date:businessDate(r.date),...(r.confirmed_self?{state:'protected',reason:'已人工确认自配送'}:decideDeliveryFee(r,observations,providers))}));
+  const serviceOrders=baseDecisions.filter(r=>wantsMaiyatianServiceFee(r,input.date));
+  let settlements=null, serviceSettlementStatus='not_needed';
+  if (serviceOrders.length) {
+    try {settlements=await serviceReader(serviceOrders,input.date);serviceSettlementStatus='read';}
+    catch {serviceSettlementStatus='deferred';}
+  }
+  const decisions=baseDecisions.map((row,i)=>includeMaiyatianServiceFee(candidates[i],row,input.date,settlements));
+  return {ok:true,candidate_count:candidates.length,queried_count:queried.length,providers,tech_service_settlement:serviceSettlementStatus,decisions,
     pending:decisions.filter(r=>r.retry || r.state==='conflict').map(r=>({order_no:r.order_no,date:r.date}))};
 }
 if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href){

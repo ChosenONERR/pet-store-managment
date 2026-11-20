@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {businessDate,selectDeliveryOrders,decideDeliveryFee,resolveCyanDispatchHistory} from '../agent/delivery_fee_policy.mjs';
-import {readProviderPage,extractDeliveryFees} from './delivery_fee_extract.mjs';
+import {readProviderPage,extractDeliveryFees,verifyServiceSettlement} from './delivery_fee_extract.mjs';
 const id='3602371202674777015';
 const base={order_no:id,date:'2026-11-03',platform:'美团',status:'已完成',current_fee:0};
 const providers={maiyatian:{ok:true},cyanclouds:{ok:true}};
@@ -188,5 +188,39 @@ try{
 }finally{
   if(originalPerformance)Object.defineProperty(globalThis,'performance',originalPerformance);
   globalThis.XMLHttpRequest=originalXhr;globalThis.location=originalLocation;
+}
+{
+  const day='2026-11-20', next='2026-11-21';
+  const summary={date:next,description:'技术服务结算(1笔)',amount:'0.2'};
+  const row=['技术服务',id,'美团 #1','2026-11-21 00:14:00','已完成','0.20'];
+  const tech=verifyServiceSettlement(summary,[row]);
+  check(()=>assert.deepEqual(tech,[{order_no:id,settlement_date:next,cents:20}]));
+  check(()=>assert.throws(()=>verifyServiceSettlement({...summary,amount:'0.60'},[row]),/totals/));
+  check(()=>assert.throws(()=>verifyServiceSettlement({...summary,description:'技术服务结算(2笔)'},[row]),/Incomplete/));
+  check(()=>assert.throws(()=>verifyServiceSettlement(summary,[[...row.slice(0,4),'已取消','0.2']]),/status/));
+  check(()=>assert.throws(()=>verifyServiceSettlement(summary,[[...row.slice(0,5),'-0.2']]),/amount/));
+  const eligible={...base,date:day};
+  const fees=async provider=>provider==='maiyatian'?[paid('maiyatian',9.07)]:[];
+  const run=(order,reading,providerRead=fees,date=next)=>
+    extractDeliveryFees({date,orders:[order],pending:[order]},providerRead,reading);
+  const completed=await run(eligible,async (orders, date)=>{
+    assert.equal(orders[0].order_no,id);assert.equal(date,next);return tech;
+  });
+  check(()=>{assert.equal(completed.decisions[0].amount,9.27);assert.equal(completed.decisions[0].technical_service_fee,0.20);assert.equal(completed.pending.length,0);});
+  const again=await run({...eligible,current_fee:9.27,has_technical_service_fee:true},async()=>tech);
+  check(()=>{assert.equal(again.decisions[0].amount,9.27);assert.equal(again.decisions[0].changed,false);});
+  const late=await run(eligible,async()=>[]);
+  check(()=>{assert.equal(late.decisions[0].amount,9.07);assert.equal(late.pending.length,1);});
+  const failure=await run({...eligible,current_fee:9.27,has_technical_service_fee:true},async()=>{throw Error('timeout');});
+  check(()=>{assert.equal(failure.tech_service_settlement,'deferred');assert.equal(failure.decisions[0].state,'retained');});
+  const stale=await run({...eligible,current_fee:9.27,has_technical_service_fee:true},async()=>[],fees,'2026-11-29');
+  check(()=>{assert.equal(stale.tech_service_settlement,'not_needed');assert.equal(stale.decisions[0].state,'retained');assert.equal(stale.pending.length,0);});
+  const duplicate=await run(eligible,async()=>[...tech,...tech]);
+  check(()=>assert.equal(duplicate.decisions[0].state,'conflict'));
+  const manual=await run({...eligible,protected:true,current_fee:10.27},async()=>tech);
+  check(()=>{assert.equal(manual.tech_service_settlement,'not_needed');assert.equal(manual.decisions[0].changed,undefined);});
+  const other=async provider=>provider==='cyanclouds'?[paid('cyanclouds',3.21)]:[];
+  const switched=await run({...eligible,current_fee:9.27,has_technical_service_fee:true},async()=>tech,other);
+  check(()=>assert.equal(switched.decisions[0].state,'conflict'));
 }
 process.stdout.write(JSON.stringify({ok:true,cases,external_writes:0}));

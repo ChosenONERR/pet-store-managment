@@ -105,3 +105,37 @@ export function decideDeliveryFee(order, observations, providers) {
   return {state:'confirmed', amount:source.amount, provider:source.provider, delivery_id:source.delivery_id,
     changed:order.current_fee == null || Math.abs(Number(order.current_fee)-source.amount)>0.0049};
 }
+
+const maiyatianServiceStart = '2026-11-20';
+
+export function wantsMaiyatianServiceFee(decision, date) {
+  const oldest = new Date(Date.parse(date + 'T00:00:00Z') - 6 * 86400000).toISOString().slice(0, 10);
+  return decision.state === 'confirmed' && decision.provider === 'maiyatian' &&
+    decision.date >= maiyatianServiceStart && decision.date >= oldest && decision.date <= date;
+}
+
+export function includeMaiyatianServiceFee(order, decision, date, settlements) {
+  if (order.has_technical_service_fee && decision.state === 'confirmed' && decision.provider !== 'maiyatian') {
+    return {...decision, state:'conflict', changed:false, reason:'已有麦芽田技术服务费，与另一平台配送记录冲突，保留原费用'};
+  }
+  if (decision.state !== 'confirmed' || decision.provider !== 'maiyatian' || decision.date < maiyatianServiceStart) return decision;
+  const inWindow = wantsMaiyatianServiceFee(decision, date);
+  const matches = inWindow ? (settlements ?? []).filter(row =>
+    row.order_no === decision.order_no && row.settlement_date >= decision.date && row.settlement_date <= date
+  ) : [];
+  if (matches.length > 1) {
+    return {...decision, state:'conflict', changed:false, reason:'麦芽田同一订单有多笔技术服务费结算，保留原费用'};
+  }
+  if (matches.length === 1) {
+    const {cents, settlement_date} = matches[0];
+    if (!Number.isSafeInteger(cents) || cents <= 0) throw Error('Invalid technical service charge');
+    const amount = (Math.round(decision.amount * 100) + cents) / 100;
+    return {...decision, amount, technical_service_fee:cents / 100, technical_service_date:settlement_date,
+      changed:order.current_fee == null || Math.abs(Number(order.current_fee) - amount) > 0.0049};
+  }
+  // A temporarily unavailable bill must not erase a charge already recorded.
+  if (order.has_technical_service_fee || Number(order.current_fee) - decision.amount > 0.0049) {
+    return {...decision, state:'retained', changed:false, retry:inWindow, reason:'未核实技术服务结算，保留账上已有配送费用'};
+  }
+  return inWindow ? {...decision, retry:true} : decision;
+}
