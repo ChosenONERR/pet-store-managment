@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { businessDate, selectDeliveryOrders, decideDeliveryFee, resolveCyanDispatchHistory,
   wantsMaiyatianServiceFee, includeMaiyatianServiceFee } from '../agent/delivery_fee_policy.mjs';
@@ -17,8 +18,9 @@ async function evaluate(id, code) {
 
 // This function is serialized into a NEW background tab. Authentication stays
 // inside Chrome. Only allowlisted read endpoints are used; return a projection.
-export async function readProviderPage(provider, dates, ids, resolveHistory = resolveCyanDispatchHistory) {
+export async function readProviderPage(provider, dates, ids, resolveHistory = resolveCyanDispatchHistory, compareIds = []) {
   const wanted = new Set(ids);
+  const compare = new Set(compareIds);
   const output = [];
   const yuan = v => {
     if (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) || Number(v)<0) return null;
@@ -67,7 +69,7 @@ export async function readProviderPage(provider, dates, ids, resolveHistory = re
         if(!correctStore)throw Error('Store identity mismatch');
         const actualDate=provider==='maiyatian'?r.order_date:new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(Number(r.channelOrderTime)*1000));
         if(actualDate!==date)throw Error('Order date mismatch');
-        let delivery, amount, deliveryId, ambiguityReason, historyEvidence, ambiguous=false, final=false, cancelled=false;
+        let delivery, amount, deliveryId, ambiguityReason, historyEvidence, reviewableTip, dispatch, ambiguous=false, final=false, cancelled=false;
         if(provider==='maiyatian') {
           // Only the current COMPLETED dispatch is financial evidence. Old
           // cancelled attempts contain quotes, not additional paid amounts.
@@ -90,8 +92,20 @@ export async function readProviderPage(provider, dates, ids, resolveHistory = re
             // "配送费用" as delivery.send_fee / 100, even when discount_fee
             // is positive. Use that displayed charge; never subtract the
             // discount again. Other paid extras still require a bill check.
+            const tip=yuan(d?.tip ?? 0);
+            if (!ambiguous && deliveryId && all.filter(d=>Number(d.status)===50).length===1 &&
+                all.some(d=>Number(d.status)===50 && String(d.id)===deliveryId) &&
+                all.every(d=>[50,60].includes(Number(d.status)) && Number(d.cancel_fee ?? 0)===0) &&
+                yuan(d?.discount_fee ?? 0)!==null && yuan(d?.premium_fee ?? 0)!==null &&
+                Number(d?.damage_fee ?? 0)===0 && Number(d?.pre_tip ?? 0)===0 &&
+                tip!==null && tip===yuan(delivery?.tip ?? 0)) reviewableTip=tip;
             ambiguous ||= yuan(d?.discount_fee ?? 0)===null ||
               ['premium_fee','damage_fee','tip'].some(k=>Number(d?.[k] || 0)!==0) || Number(delivery?.tip || 0)!==0;
+            if (!ambiguous && reviewableTip===0 && Number(d?.cancel_fee ?? 0)===0) {
+              // Mai's delivery_no for Meituan is the merchant order ID, not
+              // a carrier waybill. Its internal dispatch ID isn't comparable.
+              dispatch={single_completed:true,carrier:String(d?.logistic_name ?? '').trim(),finished_at:Number(d?.finished_time)};
+            }
           }
         } else {
           delivery=r.orderDeliveryInfo;deliveryId=String(r.deliveryId || '');
@@ -108,13 +122,30 @@ export async function readProviderPage(provider, dates, ids, resolveHistory = re
               amount=resolved.amount;final=resolved.state==='complete';cancelled=resolved.state==='missing';
               historyEvidence=resolved.history;
             }
+          } else if (Number(r.shipCount)===1 && final && amount>0 && !ambiguous && compare.has(orderNo)) {
+            // Single-source billing does not need this detail. If comparison
+            // fails, withhold mirror evidence rather than lose the list read.
+            try {
+              const track=await request('/api/pc/delivery/progressTrack',new URLSearchParams({orderId:id}).toString());
+              const rounds=track.data?.deliveryList, round=rounds?.[0], waybills=round?.waybillList, bill=waybills?.[0];
+              if (track.code===0 && rounds?.length===1 && waybills?.length===1 && Number(round.status)===50 &&
+                  Number(bill.status)===50 && deliveryId && String(round.deliveryId)===deliveryId &&
+                  r.waybillId && String(r.waybillId)===String(bill.waybillId) && yuan(bill.actualDeliveryFee)===amount &&
+                  yuan(bill.cancelFee)===0 && ['totalExtFee','insuredFee','tipAmount','allowanceFee'].every(k=>yuan(bill[k] ?? 0)===0) &&
+                  yuan(delivery?.cancelFee ?? 0)===0) {
+                const completed=(bill.waybillTrackInfos ?? []).filter(evt=>Number(evt.status)===50);
+                if (completed.length===1) dispatch={single_completed:true,carrier:String(bill.serviceName ?? '').trim(),
+                  finished_at:Number(completed[0].ctime),carrier_waybill:String(bill.carrierDeliveryId ?? '')};
+              }
+            } catch { /* Without a verified history, do not infer a mirror. */ }
           }
           if(cancelled && amount>0)ambiguous=true;
         }
         output.push({provider,order_no:orderNo,delivery_id:deliveryId,
           state:ambiguous?'ambiguous':final&&amount>0?'complete':!delivery||amount===0||cancelled?'missing':'pending',
           amount:final?amount:null,date,
-          ...(ambiguityReason?{reason:ambiguityReason}:{}),...(historyEvidence?{history:historyEvidence}:{})});
+          ...(ambiguous&&reviewableTip!==undefined?{reviewable_tip:reviewableTip}:{}),
+          ...(ambiguityReason?{reason:ambiguityReason}:{}),...(historyEvidence?{history:historyEvidence}:{}),...(dispatch?{dispatch}:{})});
       }
       if(provider==='cyanclouds' && seen.size===expected){complete=true;break;}
       if(rows.length<20){if(expected!==null && seen.size!==expected)throw Error('Incomplete order list');complete=true;break;}
@@ -124,7 +155,7 @@ export async function readProviderPage(provider, dates, ids, resolveHistory = re
   return output;
 }
 
-async function readProvider(provider, dates, orders) {
+async function readProvider(provider, dates, orders, compareIds) {
   const url=provider==='maiyatian'?'https://saas.maiyatian.com/query/':'https://saas.cyanclouds.com/aggregator/saas/order#/historyOrder';
   const opened=await proxy('/new?url='+encodeURIComponent(url));
   if(!opened.targetId)throw Error('Cannot open query tab');
@@ -136,7 +167,7 @@ async function readProvider(provider, dates, orders) {
       await new Promise(r=>setTimeout(r,500));
     }
     if(!ready)throw Error('Query page unavailable or login required');
-    const result=await evaluate(opened.targetId,`(async()=>{try{return {ok:true,rows:await (${readProviderPage.toString()})(${JSON.stringify(provider)},${JSON.stringify(dates)},${JSON.stringify(orders.map(r=>r.order_no))},(${resolveCyanDispatchHistory.toString()}))};}catch{return {ok:false};}})()`);
+    const result=await evaluate(opened.targetId,`(async()=>{try{return {ok:true,rows:await (${readProviderPage.toString()})(${JSON.stringify(provider)},${JSON.stringify(dates)},${JSON.stringify(orders.map(r=>r.order_no))},(${resolveCyanDispatchHistory.toString()}),${JSON.stringify(compareIds)})};}catch{return {ok:false};}})()`);
     if(result?.ok!==true || !Array.isArray(result.rows))throw Error('Provider read incomplete');
     return result.rows;
   } finally {await proxy('/close?target='+encodeURIComponent(opened.targetId)).catch(()=>{});}
@@ -228,7 +259,8 @@ export async function extractDeliveryFees(input, reader = readProvider, serviceR
   const providers={},observations=[];
   for(const provider of ['maiyatian','cyanclouds']){
     if(!queried.length){providers[provider]={ok:true};continue;}
-    try{observations.push(...await reader(provider,dates,queried));providers[provider]={ok:true};}
+    const compareIds=observations.filter(r=>r.provider==='maiyatian' && r.state==='complete' && r.dispatch && r.amount>0).map(r=>r.order_no);
+    try{observations.push(...await reader(provider,dates,queried,compareIds));providers[provider]={ok:true};}
     catch{providers[provider]={ok:false,error:'查询未完成，请检查该平台登录及订单页面；原费用保持不动'};}
   }
   const baseDecisions=candidates.map(r=>({order_no:r.order_no,date:businessDate(r.date),...(r.confirmed_self?{state:'protected',reason:'已人工确认自配送'}:decideDeliveryFee(r,observations,providers))}));
@@ -238,7 +270,19 @@ export async function extractDeliveryFees(input, reader = readProvider, serviceR
     try {settlements=await serviceReader(serviceOrders,input.date);serviceSettlementStatus='read';}
     catch {serviceSettlementStatus='deferred';}
   }
-  const decisions=baseDecisions.map((row,i)=>includeMaiyatianServiceFee(candidates[i],row,input.date,settlements));
+  const decisions=baseDecisions.map((row,i)=>{
+    const d=includeMaiyatianServiceFee(candidates[i],row,input.date,settlements);
+    if (d.state==='conflict') {
+      // Ignore query time, batch composition, and API row order. Retain actual
+      // fee, waybill and settlement evidence, so new evidence can prompt again.
+      const evidence=observations.filter(r=>r.order_no===d.order_no).map(r=>JSON.stringify([
+        r.provider,r.state,r.delivery_id,r.amount,r.reviewable_tip,r.dispatch,r.history,r.reason
+      ])).sort();
+      const receipt=(settlements ?? []).filter(r=>r.order_no===d.order_no).map(r=>`${r.settlement_date}:${r.cents}`).sort();
+      d.conflict_key=createHash('sha256').update(JSON.stringify([d.order_no,d.reason,candidates[i].current_fee,evidence,receipt])).digest('hex');
+    }
+    return d;
+  });
   return {ok:true,candidate_count:candidates.length,queried_count:queried.length,providers,tech_service_settlement:serviceSettlementStatus,decisions,
     pending:decisions.filter(r=>r.retry || r.state==='conflict').map(r=>({order_no:r.order_no,date:r.date}))};
 }

@@ -76,20 +76,52 @@ export function resolveCyanDispatchHistory(order, history) {
   return {state:'complete',amount:paid.amount/100,history:evidence};
 }
 
+function sameMeituanDispatch(mai, cyan) {
+  const a=mai.dispatch, b=cyan.dispatch;
+  const meituanRunner = name => /^(?:美团跑腿|美团跑腿帮送)$/.test(name ?? '');
+  return a && b && meituanRunner(a.carrier) && meituanRunner(b.carrier) &&
+    a.single_completed === true && b.single_completed === true &&
+    !a.separate_charge && !b.separate_charge &&
+    (!a.carrier_waybill || !b.carrier_waybill || a.carrier_waybill===b.carrier_waybill) &&
+    Math.round(mai.amount*100)===Math.round(cyan.amount*100) &&
+    [a.finished_at,b.finished_at].every(t=>Number.isSafeInteger(t) && t>0) &&
+    Math.abs(a.finished_at-b.finished_at)<=30;
+}
+
 export function decideDeliveryFee(order, observations, providers) {
   const rows = observations.filter(r => r.order_no === order.order_no);
   const positive = [];
   let awaitingDispatch = false;
+  let manualMaiyatian = null;
   for (const provider of ['maiyatian', 'cyanclouds']) {
     const found = rows.filter(r => r.provider === provider);
     if (!providers[provider]?.ok) return {state:'deferred', retry:true, reason:`${provider}查询失败，保留原费用并后台重试`};
-    if (found.length > 1) return {state:'conflict',reason:'配送记录不唯一或有多次派送/附加费用，需核对'};
+    if (found.length > 1) return {state:'conflict',reason:'同一平台返回多条配送订单，无法确认哪笔实际扣款'};
     const row = found[0];
-    if (row?.state==='ambiguous') return {state:'conflict',reason:row.reason || '配送记录不唯一或有多次派送/附加费用，需核对'};
+    if (row?.state==='ambiguous') {
+      if (provider==='maiyatian' && order.protected && order.confirmed_manual &&
+          Number(order.current_fee)>0 && Number.isFinite(row.amount) && row.amount>0 &&
+          Number.isFinite(row.reviewable_tip) && row.reviewable_tip>=0) {
+        manualMaiyatian = row;
+        continue;
+      }
+      return {state:'conflict',reason:row.reason || (provider==='maiyatian'?'麦芽田':'青云聚信')+'配送记录或附加费用尚未确认实扣'};
+    }
     if (row?.state === 'complete' && Number.isFinite(row.amount) && row.amount > 0) positive.push(row);
     else if (row && row.state !== 'missing') awaitingDispatch = true;
   }
-  if (positive.length > 1) return {state:'conflict',reason:'两个平台都有实际配送费，不自动相加或覆盖'};
+  if (manualMaiyatian) {
+    if (positive.length || awaitingDispatch) return {state:'conflict',reason:'麦芽田已完成配送，另一平台仍有实付或未结清的派送记录'};
+    return {state:'conflict',reason:'麦芽田配送及小费已查到，需核对结算流水是否与人工确认总额一致',
+      manual_fee_review: {delivery_fee:manualMaiyatian.amount, tip:manualMaiyatian.reviewable_tip}};
+  }
+  if (positive.length > 1) {
+    const [mai,cyan]=positive;
+    const reason=`麦芽田显示 ¥${mai.amount.toFixed(2)}、青云聚信显示 ¥${cyan.amount.toFixed(2)}`;
+    return sameMeituanDispatch(mai,cyan)
+      ? {state:'conflict',reason,mirror_review:{delivery_fee:mai.amount,delivery_id:mai.delivery_id}}
+      : {state:'conflict',reason:`${reason}；配送记录不足以确认是同一趟`};
+  }
   const source = positive[0];
   if (order.protected) {
     if (source && Math.abs(Number(order.current_fee) - source.amount) > 0.0049) return {state:'conflict',reason:'平台实付与人工确认费用不一致，保留人工值'};
@@ -110,11 +142,51 @@ const maiyatianServiceStart = '2026-11-20';
 
 export function wantsMaiyatianServiceFee(decision, date) {
   const oldest = new Date(Date.parse(date + 'T00:00:00Z') - 6 * 86400000).toISOString().slice(0, 10);
-  return decision.state === 'confirmed' && decision.provider === 'maiyatian' &&
+  return ((decision.state === 'confirmed' && decision.provider === 'maiyatian') || decision.manual_fee_review || decision.mirror_review) &&
     decision.date >= maiyatianServiceStart && decision.date >= oldest && decision.date <= date;
 }
 
 export function includeMaiyatianServiceFee(order, decision, date, settlements) {
+  if (decision.mirror_review) {
+    const entries=(wantsMaiyatianServiceFee(decision,date) ? (settlements ?? []) : []).filter(row=>
+      row.order_no===decision.order_no && row.settlement_date>=decision.date && row.settlement_date<=date);
+    const {mirror_review:match,...base}=decision;
+    const conflict=reason=>({...base,state:'conflict',changed:false,reason:`${base.reason}；${reason}`});
+    if (entries.length>1) return conflict('麦芽田有多笔技术服务费结算，不能确认实际扣款');
+    if (!entries.length || !Number.isSafeInteger(entries[0].cents) || entries[0].cents<=0) {
+      return conflict('两边完单相符，但未核实麦芽田该单的唯一技术服务费扣款');
+    }
+    const amount=(Math.round(match.delivery_fee*100)+entries[0].cents)/100;
+    const recorded=Number(order.current_fee);
+    if ((order.protected && Math.abs(recorded-amount)>0.0049) || recorded-amount>0.0049) {
+      return conflict(`麦芽田配送与服务费合计 ¥${amount.toFixed(2)}，与账上 ¥${recorded.toFixed(2)} 不一致`);
+    }
+    return {...base,state:order.protected?'protected':'confirmed',amount,provider:'maiyatian',delivery_id:match.delivery_id,
+      technical_service_fee:entries[0].cents/100,technical_service_date:entries[0].settlement_date,
+      cross_platform_mirror:true,reason:'同一趟美团跑腿，按麦芽田配送与技术服务费计一次',
+      changed:!order.protected && (order.current_fee==null || Math.abs(recorded-amount)>0.0049)};
+  }
+  if (decision.manual_fee_review) {
+    const inWindow=wantsMaiyatianServiceFee(decision,date);
+    const entries=(inWindow ? (settlements ?? []) : []).filter(row=>row.order_no===decision.order_no &&
+      row.settlement_date>=decision.date && row.settlement_date<=date);
+    const {delivery_fee,tip}=decision.manual_fee_review;
+    const observedCents=Math.round(delivery_fee*100)+Math.round(tip*100);
+    const recorded=Number(order.current_fee);
+    if (entries.length > 1) return {...decision,reason:'同一订单出现多笔麦芽田技术服务费结算，无法确认是否重复扣费'};
+    if (entries.length===0) {
+      // An unavailable ledger is not evidence that the owner-confirmed fee
+      // changed. Retry silently unless already-visible charges exceed it.
+      return observedCents<=Math.round(recorded*100)
+        ? {...decision,state:'protected',reason:'账上已人工确认，当前没有新增扣款冲突，流水仍会后台复查',changed:false,retry:inWindow}
+        : {...decision,reason:'麦芽田配送及小费已达 ¥'+(observedCents/100).toFixed(2)+'，超过账上人工确认的 ¥'+recorded.toFixed(2)};
+    }
+    if (!Number.isSafeInteger(entries[0].cents) || entries[0].cents<=0) return decision;
+    const total=(observedCents+entries[0].cents)/100;
+    return Math.abs(total-recorded)<0.0049
+      ? {...decision,state:'protected',reason:'平台结算与人工确认金额一致',changed:false}
+      : {...decision,reason:'麦芽田实扣合计 ¥'+total.toFixed(2)+'，与账上人工确认的 ¥'+recorded.toFixed(2)+' 不一致'};
+  }
   if (order.has_technical_service_fee && decision.state === 'confirmed' && decision.provider !== 'maiyatian') {
     return {...decision, state:'conflict', changed:false, reason:'已有麦芽田技术服务费，与另一平台配送记录冲突，保留原费用'};
   }

@@ -94,6 +94,14 @@ try{
     respond=u=>u.pathname==='/order/detail/'?{errno:1,data:{source_id:id,delivery:{id:'123',status:50,send_fee:678,...extra}}}:{errno:1,data:[row]};
     result=await readProviderPage('maiyatian',['2026-11-03'],[id]);assert.equal(result[0].state,'ambiguous');cases++;
   }
+  for(const cancelFee of [0,200]) {
+    respond=u=>u.pathname==='/order/detail/'
+      ? {errno:1,data:{source_id:id,delivery:{id:'123',status:50,send_fee:907,tip:100,premium_fee:200,damage_fee:0,pre_tip:0}}}
+      : {errno:1,data:[{...row,delivery:{...row.delivery,send_fee:907,tip:100},
+        deliveries:[row.deliveries[0],{...row.deliveries[1],cancel_fee:cancelFee}]}]};
+    result=await readProviderPage('maiyatian',['2026-11-03'],[id]);
+    check(()=>{assert.equal(result[0].state,'ambiguous');assert.equal(result[0].reviewable_tip,cancelFee===0?1:undefined);});
+  }
   respond=()=>({errno:1,data:[{...row,delivery:{id:'123',status:20,send_fee:678}}]});
   result=await readProviderPage('maiyatian',['2026-11-03'],[id]);assert.equal(result[0].state,'pending');assert.equal(result[0].amount,null);cases++;
   respond=()=>({errno:1,data:[{...row,order_date:'2026-11-02'}]});
@@ -103,6 +111,21 @@ try{
   const qyRow={orderId:'201',channelOrderId:id,channelShopName:'宠速星宠物用品店（环常南路店）',channelOrderTime:1793685600,deliveryStatus:50,deliveryId:'321',shipCount:1,orderDeliveryInfo:{actualDeliveryFee:451,deliveryFee:557,discountFee:106,totalExtFee:0,tipFee:0,insuredFee:0}};
   respond=(u,b)=>({code:0,data:{total:1,pageNum:Number(new URLSearchParams(b).get('pageNum')),dataList:[qyRow]}});
   result=await readProviderPage('cyanclouds',['2026-11-03'],[id]);assert.equal(result[0].amount,4.51);assert.equal(result[0].state,'complete');cases++;
+  const comparisonRow={...qyRow,waybillId:'paid-waybill'};
+  const completedBill={waybillId:'paid-waybill',carrierDeliveryId:'carrier-id',status:50,actualDeliveryFee:451,
+    cancelFee:0,totalExtFee:0,tipAmount:0,serviceName:'美团跑腿',waybillTrackInfos:[{ctime:1793686200,status:50}]};
+  for (const variant of ['valid','extra','another-bill','wrong-bill','failed']) {
+    const waybillList=[{...completedBill,...(variant==='extra'?{cancelFee:200}:variant==='wrong-bill'?{waybillId:'other'}:{})}];
+    if (variant==='another-bill') waybillList.push({...completedBill,waybillId:'other'});
+    respond=u=>u.pathname==='/api/pc/delivery/progressTrack'
+      ? variant==='failed'?{code:1}:{code:0,data:{deliveryList:[{deliveryId:'321',status:50,waybillList}]}}
+      : {code:0,data:{total:1,pageNum:1,dataList:[comparisonRow]}};
+    result=await readProviderPage('cyanclouds',['2026-11-03'],[id],resolveCyanDispatchHistory,[id]);
+    check(()=>{
+      assert.equal(result[0].state,'complete');
+      assert.deepEqual(result[0].dispatch,variant==='valid'?{single_completed:true,carrier:'美团跑腿',finished_at:1793686200,carrier_waybill:'carrier-id'}:undefined);
+    });
+  }
   respond=()=>({code:0,data:{total:1,pageNum:1,dataList:[{...qyRow,shipCount:2}]}});
   result=await readProviderPage('cyanclouds',['2026-11-03'],[id]);assert.equal(result[0].state,'ambiguous');cases++;
   // Regression: two send rounds are not two charges. Cancelled waybills still
@@ -222,5 +245,49 @@ try{
   const other=async provider=>provider==='cyanclouds'?[paid('cyanclouds',3.21)]:[];
   const switched=await run({...eligible,current_fee:9.27,has_technical_service_fee:true},async()=>tech,other);
   check(()=>assert.equal(switched.decisions[0].state,'conflict'));
+  const manualOrder={...eligible,current_fee:10.27,protected:true,confirmed_manual:true};
+  const manualSource={...paid('maiyatian',9.07),state:'ambiguous',reviewable_tip:1};
+  const reviewed=async provider=>provider==='maiyatian'?[manualSource]:[];
+  const matched=await run(manualOrder,async()=>tech,reviewed);
+  check(()=>{assert.equal(matched.decisions[0].state,'protected');assert.equal(matched.decisions[0].changed,false);assert.equal(matched.pending.length,0);});
+  const newFee=await run(manualOrder,async()=>[{...tech[0],cents:40}],reviewed);
+  check(()=>{assert.equal(newFee.decisions[0].state,'conflict');assert.match(newFee.decisions[0].reason,/10\.47.*10\.27/);});
+  const missing=await run(manualOrder,async()=>[],reviewed);
+  check(()=>{assert.equal(missing.decisions[0].state,'protected');assert.equal(missing.decisions[0].changed,false);assert.equal(missing.pending.length,1);});
+  const baseConflict=await run({...manualOrder,current_fee:9.07},async()=>[],reviewed);
+  check(()=>{assert.equal(baseConflict.decisions[0].state,'conflict');assert.match(baseConflict.decisions[0].reason,/10\.07.*9\.07/);});
+  const duplicateBill=await run(manualOrder,async()=>[...tech,...tech],reviewed);
+  check(()=>assert.equal(duplicateBill.decisions[0].state,'conflict'));
+  const imported=await run({...manualOrder,confirmed_manual:false},async()=>tech,reviewed);
+  check(()=>assert.equal(imported.decisions[0].state,'conflict'));
+  const twoProviders=await run(manualOrder,async()=>tech,async provider=>provider==='maiyatian'?[manualSource]:[paid('cyanclouds',3.21)]);
+  check(()=>assert.equal(twoProviders.decisions[0].state,'conflict'));
+
+  const mirrorMai={...paid('maiyatian',4.10),dispatch:{carrier:'美团跑腿',finished_at:1795310813,single_completed:true}};
+  const mirrorCyan={...paid('cyanclouds',4.10),dispatch:{carrier:'美团跑腿',finished_at:1795310825,single_completed:true,carrier_waybill:'carrier-id'}};
+  const compare=(mai=mirrorMai,cyan=mirrorCyan)=>async (provider,_dates,_orders,compareIds)=>{
+    if(provider==='maiyatian')return [mai];
+    assert.deepEqual(compareIds,mai.state==='complete'?[id]:[]);return [cyan];
+  };
+  const reconcile=await run({...eligible,current_fee:4.10},async()=>tech,compare());
+  check(()=>{const d=reconcile.decisions[0];assert.equal(d.amount,4.30);assert.equal(d.changed,true);assert.equal(d.cross_platform_mirror,true);assert.equal(d.provider,'maiyatian');assert.equal(reconcile.pending.length,0);});
+  const noSecondCharge=await run({...eligible,protected:true,current_fee:4.30},async()=>tech,compare());
+  check(()=>{assert.equal(noSecondCharge.decisions[0].state,'protected');assert.equal(noSecondCharge.decisions[0].changed,false);assert.equal(noSecondCharge.pending.length,0);});
+  const neverLower=await run({...eligible,current_fee:8.20},async()=>tech,compare());
+  check(()=>{assert.equal(neverLower.decisions[0].state,'conflict');assert.match(neverLower.decisions[0].reason,/4\.30.*8\.20/);});
+  for(const missingProof of [[],[{...tech[0],order_no:'3602371202674777016'}],[...tech,...tech],[{...tech[0],cents:0}]]) {
+    const review=await run(eligible,async()=>missingProof,compare());
+    check(()=>{assert.equal(review.decisions[0].state,'conflict');assert.match(review.decisions[0].conflict_key,/^[a-f0-9]{64}$/);assert.equal(review.pending.length,1);});
+  }
+  for(const patch of [{carrier:'顺丰快送'},{finished_at:1795310844},{finished_at:null},{single_completed:false},{separate_charge:true}]) {
+    const review=await run(eligible,async()=>{throw Error('Should not read wallet without matching deliveries');},compare(mirrorMai,{...mirrorCyan,dispatch:{...mirrorCyan.dispatch,...patch}}));
+    check(()=>{assert.equal(review.decisions[0].state,'conflict');assert.equal(review.tech_service_settlement,'not_needed');});
+  }
+  const differentCarrierId=await run(eligible,async()=>tech,compare({...mirrorMai,dispatch:{...mirrorMai.dispatch,carrier_waybill:'different-carrier-id'}}));
+  check(()=>assert.equal(differentCarrierId.decisions[0].state,'conflict'));
+  const sameConflict=await run({...eligible,current_fee:8.20},async()=>tech,compare(),'2026-11-23');
+  check(()=>assert.equal(sameConflict.decisions[0].conflict_key,neverLower.decisions[0].conflict_key));
+  const newEvidence=await run({...eligible,current_fee:8.20},async()=>tech,compare(mirrorMai,{...mirrorCyan,amount:4.11}));
+  check(()=>{assert.equal(newEvidence.decisions[0].state,'conflict');assert.notEqual(newEvidence.decisions[0].conflict_key,neverLower.decisions[0].conflict_key);});
 }
 process.stdout.write(JSON.stringify({ok:true,cases,external_writes:0}));

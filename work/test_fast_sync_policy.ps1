@@ -16,6 +16,17 @@ $incrementalFunctionAst = @($ast.FindAll({ param($node) $node -is [Management.Au
 if ($incrementalFunctionAst.Count -ne 1) { throw 'Expected exactly one Test-UseIncrementalChangePath function' }
 Invoke-Expression $incrementalFunctionAst[0].Extent.Text
 
+$refundNoticeFunction=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-ResolvedCancelledRefundObservation'},$true)
+if ($null -eq $refundNoticeFunction) { throw 'Missing resolved-refund notice guard' }
+Invoke-Expression $refundNoticeFunction.Extent.Text
+$cancelledObservation=[pscustomobject]@{state='completed';platform_order_status='已取消';ledger_order_status='已取消';refund_amount=0;item_count=0}
+if (-not (Test-ResolvedCancelledRefundObservation $cancelledObservation)) { throw 'Cancelled non-income order should not create a refund warning' }
+foreach($change in @(@{state='pending'},@{state='unknown'},@{platform_order_status='已完成'},@{ledger_order_status='已完成'},@{refund_amount=2},@{item_count=1},@{refund_amount=$null})){
+    $candidate=$cancelledObservation.PSObject.Copy()
+    foreach($key in $change.Keys){$candidate.$key=$change[$key]}
+    if (Test-ResolvedCancelledRefundObservation $candidate) { throw 'A still-actionable or incomplete refund was silenced' }
+}
+
 $unchangedOrder = [pscustomobject]@{
     ok=$true;data_changed=$false;change_details=[pscustomobject]@{summary=$false;items=$false;interventions=$false}
     new_item_order_nos=@();changed_order_nos=@();affected_months=@();newly_detected_refunds=0;pending_refund_items=0;applied_refund_details=@();refund_observation_count=0;refund_observation_details=@()

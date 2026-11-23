@@ -88,6 +88,7 @@ try {
         $protected=$note -match '人工确认配送费' -or $overrides.ContainsKey($id) -or
           ($null -ne $fee -and [string]$fee -ne '' -and [double]$fee -gt 0 -and ($null -eq $auto -or [math]::Abs([double]$fee-$auto) -gt 0.0049))
         $record=[pscustomobject]@{order_no=$id;date=$day;platform='美团';status=[string](Get-DeliveryCell $r 3);intervention=$interventions.ContainsKey($id);current_fee=$(if([string]$fee -eq ''){$null}else{[double]$fee});protected=[bool]$protected;confirmed_self=($note -match '人工确认配送费：?\s*0(?:\.0+)?元');has_technical_service_fee=($note -match '(?:^|[；;])麦芽田技术服务费：\d+(?:\.\d+)?元（结算\d{4}-\d{2}-\d{2}）');row=($i+2);note=$note;auto_fee=$auto;manual_migration=$false}
+        $record | Add-Member -NotePropertyName confirmed_manual -NotePropertyValue ($note -match '(?:^|[；;])人工确认配送费：?\s*\d+(?:\.\d+)?\s*元')
         if($overrides.ContainsKey($id)){$record.current_fee=[double]$overrides[$id].delivery_fee;if($record.current_fee -eq 0){$record.confirmed_self=$true}}
         $orders.Add($record);$byId[$id]=$record
         if(-not $record.intervention -and $record.status -notmatch '取消'){$monthKeys[$day.Substring(0,7)]=$true}

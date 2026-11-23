@@ -550,6 +550,7 @@ foreach ($order in @($extract.orders)) {
     $manualDeliveryMarker = $null
     $automaticDelivery = $null
     $automaticDeliveryMarker = $null
+    $technicalDeliveryMarker = $null
     if ($existingSummary -and $existingSummary.Note -match '人工确认配送费：?\s*(\d+(?:\.\d+)?)\s*元?') {
         $manualDelivery = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture)
         $manualDeliveryMarker = "人工确认配送费：$($manualDelivery.ToString('0.00',[Globalization.CultureInfo]::InvariantCulture))元"
@@ -563,6 +564,10 @@ foreach ($order in @($extract.orders)) {
             $manualDeliveryMarker = "人工确认配送费：$($manualDelivery.ToString('0.00',[Globalization.CultureInfo]::InvariantCulture))元"
             $automaticDeliveryMarker = $null
         }
+    }
+    if ($automaticDeliveryMarker -and $automaticDeliveryMarker.StartsWith('自动配送费[maiyatian:') -and
+        $existingSummary.Note -match '(?:^|[；;])(麦芽田技术服务费：\d+(?:\.\d+)?元（结算\d{4}-\d{2}-\d{2}）)') {
+        $technicalDeliveryMarker = $Matches[1]
     }
     $refundAccounting = $refundAccountingByOrder[[string]$order.orderNo]
     $refundEvents = @($refundAccounting.events)
@@ -621,7 +626,7 @@ foreach ($order in @($extract.orders)) {
         ItemCount = $itemCount
         Source = '美团订单页'
         SyncTime = $syncTime
-        Note = ((@("原始状态：$($order.rawStatus)",$manualDeliveryMarker,$automaticDeliveryMarker,$actualOverrideNote) + $refundNoteParts | Where-Object { $_ }) -join '；')
+        Note = ((@("原始状态：$($order.rawStatus)",$manualDeliveryMarker,$automaticDeliveryMarker,$technicalDeliveryMarker,$actualOverrideNote) + $refundNoteParts | Where-Object { $_ }) -join '；')
         DailyOrderNo = if ($order.dailyOrderNo) { "美团$($order.dailyOrderNo)号单" } else { $null }
         SortKey = "$($order.orderDate) $($order.orderTime)|$($order.orderNo)"
     }
@@ -945,11 +950,14 @@ foreach ($target in $verifyTargets) {
 
 $refundObservationDetails = @($extract.orders | ForEach-Object {
     $order = $_
+    $accountedOrder = $summaryById[[string]$order.orderNo]
     foreach ($observation in @($order.refundObservations)) {
         [pscustomobject]@{
             order_no = [string]$order.orderNo
             daily_order_no = $order.dailyOrderNo
             record_id = [string]$observation.recordId
+            platform_order_status = [string]$order.status
+            ledger_order_status = [string]$accountedOrder.Status
             state = [string]$observation.state
             status_text = [string]$observation.statusText
             refund_amount = if ($null -eq $observation.amount) { 0.0 } else { [double]$observation.amount }

@@ -38,6 +38,7 @@ $integrityAuditScript = Join-Path $workRoot 'audit_finance_integrity.ps1'
 $ledgerMetaPath = Join-Path $workRoot 'daily_ledger_meta.json'
 $larkIdentityCachePath = Join-Path $stateRoot 'lark_user_identity.json'
 $failureNotificationRoot = Join-Path $stateRoot 'failure_notifications'
+$deliveryAlertReceiptsPath = Join-Path $stateRoot 'delivery_fee_alert_receipts.json'
 $interactivePriorityPath = Join-Path $stateRoot 'interactive_priority.json'
 $promotionCaptureScript = Join-Path $projectRoot 'agent\sync_promotion_expense.ps1'
 $promotionAutomationStartDate = [datetime]'2026-09-23'
@@ -180,6 +181,37 @@ function Get-TextFingerprint([string]$Value) {
     } finally {
         $sha.Dispose()
     }
+}
+
+function Get-NewDeliveryConflicts($Conflicts, [hashtable]$Receipts) {
+    $seen = @{}
+    foreach ($conflict in $Conflicts) {
+        if (-not $Receipts.ContainsKey($conflict.key) -and -not $seen.ContainsKey($conflict.key)) {
+            $seen[$conflict.key] = $true
+            $conflict
+        }
+    }
+}
+
+function Read-DeliveryAlertReceipts([string]$Path) {
+    $receipts = @{}
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        $saved = [IO.File]::ReadAllText($Path,[Text.Encoding]::UTF8) | ConvertFrom-Json
+        if ($null -eq $saved -or -not $saved.PSObject.Properties['keys']) { throw '配送费提醒去重记录格式无效' }
+        foreach ($key in $saved.keys) {
+            if ($key -notmatch '^\d{16,22}:(?:[0-9a-f]{64}|[0-9a-f]{12})$') { throw '配送费提醒去重记录格式无效' }
+            $receipts[[string]$key] = $true
+        }
+    }
+    return $receipts
+}
+
+function Save-DeliveryAlertReceipts([string]$Path, [hashtable]$Receipts, $Alerts, $SendReceipt) {
+    if (-not $SendReceipt.sent -or $SendReceipt.dry_run) { return }
+    foreach ($alert in $Alerts) { $Receipts[$alert.key] = $true }
+    $temporary = "$Path.$PID.tmp"
+    [IO.File]::WriteAllText($temporary, (@{keys=@($Receipts.Keys | Sort-Object)} | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $temporary -Destination $Path -Force
 }
 
 function Get-FailureNotificationCategory([string]$Reason) {
@@ -658,6 +690,17 @@ function Assert-FormulaRange([string]$SheetName, [string]$Range) {
         $result = Invoke-LarkJson { lark-cli sheets +formula-verify --as user --spreadsheet-token $spreadsheetToken --sheet-name $SheetName --range $continuousRange --format json --exit-on-error } "公式校验调用失败：$SheetName $continuousRange"
         if ($result.data.status -ne 'success') { throw "公式存在错误：$SheetName $continuousRange" }
     }
+}
+
+function Test-ResolvedCancelledRefundObservation($Observation) {
+    if ($null -eq $Observation) { return $false }
+    foreach ($name in @('state','platform_order_status','ledger_order_status','refund_amount','item_count')) {
+        if ($null -eq $Observation.PSObject.Properties[$name]) { return $false }
+    }
+    return ($Observation.state -eq 'completed' -and
+        $Observation.platform_order_status -eq '已取消' -and $Observation.ledger_order_status -eq '已取消' -and
+        $null -ne $Observation.refund_amount -and [double]$Observation.refund_amount -eq 0 -and
+        $null -ne $Observation.item_count -and [int]$Observation.item_count -eq 0)
 }
 
 function Get-DeliveryFeeFailureWarning([string]$Reason) {
@@ -1477,6 +1520,7 @@ $deliveryOnlyChange = $false
 $executionPath = 'full'
 $executionPathReason = $null
 $syncWarnings = [Collections.Generic.List[string]]::new()
+$deliveryConflicts = [Collections.Generic.List[object]]::new()
 $operationalDegraded = $false
 $nightRecoveryRequired = $false
 try {
@@ -1541,13 +1585,14 @@ try {
                 $syncWarnings.Add("退款待确认：订单 $($pendingRefund.order_no)｜$($pendingRefund.goods_code)×$($pendingRefund.quantity)｜顾客退款 ¥$($pendingRefund.refund_amount)；收入已扣减，货物成本暂保留。请告诉经营管家商品是‘已退回入库’、‘未退货’还是‘退回报损’。")
             }
             foreach ($refundObservation in @($orderResult.refund_observation_details)) {
+                if (Test-ResolvedCancelledRefundObservation $refundObservation) { continue }
                 $dailyLabel = if ($refundObservation.daily_order_no) { "美团$($refundObservation.daily_order_no)号单" } else { "订单 $($refundObservation.order_no)" }
                 $statusText = if ($refundObservation.status_text) { [string]$refundObservation.status_text } else { '平台未返回可识别状态文字' }
                 if ([string]$refundObservation.state -eq 'pending') {
-                    $syncWarnings.Add("退款状态观察：$dailyLabel（$($refundObservation.order_no)）检测到退货/退款仍在处理中，当前未改收入、成本或库存；后续每小时及00:00会继续核对。平台状态：$statusText。")
+                    $syncWarnings.Add("退款状态观察：$dailyLabel（$($refundObservation.order_no)）还在处理中，账上未改；暂不用操作，系统会继续复查。平台状态：$statusText。")
                 } else {
                     $operationalDegraded = $true
-                    $syncWarnings.Add("退款识别待核对：$dailyLabel（$($refundObservation.order_no)）存在退款记录，但完成状态或退款金额不足以安全改账；本次未改收入、成本或库存，请人工查看美团售后状态。平台状态：$statusText。")
+                    $syncWarnings.Add("退款识别待核对：$dailyLabel（$($refundObservation.order_no)）平台显示「$statusText」，账上尚未扣这笔退款。请核对美团售后详情的最终状态和实际退款金额。")
                 }
             }
         }
@@ -1588,7 +1633,8 @@ try {
             }
             foreach ($decision in @($deliveryFeeResult.decisions)) {
                 if ($decision.state -eq 'conflict') {
-                    $syncWarnings.Add("配送费待核对：订单 $($decision.order_no)｜$($decision.reason)。已有费用保持不动，请核对金额冲突。")
+                    $evidenceKey = if ($decision.PSObject.Properties['conflict_key'] -and $decision.conflict_key -match '^[0-9a-f]{64}$') { $decision.conflict_key } else { Get-TextFingerprint $decision.reason }
+                    $deliveryConflicts.Add([pscustomobject]@{ key="$($decision.order_no):$evidenceKey"; text="配送费待核对：订单 $($decision.order_no)｜$($decision.reason)。账上金额未改；请核对配送平台的实际扣款，不要按派送次数补录。" })
                 }
             }
             if (@($deliveryFeeResult.changed_order_nos).Count -gt 0 -and -not $DryRun) {
@@ -1775,12 +1821,27 @@ try {
         $refundAlertResult = $alertStage.value
     }
     $deliveryAlertResult = $null
-    $deliveryAlerts = @($syncWarnings | Where-Object { $_ -match '^配送费(?:待核对|已补录)：' })
-    if ($Silent -and $deliveryAlerts.Count -gt 0) {
-        $deliveryAlertText = "🚚 配送费核对与补录`n" + (($deliveryAlerts | Select-Object -First 12) -join "`n")
-        $deliveryAlertKey = "petstar-delivery-alert-$(Get-TextFingerprint ($deliveryAlerts -join '|'))"
+    $deliveryConflictsToSend = @()
+    $deliveryReceiptsError = $null
+    if ($deliveryConflicts.Count -gt 0) {
+        try {
+            $deliveryReceipts = Read-DeliveryAlertReceipts $deliveryAlertReceiptsPath
+            $deliveryConflictsToSend = @(Get-NewDeliveryConflicts $deliveryConflicts $deliveryReceipts | Sort-Object key | Select-Object -First 12)
+        } catch { $deliveryReceiptsError = '无法读取配送费提醒去重记录，暂缓逐单提醒；未影响账目和后台复查' }
+    }
+    $deliveryAlerts = @($deliveryConflictsToSend | ForEach-Object { $_.text })
+    if ($Silent -and $deliveryAlerts.Count -lt 12) {
+        $deliveryAlerts += @($syncWarnings | Where-Object { $_ -match '^配送费已补录：' } | Select-Object -First (12 - $deliveryAlerts.Count))
+    }
+    if ($deliveryAlerts.Count -gt 0) {
+        $deliveryAlertText = "🚚 配送费核对与补录`n" + ($deliveryAlerts -join "`n")
+        $deliveryAlertKey = "petstar-delivery-alert-$(Get-TextFingerprint ((@($deliveryConflictsToSend | ForEach-Object { $_.key }) + $deliveryAlerts) -join '|'))"
         $alertStage = Invoke-WithRetry 'delivery_fee_alert' { Send-FeishuMessage $deliveryAlertText $null $deliveryAlertKey } 2
         $deliveryAlertResult = $alertStage.value
+        if ($deliveryConflictsToSend.Count -gt 0) {
+            try { Save-DeliveryAlertReceipts $deliveryAlertReceiptsPath $deliveryReceipts $deliveryConflictsToSend $deliveryAlertResult }
+            catch { $deliveryReceiptsError = '配送费提醒已发送，但未保存去重记录；未影响账目' }
+        }
     }
     $priorDayNotifications = @()
     foreach ($report in $priorDayReports) {
@@ -1822,6 +1883,7 @@ try {
         order_sync = $orderResult
         delivery_fee_sync = $deliveryFeeResult
         delivery_fee_alert = $deliveryAlertResult
+        delivery_fee_alert_receipt_error = $deliveryReceiptsError
         inventory_sync = $inventoryResult
         pending_gift_reconciliation = $giftReconcileResult
         pending_gift_alert = $giftAlertResult
