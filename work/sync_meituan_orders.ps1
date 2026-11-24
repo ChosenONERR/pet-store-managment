@@ -596,7 +596,8 @@ foreach ($order in @($extract.orders)) {
                 }
                 "$($_.goods_code)×$($_.quantity) $dispositionText"
             }) -join '、'
-            $refundNoteParts += "退款补偿[$($event.record_id)]：顾客退款¥$([double]$event.customer_refund_amount)；$itemText"
+            $merchantText = if (Test-VerifiedRefundMerchantSettlement $event) { "；商家冲回¥$([double]$event.income_adjustment)（财务已核对）" } else { '' }
+            $refundNoteParts += "退款补偿[$($event.record_id)]：顾客退款¥$([double]$event.customer_refund_amount)$merchantText；$itemText"
         }
     }
     $effectiveDeliveryFee = if ($null -ne $manualDelivery) { $manualDelivery } elseif ($null -ne $automaticDelivery) { $automaticDelivery } else { $order.deliveryFee }

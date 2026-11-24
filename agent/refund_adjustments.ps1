@@ -47,6 +47,27 @@ function Convert-ToRefundNumber($Value) {
     return $null
 }
 
+function Test-VerifiedRefundMerchantSettlement($Event) {
+    return ($null -ne $Event.PSObject.Properties['income_adjustment_basis'] -and
+        [string]$Event.income_adjustment_basis -ceq '美团财务订单查询：商家退款冲回已核对')
+}
+
+function Set-RefundMerchantSettlement([string]$ProjectRoot, [string]$OrderNo, [string]$RecordId, [decimal]$MerchantReversal) {
+    if ($OrderNo -notmatch '^\d{16,22}$' -or $RecordId -notmatch '^\d+$' -or $MerchantReversal -lt 0 -or
+        [math]::Round($MerchantReversal, 2) -ne $MerchantReversal) {
+        throw '商家退款冲回的订单、退款记录编号或金额无效'
+    }
+    $state = Read-RefundAdjustmentState $ProjectRoot
+    $matches = @($state.events | Where-Object { [string]$_.platform -ceq '美团' -and
+        [string]$_.order_no -ceq $OrderNo -and [string]$_.record_id -ceq $RecordId })
+    if ($matches.Count -ne 1) { throw '未唯一匹配现有美团退款记录，不写入商家冲回' }
+    $event = $matches[0]
+    $event.income_adjustment = [double]$MerchantReversal
+    $event | Add-Member -NotePropertyName income_adjustment_basis -NotePropertyValue '美团财务订单查询：商家退款冲回已核对' -Force
+    Write-RefundAdjustmentState $ProjectRoot $state
+    return $event
+}
+
 function Merge-RefundDiscoveries([string]$ProjectRoot, $Orders) {
     $state = Read-RefundAdjustmentState $ProjectRoot
     $events = [Collections.Generic.List[object]]::new()
@@ -111,7 +132,10 @@ function Merge-RefundDiscoveries([string]$ProjectRoot, $Orders) {
             $current.requested_at = [string]$refund.requestedAt
             $current.reason = [string]$refund.reason
             $current.customer_refund_amount = [double]$refund.amount
-            $current.income_adjustment = [double]$refund.amount
+            # An order-page customer refund is not a merchant ledger debit.
+            if (-not (Test-VerifiedRefundMerchantSettlement $current)) {
+                $current.income_adjustment = [double]$refund.amount
+            }
             $knownItems = @($current.items)
             $mergedItems = @()
             foreach ($item in @($refund.items)) {

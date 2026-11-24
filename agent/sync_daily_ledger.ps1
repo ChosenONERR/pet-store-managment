@@ -370,6 +370,9 @@ foreach ($refundEvent in @(Get-RefundEvents $ProjectRoot)) {
         }
     }
     $line = "退款¥$([double]$refundEvent.customer_refund_amount)：$($refundParts -join '、')"
+    if (Test-VerifiedRefundMerchantSettlement $refundEvent) {
+        $line = "顾客$line；商家冲回¥$([double]$refundEvent.income_adjustment)（财务已核对）"
+    }
     if (-not $refundNotesByOrder.ContainsKey([string]$refundEvent.order_no)) { $refundNotesByOrder[[string]$refundEvent.order_no] = @() }
     $refundNotesByOrder[[string]$refundEvent.order_no] += $line
 }
