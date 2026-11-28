@@ -4,7 +4,7 @@ $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $root 'agent/record_finance_event.ps1'),[ref]$null,[ref]$parseErrors)
 if (@($parseErrors).Count) { throw 'Finance source failed to parse' }
 # Load only real pure helpers; never execute the live entry point or a CLI.
-$names = @('Get-CellValue','Convert-ToNumber','Convert-ToNullableNumber','Assert-Positive','Assert-NonNegative','New-ValueCell','New-UnitCostCell','Copy-CellRow','Set-WorkingRow','Convert-BatchDate','Get-BatchArgument','Get-SkuCodeCandidates','Resolve-UniqueSkuReference','Get-FirstEmptyRow','Get-StableEventKey','Convert-ToExcelSerial','Test-NullableNumberEqual','Invoke-BatchSkuMaintenance')
+$names = @('Get-CellValue','Convert-ToNumber','Convert-ToNullableNumber','Assert-Positive','Assert-NonNegative','New-ValueCell','New-UnitCostCell','Copy-CellRow','Set-WorkingRow','Convert-BatchDate','Get-BatchArgument','Get-SkuCodeCandidates','Resolve-UniqueSkuReference','Get-FirstEmptyRow','Get-StableEventKey','Convert-ToExcelSerial','Convert-ToDateValue','Add-ShelfLife','Resolve-ReplenishmentExpiry','Test-NullableNumberEqual','Invoke-BatchSkuMaintenance')
 foreach ($name in $names) {
     $node = @($ast.FindAll({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$true))
     if ($node.Count -ne 1) { throw "Missing helper: $name" }
@@ -84,4 +84,26 @@ if($script:replenishmentMock.Count -ne 1 -or (Get-CellValue $script:replenishmen
 Reset-Mocks
 $unknown=Invoke-BatchSkuMaintenance @((New-Op 'Replenishment' 'sku_ref:3:new-box' 3))
 if($null -ne $unknown.operations[0].after_average_cost -or $unknown.operations[0].after_quantity -ne 6){throw 'Unknown old cost was invented'}
-[pscustomobject]@{ok=$true;cases=8;external_writes=0}|ConvertTo-Json -Compress
+Reset-Mocks
+$priorExpiry = Convert-ToExcelSerial ([datetime]'2027-02-01')
+$script:skuMock[1][15] = New-ValueCell $priorExpiry
+$dated = New-Op 'Replenishment' 'sku_ref:3:new-box' 3
+$dated.arguments | Add-Member NoteProperty expiry_date '2027-05-01'
+$DryRun = $true
+$expiryPreview = Invoke-BatchSkuMaintenance @($dated)
+if ($expiryPreview.operations[0].expiry_date -ne '2027-05-01' -or $script:writeCalls) { throw 'Direct expiry not previewed safely' }
+$DryRun = $false
+$null = Invoke-BatchSkuMaintenance @($dated)
+if ((Get-CellValue $script:replenishmentMock[0] 18) -ne (Convert-ToExcelSerial ([datetime]'2027-05-01')) -or (Get-CellValue $script:skuMock[1] 15) -ne $priorExpiry) { throw 'New lot expiry missing or old SKU expiry overwritten' }
+Reset-Mocks
+$script:skuMock[1][15] = New-ValueCell $priorExpiry
+$undated = New-Op 'Replenishment' 'sku_ref:3:new-box' 3
+$undated.arguments | Add-Member NoteProperty no_expiry $true
+$null = Invoke-BatchSkuMaintenance @($undated)
+if ((Get-CellValue $script:replenishmentMock[0] 18) -or (Get-CellValue $script:skuMock[1] 15) -ne $priorExpiry) { throw 'Explicit no expiry was not left blank or cleared old SKU expiry' }
+Reset-Mocks
+$dated.arguments | Add-Member NoteProperty no_expiry $true
+Assert-Rejected @($dated) '.+'
+$leap = Resolve-ReplenishmentExpiry $null ([datetime]'2026-08-31') 6 ([string][char]0x6708) $false
+if ($leap.ToString('yyyy-MM-dd') -ne '2027-02-28') { throw 'Shelf life date did not respect calendar months' }
+[pscustomobject]@{ok=$true;cases=13;external_writes=0}|ConvertTo-Json -Compress

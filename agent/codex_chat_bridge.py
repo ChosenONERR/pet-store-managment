@@ -49,7 +49,7 @@ QUERY_CACHE_SECONDS = 30
 RATE_LIMIT_BASE_SECONDS = 60
 RATE_LIMIT_MAX_SECONDS = 15 * 60
 RATE_LIMIT_RESET_SECONDS = 60 * 60
-RUNTIME_VERSION = "2026-11-17.1"
+RUNTIME_VERSION = "2026-11-28.1"
 RUNTIME_PIPE = rf"\\.\pipe\petstar_codex_runtime_{hashlib.sha256(str(PROJECT_ROOT).encode('utf-8')).hexdigest()[:16]}"
 RUNTIME_AUTHKEY = hashlib.sha256((str(PROJECT_ROOT) + "|petstar-codex-runtime-v1").encode("utf-8")).digest()
 QUERY_DATASETS = {
@@ -137,7 +137,7 @@ ACTION_GUIDE = """
 - SetOrderActuals: order_no, amount（最终实际收入）, items（最终实际交付的KW/CSX×数量）, delivery_fee, note。用于线上订单私下退款、漏送退款、到店换货、实际成交商品变化或最终改价；漏送/退回的商品不得写入 items；该动作不修改平台库存
 - OfflineSale: date, items(KW/CSX×数量), amount, delivery_fee, receipt_status, platform, note。receipt_status 只填“已到账”或“未到账”；platform 只填“美团”“淘宝闪购”“京东到家”“线下”（用户说“京东外卖”时填“京东到家”）
 - AddOrderGift: date, order_no或daily_order_no, items, note
-- Replenishment: date, goods_code, transition_code（消息同时给出CSX时填写）, quantity, purchase_amount, payment_amount, payment_date, production_date, shelf_life_value, shelf_life_unit, note。店主没有明确说赊账、挂账、未付款或以后付款时，默认当天已全额付款，payment_amount 填 purchase_amount，payment_date 填 date；明确未付款时 payment_amount/payment_date 留空，并在 note 保留原话。该动作只新增补货记录并更新SKU当前成本，不重算历史订单、收入、利润或经营简账
+- Replenishment: date, goods_code, transition_code（消息同时给出CSX时填写）, quantity, purchase_amount, payment_amount, payment_date, expiry_date, no_expiry, production_date, shelf_life_value, shelf_life_unit, note。店主没有明确说赊账、挂账、未付款或以后付款时，默认当天已全额付款，payment_amount 填 purchase_amount，payment_date 填 date；明确未付款时 payment_amount/payment_date 留空，并在 note 保留原话。该动作只新增补货记录并更新SKU当前成本，不重算历史订单、收入、利润或经营简账
 - SetCostBookQuantity: goods_code, quantity, date, note。仅当店主明确纠正某 SKU 在本次补货前的“成本账数量”时使用；若同一请求还包含该 SKU 补货，必须把本动作放在对应 Replenishment 前面，使移动平均成本按纠正后的旧数量计算。它不代表美团库存，不修改历史订单或经营简账
 - CashExpense / OperatingExpense / OwnerWithdrawal / OwnerLabor / MarketRent / BeginningCash / ActualReceipt / AssetAmortization: date, amount, note。ActualReceipt 只表示平台资金实际打入收款账户的月度现金到账，不得用于修正某一订单的收入、退款或利润，也不得携带 order_no
 - 售后再次配送、补送的额外配送费使用 OperatingExpense（date、amount、order_no、note），note 项目为“售后追加配送费”，说明原订单号及原因。它是新增经营支出，不得用 SetOrderDeliveryFee 或 SetOrderActuals 覆盖首次配送费。普通首次配送费仍使用原订单配送费动作；采购付款、老板取款不得生成 OperatingExpense。经营利润只从月份支出汇总扣费，不另扣干预订单成本。
@@ -171,6 +171,7 @@ sku 查询的每一行也会返回 action_code。只要查询结果提供 action
 干预单不计算购买商品进货成本；自然单和线下单计算货物成本。赠品成本按登记时成本快照计入。
 生产日期加保质期可推算到期日；缺少保质期不得猜。今天、昨天、前天以 Asia/Shanghai 和消息创建时间为准。
 只有当前消息明确要求登记实际“补货/进货/采购”并提供数量，才优先生成 Replenishment；仅记录“待办：补货/采购……”不得登记采购事实，使用 AddTodo。即使实际补货同时出现生产日期、保质期，也不能误判成仅修改已有批次。只有没有新增数量和采购事实、明确是在修正已有库存日期时，才使用 SetSkuBatchDate。
+实际补货的商品、数量和采购金额（含明确免费）已齐时，就生成 Replenishment，即使效期缺失也保留动作，由执行层保存未确认草稿并追问。到期日选择店主针对本批明确提供的完整日期（expiry_date 为 yyyy-MM-dd），或填写本批生产日期加完整保质期；只有店主明确说本批无效期才能填 no_expiry=true，不得用 clear_expiry。“不知道、没查到、还没到货、没有提到”、商品类别、报价日期、采购日期或主表上的旧批日期都不能作为本批效期。不同商品的效期不得互借；只给明确的字段，缺少留空。
 店主明确说试吃装、赠送、免费或成本为0时，Replenishment 的 purchase_amount 可以是0，并在 note 保留零成本原因。新KW尚未存在于SKU成本主表时也照常生成 Replenishment，由执行层建立待平台同步档案，不能改成 SetSkuBatchDate 或直接报无法处理。
 “补货”既可能是已有商品再次采购，也可能是第一次上新的入库，不能要求店主换一种固定说法。消息同时给出 KW 和 CSX 时，goods_code 填 KW、transition_code 填 CSX；只有 CSX 时 goods_code 填 CSX。执行层会优先用任一编号唯一匹配 SKU 主表，并在无冲突时把新 KW 绑定到该 CSX 所在档案。
 补货只更新补货记录和该SKU当前成本；即使一次有多条补货，也不得生成 RefreshLedger，不得声称会修改库存批次、现金流、历史订单、收入、利润或经营简账。

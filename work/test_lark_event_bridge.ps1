@@ -187,12 +187,21 @@ function Invoke-PetstarCodex([string]$Text, [string]$MessageId, [string]$Mode = 
         $fee = if ($Text -match '改成8') { 8 } else { 6.5 }
         $actions = @(New-TestCodexAction 'SetOrderDeliveryFee' @{date='2026-09-12';order_no='3402294850565247821';amount=$fee})
         $reply = "📝 待确认：配送费改为 $fee 元。"
+    } elseif ($Text -match '效期追问批量测试') {
+        $actions = @(
+            (New-TestCodexAction 'Replenishment' @{date='2026-09-12';goods_code='kw1104';quantity=6;purchase_amount=330;payment_amount=330;payment_date='2026-09-12';expiry_date='2028-02-28';note='昨日补货'}),
+            (New-TestCodexAction 'Replenishment' @{date='2026-09-12';goods_code='kw1113';quantity=3;purchase_amount=0;no_expiry=$true;note='试吃装'})
+        )
+        $reply = '📝 待确认：效期追问测试（模拟未在本条消息提供的效期值）。'
+    } elseif ($Text -match '效期追问单笔测试') {
+        $actions = @(New-TestCodexAction 'Replenishment' @{date='2026-09-12';goods_code='kw1104';quantity=6;purchase_amount=330;payment_amount=330;payment_date='2026-09-12'})
+        $reply = '📝 待确认：效期追问单笔测试。'
     } elseif ($Text -match '批量SKU维护测试') {
         $actions = @(
             (New-TestCodexAction 'SetCostBookQuantity' @{date='2026-09-13';goods_code='kw1104';quantity=1;note='店主确认补货前实际还有1袋'}),
-            (New-TestCodexAction 'Replenishment' @{date='2026-09-13';goods_code='kw1104';quantity=2;purchase_amount=20;note='批量测试补货'}),
+            (New-TestCodexAction 'Replenishment' @{date='2026-09-13';goods_code='kw1104';quantity=2;purchase_amount=20;no_expiry=$true;note='批量测试补货'}),
             (New-TestCodexAction 'SetSkuCost' @{date='2026-09-13';goods_code='kw1109';amount=1.25;note='批量测试成本'}),
-            (New-TestCodexAction 'Replenishment' @{date='2026-09-13';goods_code='kw1113';quantity=3;purchase_amount=0;note='批量测试零成本补货'})
+            (New-TestCodexAction 'Replenishment' @{date='2026-09-13';goods_code='kw1113';quantity=3;purchase_amount=0;no_expiry=$true;note='批量测试零成本补货'})
         )
         $reply = '📝 待确认：先纠正补货前成本账数量，再批量登记两笔补货和一笔普通成本修改。'
     } elseif ($Text -match 'kw1113') {
@@ -238,7 +247,7 @@ function Invoke-PetstarEvent([string[]]$Arguments) {
             $isPendingGift = [string]$map.order_no -eq '999999999999999999'
             [pscustomobject]@{status=$(if($isPendingGift){'pending_order'}else{'matched'});order_no=$map.order_no;daily_order_no=$(if($isPendingGift){'待同步'}else{'美团1号单'});gift_items='kw4189×1';gift_cost=2.1;pending_cost_codes=@();accounting=$(if($isPendingGift){'待匹配'}else{'并入货物成本'})}
         }
-        'Replenishment' { [pscustomobject]@{goods_code=$map.goods_code;package_quantity=[double]$map.quantity;purchase_amount=[double]$map.purchase_amount;payment_amount=$(if($null-ne$map.payment_amount){[double]$map.payment_amount}else{$null});after_average_cost=$(if([double]$map.purchase_amount -eq 0){0}else{55});production_date=$map.production_date;expiry_date=$(if($map.goods_code -eq 'kw1113'){'2028-02-26'}else{'2028-02-28'});sku_status=$(if($map.goods_code -eq 'kw1113'){$(if($script:previewMode){'will_create_pending_profile'}else{'created_pending_profile'})}else{'matched'})} }
+        'Replenishment' { [pscustomobject]@{goods_code=$map.goods_code;package_quantity=[double]$map.quantity;purchase_amount=[double]$map.purchase_amount;payment_amount=$(if($null-ne$map.payment_amount){[double]$map.payment_amount}else{$null});after_average_cost=$(if([double]$map.purchase_amount -eq 0){0}else{55});production_date=$map.production_date;expiry_date=$(if($map.expiry_date){$map.expiry_date}elseif($map.production_date -and $map.goods_code -eq 'kw1113'){'2028-02-26'}elseif($map.production_date){'2028-02-28'});sku_status=$(if($map.goods_code -eq 'kw1113'){$(if($script:previewMode){'will_create_pending_profile'}else{'created_pending_profile'})}else{'matched'})} }
         'ChangeSkuCode' { [pscustomobject]@{status='ready';old_code=$map.goods_code;new_code=$map.new_goods_code} }
         'SetOrderDeliveryFee' { [pscustomobject]@{order_no=$map.order_no;order_type='自然单';date='2026-09-12';daily_order_no='美团2号单';old_delivery_fee=0;delivery_fee=$amount} }
         'SetSkuBatchDate' { [pscustomobject]@{goods_code=$map.goods_code;production_date=$map.production_date;shelf_life="$($map.shelf_life_value)$($map.shelf_life_unit)";expiry_date='2027-08-13'} }
@@ -266,7 +275,7 @@ function Invoke-PetstarBatchSkuMaintenance($StoredOperations, $Event, [int]$Star
     foreach ($stored in $items) {
         $args = $stored.arguments
         $details = if ([string]$stored.action -eq 'Replenishment') {
-            [pscustomobject]@{row=80+$executed.Count;goods_code=$args.goods_code;package_quantity=[double]$args.quantity;purchase_amount=[double]$args.purchase_amount;after_average_cost=$(if([double]$args.purchase_amount-eq 0){0}else{10});sku_status=$(if($Preview -and $args.goods_code -eq 'kw1113'){'will_create_pending_profile'}else{'matched'})}
+            [pscustomobject]@{row=80+$executed.Count;goods_code=$args.goods_code;package_quantity=[double]$args.quantity;purchase_amount=[double]$args.purchase_amount;expiry_date=$args.expiry_date;after_average_cost=$(if([double]$args.purchase_amount-eq 0){0}else{10});sku_status=$(if($Preview -and $args.goods_code -eq 'kw1113'){'will_create_pending_profile'}else{'matched'})}
         } elseif ([string]$stored.action -eq 'SetCostBookQuantity') {
             [pscustomobject]@{sheet='SKU成本主表';row=18;goods_code=$args.goods_code;old_quantity=0;new_quantity=[double]$args.quantity;moving_average_cost=10;historical_orders_changed=$false;ledger_changed=$false}
         } else {
@@ -356,7 +365,7 @@ try {
     if ($cancel.ack -notmatch '没有修改表格' -or (Read-PendingConfirmation)) { throw '取消待确认失败' }
 
     $script:testCalls.Clear()
-    $codexDraft = Invoke-TestMessage 'draft-codex-replenishment' '把昨天那批模糊补货也记一下'
+    $codexDraft = Invoke-TestMessage 'draft-codex-replenishment' '把昨天那批模糊补货也记一下，生产日期2026年8月28日，保质期18个月'
     if ($codexDraft.ack -notmatch '待确认' -or $codexDraft.ack -notmatch 'kw1104' -or $codexDraft.ack -notmatch '2026-09-12' -or $script:testCalls.Count -ne 0) { throw "Codex 结构化补货预览失败：$($codexDraft.ack)" }
     $codexConfirm = Invoke-TestMessage 'confirm-codex-replenishment' '确认'
     $replenishmentCall = @($script:testCalls | Where-Object action -eq 'Replenishment')[-1]
@@ -371,7 +380,7 @@ try {
 
     $script:testCalls.Clear()
     $script:testBatchCalls.Clear()
-    $batchSkuDraft = Invoke-TestMessage 'draft-batch-sku-maintenance' '批量SKU维护测试'
+    $batchSkuDraft = Invoke-TestMessage 'draft-batch-sku-maintenance' '批量SKU维护测试，两项补货都无效期'
     if ($batchSkuDraft.ack -notmatch '待确认' -or $batchSkuDraft.ack -notmatch '不会重算历史订单' -or $batchSkuDraft.ack -notmatch '成本账数量 0 → 1' -or $script:testBatchCalls.Count -ne 1 -or -not [bool]$script:testBatchCalls[0].preview -or [int]$script:testBatchCalls[0].count -ne 4 -or $script:testCalls.Count -ne 0) {
         throw "批量 SKU 维护预览没有一次处理全部兼容动作：ack=$($batchSkuDraft.ack) batch=$($script:testBatchCalls|ConvertTo-Json -Compress -Depth 8) single=$($script:testCalls.Count)"
     }
@@ -380,6 +389,48 @@ try {
     if ($script:testBatchCalls.Count -ne 2 -or $executionBatchCalls.Count -ne 1 -or [int]$executionBatchCalls[0].count -ne 4 -or $script:testCalls.Count -ne 0 -or $batchSkuConfirm.ack -notmatch '补货记录第' -or $batchSkuConfirm.ack -notmatch '成本账数量 0 → 1' -or $batchSkuConfirm.ack -notmatch '未修改历史订单或经营简账') {
         throw "批量 SKU 维护没有一次执行全部兼容动作：ack=$($batchSkuConfirm.ack) batch=$($script:testBatchCalls|ConvertTo-Json -Compress -Depth 8) single=$($script:testCalls.Count)"
     }
+
+    $script:testCalls.Clear()
+    $script:testBatchCalls.Clear()
+    $dateEvent = [pscustomobject]@{create_time=[string]([datetimeoffset]'2026-09-13T12:30:00+08:00').ToUnixTimeMilliseconds()}
+    $dateOp = New-TestCodexAction 'Replenishment' @{goods_code='kw1104';quantity=2;purchase_amount=20;expiry_date='2027-03-18'}
+    Set-ReplenishmentExpirySourceFacts @($dateOp) '昨天补货 KW1104 2包20元，到期日2027-03-18' $dateEvent
+    if ((Get-ReplenishmentExpiryQuestion @($dateOp)) -or $dateOp.arguments.date -ne (Resolve-MessageDate '昨天' $dateEvent.create_time).ToString('yyyy-MM-dd')) { throw '已提供的完整效期仍被追问，或者错把效期当成采购日期' }
+    $partial = New-TestCodexAction 'Replenishment' @{goods_code='kw1104';quantity=2;purchase_amount=20;production_date='2026-08-28'}
+    Set-ReplenishmentExpirySourceFacts @($partial) '昨天补货 KW1104 2包20元，生产日期2026-08-28' $dateEvent
+    $partialQ = Get-ReplenishmentExpiryQuestion @($partial)
+    $partialAnswer = Resolve-ReplenishmentExpiryAnswer '保质期18个月' $partialQ
+    if ($partialAnswer.production_date -ne '2026-08-28' -or $partialAnswer.shelf_life_value -ne 18) { throw '补答保质期不应丢失已经提供的生产日期' }
+    $pretendNone = New-TestCodexAction 'Replenishment' @{goods_code='kw1104';quantity=2;purchase_amount=20;no_expiry=$true}
+    Set-ReplenishmentExpirySourceFacts @($pretendNone) '昨天补货 KW1104 2包20元，暂时没有到期日期' $dateEvent
+    if (-not (Get-ReplenishmentExpiryQuestion @($pretendNone))) { throw '缺少日期证据时不得擅自认定无效期' }
+    $expiryDraft = Invoke-TestMessage 'draft-missing-expiry' '昨天补货效期追问批量测试'
+    $expiryPending = Read-PendingConfirmation
+    if ($expiryDraft.ack -notmatch 'kw1104.*数量 6.*¥330' -or $expiryDraft.ack -notmatch '有到期日吗' -or -not $expiryPending.awaiting_replenishment_expiry -or -not $expiryPending.needs_information -or $script:testBatchCalls.Count -or $script:testCalls.Count) { throw '多项补货缺效期时未挡住整批预览与写入' }
+    $tooEarly = Invoke-TestMessage 'expiry-confirm-too-early' '确认'
+    if ($tooEarly.ack -notmatch '有到期日吗' -or $script:testBatchCalls.Count -or $script:testCalls.Count) { throw '未补效期却提前执行' }
+    $invalidExpiry = Invoke-TestMessage 'expiry-invalid' '2027-02-30'
+    if ($invalidExpiry.ack -notmatch '有到期日吗' -or $script:testBatchCalls.Count) { throw '无效日期错误放行' }
+    $otherSku = Invoke-TestMessage 'expiry-wrong-sku' 'kw9999 2027-03-18'
+    if ((Read-PendingConfirmation).operation_signature -ne $expiryPending.operation_signature) { throw '其他货号日期串入原补货' }
+    $firstExpiry = Invoke-TestMessage 'expiry-first' 'kw1104 到期日是2027年3月18日'
+    $secondPending = Read-PendingConfirmation
+    if ($firstExpiry.ack -notmatch 'kw1113.*数量 3.*¥0' -or $secondPending.operations[0].arguments.expiry_date -ne '2027-03-18' -or $secondPending.operations[1].arguments.no_expiry -eq $true -or $script:testBatchCalls.Count) { throw '补答后未保存对应日期、追问下一商品，或错误继承了无效期' }
+    $allExpiry = Invoke-TestMessage 'expiry-second' '无效期'
+    $readyExpiry = Read-PendingConfirmation
+    if ($allExpiry.ack -notmatch '待确认' -or $allExpiry.ack -notmatch '本批到期日：2027-03-18' -or $allExpiry.ack -notmatch '无效期，日期留空' -or $readyExpiry.needs_information -or $script:testBatchCalls.Count -ne 1 -or -not $script:testBatchCalls[0].preview -or $readyExpiry.operations[0].arguments.date -ne '2026-09-12' -or [double]$readyExpiry.operations[0].arguments.payment_amount -ne 330 -or $readyExpiry.change_id -ne $expiryPending.change_id) { throw '补答丢失原日期、付款、确认编号或绕开确认' }
+    $expiryConfirm = Invoke-TestMessage 'confirm-complete-expiry' '确认'
+    if ($expiryConfirm.ack -notmatch '补货记录第' -or $script:testBatchCalls.Count -ne 2 -or (Read-PendingConfirmation)) { throw '已补齐效期的整批补货未正常执行' }
+
+    $script:testCalls.Clear()
+    $singleExpiry = Invoke-TestMessage 'draft-single-expiry' '昨天补货效期追问单笔测试'
+    $singleAck = Invoke-TestMessage 'single-expiry-unavailable' '有，暂时没查到日期'
+    if ($singleAck.ack -notmatch '有到期日吗' -or $script:testCalls.Count) { throw '有日期但尚未知时应保留待补充' }
+    $singleNone = Invoke-TestMessage 'single-expiry-none' '没有'
+    if ($singleNone.ack -notmatch '无效期，日期留空' -or $script:testCalls.Count) { throw '确认无效期应重新预览，不应立即写入' }
+    $singleConfirm = Invoke-TestMessage 'confirm-single-expiry' '确认'
+    $final = $script:testCalls[-1]
+    if ($final.action -ne 'Replenishment' -or $final.arguments.no_expiry -ne $true -or [double]$final.arguments.quantity -ne 6 -or $singleConfirm.ack -notmatch '无效期，日期留空') { throw '单笔无效期确认未保留原补货或日期留空口径' }
 
     $codexQuestion = Invoke-TestMessage 'codex-question' '你现在用什么方式理解我的话？'
     if (-not $codexQuestion.ok -or $codexQuestion.ack -notmatch '本机 Codex 正常回答') { throw 'Codex 普通对话回退失败' }

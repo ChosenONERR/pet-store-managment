@@ -13,6 +13,7 @@
     [ValidateSet('returned_restocked','refund_no_return','returned_damaged')][string]$RefundDisposition,
     [switch]$RetireExistingNewCode,
     [Nullable[datetime]]$ExpiryDate,
+    [switch]$NoExpiry,
     [switch]$ClearExpiry,
     [Nullable[datetime]]$ProductionDate,
     [Nullable[double]]$ShelfLifeValue,
@@ -316,6 +317,18 @@ function Add-ShelfLife([datetime]$StartDate, [double]$Value, [string]$Unit) {
         '年' { return $StartDate.Date.AddYears([int][math]::Round($Value)) }
         default { throw '保质期单位只支持天、月、年' }
     }
+}
+
+function Resolve-ReplenishmentExpiry([Nullable[datetime]]$ExplicitDate, [Nullable[datetime]]$ProducedOn, [Nullable[double]]$Life, [string]$Unit, [bool]$NoExpiry) {
+    if ($NoExpiry -and ($null -ne $ExplicitDate -or $null -ne $ProducedOn -or $null -ne $Life)) { throw '本批无效期不能与到期日、生产日期或保质期一起填写' }
+    if (($null -ne $ProducedOn) -xor ($null -ne $Life)) { throw '登记批次时，生产日期和保质期必须一起提供' }
+    $calculated = $null
+    if ($null -ne $ProducedOn) {
+        Assert-Positive $Life '保质期'
+        $calculated = (Add-ShelfLife ([datetime]$ProducedOn) ([double]$Life) $Unit).Date
+    }
+    if ($null -ne $ExplicitDate) { return ([datetime]$ExplicitDate).Date }
+    return $calculated
 }
 
 function Get-CanonicalSkuMap($Rows) {
@@ -1153,9 +1166,11 @@ function Invoke-BatchSkuMaintenance([object[]]$Operations) {
         $productionRaw = Get-BatchArgument $arguments 'production_date'
         $shelfLife = Convert-ToNullableNumber (Get-BatchArgument $arguments 'shelf_life_value')
         $shelfUnit = [string](Get-BatchArgument $arguments 'shelf_life_unit'); if (-not $shelfUnit) { $shelfUnit = '月' }
-        if (($null -ne $productionRaw) -xor ($null -ne $shelfLife)) { throw "第$($operationIndex+1)项补货的生产日期和保质期必须一起提供" }
-        $productionDateValue = $null; $expiry = $null
-        if ($null -ne $productionRaw) { $productionDateValue = Convert-BatchDate $productionRaw $operationDate '生产日期'; Assert-Positive $shelfLife '保质期'; $expiry = Add-ShelfLife $productionDateValue ([double]$shelfLife) $shelfUnit }
+        $shelfUnit = if ($shelfUnit -match '月') { '月' } elseif ($shelfUnit -eq '日') { '天' } else { $shelfUnit }
+        $productionDateValue = if ($productionRaw) { Convert-BatchDate $productionRaw $operationDate '生产日期' } else { $null }
+        $expiryRaw = Get-BatchArgument $arguments 'expiry_date'
+        $explicitExpiry = if ($expiryRaw) { Convert-BatchDate $expiryRaw $operationDate '到期日期' } else { $null }
+        $expiry = Resolve-ReplenishmentExpiry $explicitExpiry $productionDateValue $shelfLife $shelfUnit ((Get-BatchArgument $arguments 'no_expiry') -eq $true)
         $salesQuantity = [double]$quantityValue * $unitsPerPack
         $incomingUnitCost = [double]$purchaseAmountValue / $salesQuantity
         $beforeQuantity = if ($newSku) { 0.0 } else { Convert-ToNullableNumber (Get-CellValue $cells $skuSchema.CostBookQuantity.Index) }; if ($null -eq $beforeQuantity) { $beforeQuantity = 0.0 }
@@ -1196,7 +1211,7 @@ function Invoke-BatchSkuMaintenance([object[]]$Operations) {
         Set-WorkingRow $replenishmentRows $rowNumber $rowCells
         $matrix=@();$matrix+=,$rowCells;$writes.Add(@{shortcut='+cells-set';input=@{sheet_name='补货记录';range="A${rowNumber}:T${rowNumber}";cells=$matrix}})
         $expectedSku[[string]$skuRowNumber]=[pscustomobject]@{baseline=Convert-ToNullableNumber (Get-CellValue $cells $skuSchema.BaselineUnitCost.Index);moving=$afterAverage;quantity=$afterQuantity;status=Get-CellValue $cells $skuSchema.CostStatus.Index}
-        $expectedReplenishment[[string]$rowNumber]=[pscustomobject]@{goods_code=$displayCode;quantity=[double]$quantityValue;purchase_amount=[double]$purchaseAmountValue;batch_id=$batchId;after_quantity=$afterQuantity;after_average=$afterAverage};$null=$formulaRows.Add($rowNumber)
+        $expectedReplenishment[[string]$rowNumber]=[pscustomobject]@{goods_code=$displayCode;quantity=[double]$quantityValue;purchase_amount=[double]$purchaseAmountValue;batch_id=$batchId;after_quantity=$afterQuantity;after_average=$afterAverage;expiry_date=$expiry};$null=$formulaRows.Add($rowNumber)
         $results.Add([pscustomobject]@{row=$rowNumber;sku_master_row=$skuRowNumber;goods_code=$displayCode;transition_code=$requestedCsx;product_id=$productId;package_quantity=[double]$quantityValue;sales_unit_quantity=$salesQuantity;purchase_amount=[double]$purchaseAmountValue;payment_amount=$paymentAmountValue;unit_cost=$incomingUnitCost;before_quantity=$beforeQuantity;before_average_cost=$beforeAverage;after_quantity=$afterQuantity;after_average_cost=$afterAverage;production_date=$(if($productionDateValue){$productionDateValue.ToString('yyyy-MM-dd')}else{$null});expiry_date=$(if($expiry){$expiry.ToString('yyyy-MM-dd')}else{$null});sku_status=$(if($newSku){$(if($DryRun){'will_create_pending_profile'}else{'created_pending_profile'})}elseif($mappingUpdate){$(if($DryRun){'will_attach_kw_by_csx'}else{'attached_kw_by_csx'})}elseif($duplicateResolutionRows.Count-gt0){'matched_unique_active_platform_sku'}else{'matched'});duplicate_rows_ignored=@($duplicateResolutionRows|Sort-Object);affected_tables=@('补货记录','SKU成本主表');remote_replay=$false})
     }
 
@@ -1205,7 +1220,7 @@ function Invoke-BatchSkuMaintenance([object[]]$Operations) {
     }
     Set-AtomicCellOperations $writes.ToArray()
     foreach($entry in $expectedSku.GetEnumerator()) { $row=[int]$entry.Key;$e=$entry.Value;$a=Get-SingleSheetRow 'SKU成本主表' "A${row}:Z${row}";if($null-eq$a -or -not(Test-NullableNumberEqual (Get-CellValue $a $skuSchema.BaselineUnitCost.Index) $e.baseline) -or -not(Test-NullableNumberEqual (Get-CellValue $a $skuSchema.MovingAverageCost.Index) $e.moving) -or -not(Test-NullableNumberEqual (Get-CellValue $a $skuSchema.CostBookQuantity.Index) $e.quantity) -or [string](Get-CellValue $a $skuSchema.CostStatus.Index)-ne[string]$e.status){throw "批量 SKU 维护写后校验失败：SKU成本主表第 $row 行"} }
-    foreach($entry in $expectedReplenishment.GetEnumerator()) { $row=[int]$entry.Key;$e=$entry.Value;$a=Get-SingleSheetRow '补货记录' "A${row}:T${row}";if($null-eq$a -or [string](Get-CellValue $a 1)-ne[string]$e.goods_code -or -not(Test-NullableNumberEqual (Get-CellValue $a 2) $e.quantity) -or -not(Test-NullableNumberEqual (Get-CellValue $a 5) $e.purchase_amount) -or [string](Get-CellValue $a 19)-ne[string]$e.batch_id -or -not(Test-NullableNumberEqual (Get-CellValue $a 9) $e.after_quantity) -or -not(Test-NullableNumberEqual (Get-CellValue $a 10) $e.after_average)){throw "批量补货写后校验失败：补货记录第 $row 行"} }
+    foreach($entry in $expectedReplenishment.GetEnumerator()) { $row=[int]$entry.Key;$e=$entry.Value;$a=Get-SingleSheetRow '补货记录' "A${row}:T${row}";if($null-eq$a -or [string](Get-CellValue $a 1)-ne[string]$e.goods_code -or -not(Test-NullableNumberEqual (Get-CellValue $a 2) $e.quantity) -or -not(Test-NullableNumberEqual (Get-CellValue $a 5) $e.purchase_amount) -or [string](Get-CellValue $a 19)-ne[string]$e.batch_id -or -not(Test-NullableNumberEqual (Get-CellValue $a 9) $e.after_quantity) -or -not(Test-NullableNumberEqual (Get-CellValue $a 10) $e.after_average) -or (Convert-ToDateValue (Get-CellValue $a 18)) -ne $e.expiry_date){throw "批量补货写后校验失败：补货记录第 $row 行"} }
     if($formulaRows.Count-gt 0){$ranges=@($formulaRows|Sort-Object|ForEach-Object{"D${_}:E${_},G${_}:G${_},U${_}:U${_}"})-join',';Assert-FormulaRange '补货记录' $ranges}
     return [pscustomobject]@{operations=$results.ToArray();operation_count=$results.Count;write_operation_count=$writes.Count;master_read_count=1;replenishment_read_count=1}
 }
@@ -1954,12 +1969,7 @@ switch ($Action) {
         $beforeQuantity = if ($newSkuPending) { 0.0 } else { Convert-ToNullableNumber (Get-CellValue $skuTarget.cells $skuSchema.CostBookQuantity.Index) }
         if ($null -eq $beforeQuantity) { $beforeQuantity = 0.0 }
         $beforeAverage = if ($newSkuPending) { $null } else { Convert-ToNullableNumber (Get-CellValue $skuTarget.cells $skuSchema.MovingAverageCost.Index) }
-        $computedExpiry = $null
-        if (($null -ne $ProductionDate) -xor ($null -ne $ShelfLifeValue)) { throw '登记批次时，生产日期和保质期必须一起提供' }
-        if ($null -ne $ProductionDate) {
-            Assert-Positive $ShelfLifeValue '保质期'
-            $computedExpiry = Add-ShelfLife ([datetime]$ProductionDate) ([double]$ShelfLifeValue) $ShelfLifeUnit
-        }
+        $computedExpiry = Resolve-ReplenishmentExpiry $ExpiryDate $ProductionDate $ShelfLifeValue $ShelfLifeUnit ([bool]$NoExpiry)
         $rows = Get-SheetRows '补货记录' 'A2:T1001'
         # 批次ID同时承担远端幂等键：本地进程即使在飞书写入后、事件日志落盘前崩溃，
         # 重试也会复用原行，而不是再次增加库存。
@@ -2068,6 +2078,13 @@ switch ($Action) {
             @{shortcut='+cells-set';input=@{sheet_name='SKU成本主表';range="$($skuSchema.LastCostUpdate.Column)$($skuTarget.row_number):$($skuSchema.LastCostUpdate.Column)$($skuTarget.row_number)";cells=$masterUpdatedAtCells}}
         )
         $reference = "$GoodsCode x$quantityValue"
+        if ($computedExpiry -or $NoExpiry) {
+            $expiryCheckRow = Get-SingleSheetRow '补货记录' "A${rowNumber}:T${rowNumber}"
+            if ((Get-CellValue $expiryCheckRow 19) -ne $batchId -or
+                (Convert-ToDateValue (Get-CellValue $expiryCheckRow 18)) -ne $computedExpiry) {
+                throw "补货到期日写后校验失败：补货记录第 $rowNumber 行"
+            }
+        }
         $writeResult = [pscustomobject]@{row=$rowNumber;sku_master_row=[int]$skuTarget.row_number;goods_code=$displayCode;transition_code=$requestedCsx;product_id=$productId;package_quantity=$quantityValue;sales_unit_quantity=$salesUnitQuantity;purchase_amount=$purchaseAmountValue;payment_amount=$paymentAmountValue;unit_cost=$incomingUnitCost;before_quantity=$beforeQuantity;before_average_cost=$beforeAverage;after_quantity=$afterQuantity;after_average_cost=$afterAverage;batch_id=$batchId;expiry_date=$(if($computedExpiry){$computedExpiry.ToString('yyyy-MM-dd')}else{$null});sku_status=$(if($newSkuPending){'created_pending_profile'}elseif($mappingUpdate){'attached_kw_by_csx'}else{'matched'});mapping_update=$mappingUpdate;affected_tables=@('补货记录','SKU成本主表');remote_replay=($existingEventIndex -ge 0)}
     }
     'SetSkuCost' {

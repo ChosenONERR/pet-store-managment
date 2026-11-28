@@ -447,6 +447,7 @@ function Invoke-CodexAndReply($Event, [string]$AuthorizedOpenId, [string]$Messag
     }
 
     $actions = @($codexResult.actions)
+    Set-ReplenishmentExpirySourceFacts $actions $MessageText $Event
     $todoActions=@($actions|Where-Object {$_.action -in @('AddTodo','CompleteTodo')})
     if($todoActions.Count -gt 0){
         if($todoActions.Count -ne $actions.Count -or $codexMode -ne 'normal'){
@@ -496,6 +497,16 @@ function Invoke-CodexAndReply($Event, [string]$AuthorizedOpenId, [string]$Messag
         return $true
     }
 
+    if ($script:previewMode) {
+        $expiryQuestion = Get-ReplenishmentExpiryQuestion $mutatingActions
+        if ($expiryQuestion) {
+            foreach ($action in $mutatingActions) { $script:previewOperations.Add($action) }
+            $script:previewNeedsInformation = $true
+            $script:previewAwaitingReplenishmentExpiry = $true
+            $null = Send-Acknowledgement $AuthorizedOpenId $expiryQuestion.reply ([string]$Event.message_id) 'clarify'
+            return $true
+        }
+    }
     $executedOperations = [Collections.Generic.List[object]]::new()
     foreach ($operation in @(Invoke-CodexActionsInOrder $actions $Event $codexMode)) { $executedOperations.Add($operation) }
 
@@ -677,6 +688,132 @@ function Get-CodexActionValue($Arguments, [string]$Name) {
     return $property.Value
 }
 
+function Convert-ReplenishmentReplyDate([string]$Text) {
+    if ($Text -notmatch '^\s*(20\d{2})\s*[-年/.]\s*(\d{1,2})\s*[-月/.]\s*(\d{1,2})\s*[日号]?\s*$') { return $null }
+    $date = [datetime]::MinValue
+    $iso = '{0:D4}-{1:D2}-{2:D2}' -f [int]$Matches[1],[int]$Matches[2],[int]$Matches[3]
+    if ([datetime]::TryParseExact($iso,'yyyy-MM-dd',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::None,[ref]$date)) { return $date }
+    return $null
+}
+
+function Set-ReplenishmentExpirySourceFacts($Actions, [string]$SourceText, $Event) {
+    # Do not let inferred shelf life or a date copied from an old batch
+    # count as the owner's answer. This runs on first interpretation only;
+    # a direct reply can change the saved expiry facts via the scoped handler.
+    $purchases = @($Actions | Where-Object { [string]$_.action -eq 'Replenishment' })
+    if ($purchases.Count -eq 0) { return }
+    $datePattern = '(?<!\d)20\d{2}\s*[-年/.]\s*\d{1,2}\s*[-月/.]\s*\d{1,2}\s*[日号]?(?!\d)'
+    $textDates = @([regex]::Matches($SourceText,$datePattern) | ForEach-Object {
+        $parsed = Convert-ReplenishmentReplyDate $_.Value
+        if ($parsed) { $parsed.ToString('yyyy-MM-dd') }
+    })
+    $expiryTerms = '效期|有效期|保质期|(?:到期|过期)日期?'
+    $explicitNone = "无(?:$expiryTerms)|没(?:有)?(?:$expiryTerms)"
+    $hasExplicitNone = $SourceText -match "(?:$explicitNone)(?![期的信标照])" -and
+        $SourceText -notmatch "(?:是否|不确定|暂时|还|尚)(?:有|是|也|没查到|[\s:：]){0,6}(?:$explicitNone)"
+    foreach ($purchase in $purchases) {
+        $facts = $purchase.arguments
+        if (-not $facts) { continue }
+        if (-not (Get-CodexActionValue $facts 'date')) {
+            $purchaseText = $SourceText
+            if ($SourceText -match '到期|过期|有效期|效期|保质|生产(?:日|时间)|\bEXP\b|\bMFG\b') {
+                # The named purchase date belongs to date; a naked expiry or
+                # production date must not become the purchase/payment day.
+                $namedPurchase = [regex]::Match($SourceText,"(?:补货|采购|进货|入库)日期\s*[是为:：]?\s*($datePattern)")
+                $purchaseText = if ($namedPurchase.Success) { $namedPurchase.Groups[1].Value } else { [regex]::Replace($SourceText,$datePattern,'') }
+            }
+            $purchaseDate = (Resolve-MessageDate $purchaseText ([string]$Event.create_time)).ToString('yyyy-MM-dd')
+            $facts | Add-Member -NotePropertyName date -NotePropertyValue $purchaseDate -Force
+        }
+        if ((Get-CodexActionValue $facts 'no_expiry') -eq $true -and -not $hasExplicitNone) {
+            $facts.no_expiry = $null
+        }
+        foreach ($key in @('expiry_date','production_date')) {
+            $given = Get-CodexActionValue $facts $key
+            if ($null -eq $given) { continue }
+            $parsed = Convert-ReplenishmentReplyDate ([string]$given)
+            $hasLabel = if ($key -eq 'expiry_date') { $SourceText -match '到期|过期|有效期|效期|保质期\s*(?:至|到)|\bEXP\b' } else { $SourceText -match '生产|\bMFG\b' }
+            if ($hasLabel -and $parsed -and $parsed.ToString('yyyy-MM-dd') -in $textDates) { $facts.$key = $parsed.ToString('yyyy-MM-dd') }
+            else { $facts.$key = $null }
+        }
+        if ((Get-CodexActionValue $facts 'shelf_life_value') -and $SourceText -notmatch '保质|有效期|效期') {
+            $facts.shelf_life_value = $null
+        }
+    }
+}
+
+function Get-ReplenishmentExpiryQuestion($Operations) {
+    $list = @($Operations)
+    for ($i = 0; $i -lt $list.Count; $i++) {
+        $op = $list[$i]
+        if ([string]$op.action -ne 'Replenishment') { continue }
+        $facts = $op.arguments
+        $direct = Get-CodexActionValue $facts 'expiry_date'
+        $production = Get-CodexActionValue $facts 'production_date'
+        $life = Get-CodexActionValue $facts 'shelf_life_value'
+        $unit = [string](Get-CodexActionValue $facts 'shelf_life_unit')
+        $noExpiry = (Get-CodexActionValue $facts 'no_expiry') -eq $true
+        $hasBatchDetails = ($null -ne $production -or $null -ne $life)
+        $hasValidPair = $false
+        if ($hasBatchDetails -and (Convert-ReplenishmentReplyDate ([string]$production))) {
+            $number = 0.0
+            if ([double]::TryParse([string]$life,[Globalization.NumberStyles]::Float,[Globalization.CultureInfo]::InvariantCulture,[ref]$number)) {
+                $hasValidPair = $number -gt 0 -and -not [double]::IsInfinity($number) -and
+                    $unit -match '^(?:天|日|个?月|年)$' -and ($unit -match '天|日' -or $number -eq [math]::Floor($number))
+            }
+        }
+        if ($noExpiry -and -not $direct -and -not $hasBatchDetails) { continue }
+        if (-not $noExpiry -and ($null -eq $direct -or (Convert-ReplenishmentReplyDate ([string]$direct))) -and
+            (-not $hasBatchDetails -or $hasValidPair) -and ($direct -or $hasValidPair)) { continue }
+        $code = [string](Get-CodexActionValue $facts 'goods_code')
+        $label = if ($code -match '^sku_ref:(\d+):') { "SKU主表第$($Matches[1])行" } elseif ($code) { $code } else { '该商品' }
+        $quantity = Get-CodexActionValue $facts 'quantity'
+        $amount = Get-CodexActionValue $facts 'purchase_amount'
+        $reply = @(
+            "补货第$($i+1)项｜$label｜数量 $quantity｜采购 ¥$amount"
+            '这批有到期日吗？有，请回复完整到期日（如 2027-03-18），或一起回复生产日期和保质期；确实没有，请回复「无效期」。'
+            '原补货已保留，补齐后再给你确认，尚未记账。'
+        ) -join [Environment]::NewLine
+        return [pscustomobject]@{index=$i;goods_code=$code;production_date=(Convert-ReplenishmentReplyDate ([string]$production));reply=$reply}
+    }
+    return $null
+}
+
+function Resolve-ReplenishmentExpiryAnswer([string]$Text, $Question) {
+    # Only consume a reply to the exact item being asked. A new purchase
+    # or another SKU must follow normal routing.
+    $answer = $Text.Trim().TrimEnd([char[]]@('。','！','!')).Trim()
+    if ($answer -match '^(?i)((?:kw|csx)\s*\d+)[\s，,:：]*') {
+        if (($Matches[1] -replace '\s','') -ine [string]$Question.goods_code) { return $null }
+        $answer = $answer.Substring($Matches[0].Length).Trim()
+    }
+    $answer = ($answer -replace '^(?:本批|这批|这款|确实)\s*','').Trim()
+    if ($answer -match '^(?:无|没有|无效期|无有效期|无保质期|无(?:到期|过期)日(?:期)?|没有(?:保质期|有效期|效期|(?:到期|过期)日(?:期)?))$') {
+        return [pscustomobject]@{ no_expiry=$true; expiry_date=$null; production_date=$null; shelf_life_value=$null; shelf_life_unit=$null }
+    }
+    if ($answer -match '^(?:有|有日期|有到期日|有到期日期|有保质期|有有效期|有的|(?:有[，,\s]+)?(?:暂时|目前)?(?:不知道|没查到|没看到)(?:日期|到期日(?:期)?)?|还没到货)$') {
+        return [pscustomobject]@{waiting=$true}
+    }
+    $datePattern = '20\d{2}\s*[-年/.]\s*\d{1,2}\s*[-月/.]\s*\d{1,2}\s*[日号]?'
+    if ($answer -match "^(?:有(?:的|啊)?[，,、\s]*)?(?:(?:到期(?:日(?:期)?)?|日期|有效期|效期)\s*[是为:：]?\s*|是\s*)?($datePattern)\s*(?:到期)?$") {
+        $date = Convert-ReplenishmentReplyDate $Matches[1]
+        if (-not $date) { return [pscustomobject]@{waiting=$true} }
+        return [pscustomobject]@{no_expiry=$false;expiry_date=$date.ToString('yyyy-MM-dd');production_date=$null;shelf_life_value=$null;shelf_life_unit=$null}
+    }
+    if ($answer -match "^(?:生产日期|生产日|生产)\s*[是为:：]?\s*($datePattern)[\s，,；;、]+保质期\s*[是为:：]?\s*(\d+(?:\.\d+)?)\s*(天|日|个月|月|年)$") {
+        $prodText = $Matches[1]; $life = [double]::Parse($Matches[2],[Globalization.CultureInfo]::InvariantCulture); $unit = $Matches[3]
+        $production = Convert-ReplenishmentReplyDate $prodText
+        if (-not $production -or $life -le 0 -or [double]::IsInfinity($life) -or ($unit -match '月|年' -and $life -ne [math]::Floor($life))) { return [pscustomobject]@{waiting=$true} }
+        return [pscustomobject]@{no_expiry=$false;expiry_date=$null;production_date=$production.ToString('yyyy-MM-dd');shelf_life_value=$life;shelf_life_unit=$unit}
+    }
+    if ($Question.production_date -and $answer -match '^(?:保质期\s*[是为:：]?\s*)?(\d+(?:\.\d+)?)\s*(天|日|个月|月|年)$') {
+        $life = [double]::Parse($Matches[1],[Globalization.CultureInfo]::InvariantCulture); $unit = $Matches[2]
+        if ($life -le 0 -or [double]::IsInfinity($life) -or ($unit -match '月|年' -and $life -ne [math]::Floor($life))) { return [pscustomobject]@{waiting=$true} }
+        return [pscustomobject]@{no_expiry=$false;expiry_date=$null;production_date=$Question.production_date.ToString('yyyy-MM-dd');shelf_life_value=$life;shelf_life_unit=$unit}
+    }
+    return $null
+}
+
 function Invoke-PetstarSyncAction([string]$Action, $Arguments, $Event) {
     $dateValue = Get-CodexActionValue $Arguments 'date'
     $resolvedDate = if ($dateValue) { [datetime]::Parse([string]$dateValue) } else { Resolve-MessageDate ([string]$Event.content) ([string]$Event.create_time) }
@@ -755,6 +892,7 @@ function Invoke-CodexAction($CodexAction, $Event, [int]$Index, [string]$Mode) {
     }
     if ([bool](Get-CodexActionValue $arguments 'retire_existing_new_code')) { $eventArguments += '--retire-existing-new-code' }
     if ([bool](Get-CodexActionValue $arguments 'clear_expiry')) { $eventArguments += '--clear-expiry' }
+    if ($actionName -eq 'Replenishment' -and (Get-CodexActionValue $arguments 'no_expiry') -eq $true) { $eventArguments += '--no-expiry' }
 
     $dateActions = @('AddIntervention','OfflineSale','AddOrderGift','Replenishment','CashExpense','OperatingExpense','OwnerWithdrawal','OwnerLabor','MarketRent','BeginningCash','ActualReceipt','AssetAmortization')
     if ($actionName -in $dateActions -and $null -eq (Get-CodexActionValue $arguments 'date')) {
@@ -867,6 +1005,8 @@ function Format-CodexExecutionReply($Operations) {
             }
             'Replenishment' {
                 $lines.Add("补货记录第$($details.row)行：$($details.goods_code)｜$($details.package_quantity) 个采购包装")
+                if ($details.expiry_date) { $lines.Add("本批到期日：$($details.expiry_date)") }
+                elseif ((Get-CodexActionValue $args 'no_expiry') -eq $true) { $lines.Add('本批无效期，日期留空。') }
                 $afterCostText = if ($null -eq $details.after_average_cost -or [string]$details.after_average_cost -eq '') { '待核对' } else { "¥$([math]::Round([double]$details.after_average_cost,4))" }
                 $lines.Add("SKU成本主表当前移动平均成本：$afterCostText；未重算历史订单或经营简账。")
                 if ($details.sku_status -eq 'created_pending_profile') { $lines.Add('已建立待平台同步的SKU档案。') }
@@ -1344,6 +1484,8 @@ function Format-ConfirmationPreview([string]$ChangeId, $Operations, [string]$Fal
             'Replenishment' {
                 $lines.Add("补货：$($details.goods_code)｜日期：$($args.date)｜$($details.package_quantity)个采购包装｜采购 ¥$($details.purchase_amount)")
                 if ($details.production_date) { $lines.Add("批次：生产 $($details.production_date)｜到期 $($details.expiry_date)") }
+                elseif ($details.expiry_date) { $lines.Add("本批到期日：$($details.expiry_date)") }
+                elseif ((Get-CodexActionValue $args 'no_expiry') -eq $true) { $lines.Add('店主已确认本批无效期，日期留空。') }
                 $afterCostText = if ($null -eq $details.after_average_cost -or [string]$details.after_average_cost -eq '') { '仍待核对' } else { "¥$([math]::Round([double]$details.after_average_cost,4))" }
                 $lines.Add("SKU当前移动平均成本：$afterCostText；不会重算历史订单、收入、利润或经营简账。")
                 if ($details.sku_status -eq 'will_create_pending_profile') { $lines.Add('SKU主表尚无该货号；确认后会先建立待平台同步档案。') }
@@ -1550,6 +1692,7 @@ function New-ConfirmationDraft($Event, [string]$AuthorizedOpenId, [string]$Effec
     $script:confirmedExecution = $false
     $script:previewAcknowledgement = ''
     $script:previewNeedsInformation = $false
+    $script:previewAwaitingReplenishmentExpiry = $false
     $script:previewOperations = [Collections.Generic.List[object]]::new()
     try {
         $handled = Process-Event ($previewEvent | ConvertTo-Json -Compress -Depth 20) $AuthorizedOpenId -BypassConfirmation
@@ -1572,6 +1715,7 @@ function New-ConfirmationDraft($Event, [string]$AuthorizedOpenId, [string]$Effec
             expires_at = [datetimeoffset]::Now.AddHours(48).ToString('o')
             preview = $previewText
             needs_information = [bool]$script:previewNeedsInformation
+            awaiting_replenishment_expiry = [bool]$script:previewAwaitingReplenishmentExpiry
             mutation_count = $operations.Count
             operations = $operations
             operation_signature = Get-OperationSignature $operations
@@ -1581,6 +1725,7 @@ function New-ConfirmationDraft($Event, [string]$AuthorizedOpenId, [string]$Effec
         $script:confirmedExecution = $oldConfirmedExecution
         $script:previewAcknowledgement = ''
         $script:previewNeedsInformation = $false
+        $script:previewAwaitingReplenishmentExpiry = $false
         $script:previewOperations = $null
     }
 }
@@ -1594,11 +1739,18 @@ function New-ConfirmationDraftFromCodexResult($Event, [string]$EffectiveMessage,
     $script:previewOperations = [Collections.Generic.List[object]]::new()
     try {
         $actions = @($CodexResult.actions | Where-Object { [string]$_.action -notin @('RefreshLedger','SendDailySummary','SyncPlatformData') })
-        $null = Invoke-CodexActionsInOrder $actions $Event 'preview'
-        $operations = @($script:previewOperations)
-        $needsInformation = [bool]$CodexResult.needs_information -or $operations.Count -eq 0
-        $fallback = Format-NonExecutableCodexReply ([string]$CodexResult.reply)
-        $previewText = if ($operations.Count -gt 0) { Format-ConfirmationPreview $ChangeId $operations ([string]$CodexResult.reply) } else { $fallback }
+        $expiryQuestion = Get-ReplenishmentExpiryQuestion $actions
+        if ($expiryQuestion) {
+            $operations = $actions
+            $needsInformation = $true
+            $previewText = $expiryQuestion.reply
+        } else {
+            $null = Invoke-CodexActionsInOrder $actions $Event 'preview'
+            $operations = @($script:previewOperations)
+            $needsInformation = [bool]$CodexResult.needs_information -or $operations.Count -eq 0
+            $fallback = Format-NonExecutableCodexReply ([string]$CodexResult.reply)
+            $previewText = if ($operations.Count -gt 0) { Format-ConfirmationPreview $ChangeId $operations ([string]$CodexResult.reply) } else { $fallback }
+        }
         return [pscustomobject]@{
             change_id = $ChangeId
             conversation_hash = Get-ConversationHash $Event
@@ -1609,6 +1761,7 @@ function New-ConfirmationDraftFromCodexResult($Event, [string]$EffectiveMessage,
             expires_at = [datetimeoffset]::Now.AddHours(48).ToString('o')
             preview = $previewText
             needs_information = $needsInformation
+            awaiting_replenishment_expiry = [bool]$expiryQuestion
             mutation_count = $operations.Count
             operations = $operations
             operation_signature = Get-OperationSignature $operations
@@ -1632,6 +1785,8 @@ function Get-PendingRequestSummary($Pending) {
 function Invoke-StoredConfirmationOperations($Pending, $ExecuteEvent, [int]$LockTimeoutSeconds = 2700) {
     $executedOperations = [Collections.Generic.List[object]]::new()
     $storedOperations = @($Pending.operations)
+    $expiryQuestion = Get-ReplenishmentExpiryQuestion $storedOperations
+    if ($expiryQuestion) { throw '补货效期还没补齐，未开始写入；请先补充本批到期日或确认无效期。' }
     $tokens = Get-FinanceWorkbookTokens
     if (-not $tokens.ContainsKey('source') -or -not $tokens.ContainsKey('ledger')) { throw '经营事务缺少工作簿映射，未开始写入' }
     $transactionId = "confirm-$($Pending.change_id)-$([datetime]::Now.ToString('yyyyMMddHHmmss'))"
@@ -1712,6 +1867,15 @@ function Invoke-ConfirmationFlow($Event, [string]$AuthorizedOpenId, [string]$Mes
             $null = Send-Acknowledgement $AuthorizedOpenId "你指定的是待确认项 $requestedChangeId，但当前待确认项是 $($pending.change_id)。为避免执行错账，本次没有修改表格；请回复“确认 $($pending.change_id)”执行当前项。" ([string]$Event.message_id) 'confirm-mismatch'
             return [pscustomobject]@{handled=$true;result=$true}
         }
+        $expiryQuestion = Get-ReplenishmentExpiryQuestion @($pending.operations)
+        if ($expiryQuestion) {
+            $pending.needs_information = $true
+            $pending.preview = $expiryQuestion.reply
+            $pending | Add-Member -NotePropertyName awaiting_replenishment_expiry -NotePropertyValue $true -Force
+            Write-PendingConfirmation $pending
+            $null = Send-Acknowledgement $AuthorizedOpenId $expiryQuestion.reply ([string]$Event.message_id) 'clarify'
+            return [pscustomobject]@{handled=$true;result=$true}
+        }
         if ($pending.needs_information) {
             $null = Send-Acknowledgement $AuthorizedOpenId "这项还缺关键信息，暂时不能执行。`n请直接补充缺少的内容，我会重新给你确认。" ([string]$Event.message_id) 'confirm'
             return [pscustomobject]@{handled=$true;result=$true}
@@ -1768,7 +1932,34 @@ function Invoke-ConfirmationFlow($Event, [string]$AuthorizedOpenId, [string]$Mes
         }
     }
 
-    if ($pending -and (Test-PendingAmendment $MessageText $pending)) {
+    if ($pending -and $pending.awaiting_replenishment_expiry) {
+        $expiryQuestion = Get-ReplenishmentExpiryQuestion @($pending.operations)
+        $expiryAnswer = if ($expiryQuestion) { Resolve-ReplenishmentExpiryAnswer $MessageText $expiryQuestion } else { $null }
+        if ($expiryAnswer) {
+            if ($expiryAnswer.waiting) {
+                $null = Send-Acknowledgement $AuthorizedOpenId $expiryQuestion.reply ([string]$Event.message_id) 'clarify'
+                return [pscustomobject]@{handled=$true;result=$true}
+            }
+            # Edit only the expiry fields on a copy of the expressly captured
+            # request. Do not ask the model to reconstruct quantity or payment.
+            $plan = $pending | ConvertTo-Json -Depth 40 | ConvertFrom-Json
+            $target = $plan.operations[[int]$expiryQuestion.index].arguments
+            foreach ($property in $expiryAnswer.PSObject.Properties) {
+                $target | Add-Member -NotePropertyName $property.Name -NotePropertyValue $property.Value -Force
+            }
+            $amendEvent = $Event | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+            $amendEvent.content = [string]$plan.effective_message
+            $amendEvent.create_time = [string]$plan.original_create_time
+            $structured = [pscustomobject]@{actions=@($plan.operations);needs_information=$false;reply=''}
+            $refreshed = New-ConfirmationDraftFromCodexResult $amendEvent ([string]$plan.effective_message) $structured ([string]$plan.change_id)
+            $refreshed.original_message = [string]$plan.original_message
+            $refreshed.created_at = [string]$plan.created_at
+            $refreshed.expires_at = [string]$plan.expires_at
+            Write-PendingConfirmation $refreshed
+            $null = Send-Acknowledgement $AuthorizedOpenId ([string]$refreshed.preview) ([string]$Event.message_id) 'amend'
+            return [pscustomobject]@{handled=$true;result=$true}
+        }
+    } elseif ($pending -and (Test-PendingAmendment $MessageText $pending)) {
         $effectiveMessage = "$MessageText；原待确认请求：$($pending.effective_message)"
         $amendEvent = $Event | ConvertTo-Json -Depth 20 | ConvertFrom-Json
         $amendEvent.content = $effectiveMessage

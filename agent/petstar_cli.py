@@ -138,6 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     event.add_argument("--retire-existing-new-code", action="store_true")
     event.add_argument("--expiry-date")
+    event.add_argument("--no-expiry", action="store_true")
     event.add_argument("--clear-expiry", action="store_true")
     event.add_argument("--production-date")
     event.add_argument("--shelf-life-value", type=float)
@@ -194,6 +195,7 @@ def main() -> int:
             ("RefundDisposition", args.refund_disposition, False),
             ("RetireExistingNewCode", args.retire_existing_new_code, True),
             ("ExpiryDate", args.expiry_date, False),
+            ("NoExpiry", args.no_expiry, True),
             ("ClearExpiry", args.clear_expiry, True),
             ("ProductionDate", args.production_date, False),
             ("ShelfLifeValue", args.shelf_life_value, False),
