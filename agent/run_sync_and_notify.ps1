@@ -43,6 +43,7 @@ $interactivePriorityPath = Join-Path $stateRoot 'interactive_priority.json'
 $promotionCaptureScript = Join-Path $projectRoot 'agent\sync_promotion_expense.ps1'
 $promotionAutomationStartDate = [datetime]'2026-09-23'
 . (Join-Path $PSScriptRoot 'intervention_record.ps1')
+. (Join-Path $PSScriptRoot 'refund_notice_followup.ps1')
 
 $syncMutex = [Threading.Mutex]::new($false, 'Local\PetstarSyncAndNotify')
 if (-not $syncMutex.WaitOne(0)) {
@@ -1588,7 +1589,10 @@ try {
                 if (Test-ResolvedCancelledRefundObservation $refundObservation) { continue }
                 $dailyLabel = if ($refundObservation.daily_order_no) { "美团$($refundObservation.daily_order_no)号单" } else { "订单 $($refundObservation.order_no)" }
                 $statusText = if ($refundObservation.status_text) { [string]$refundObservation.status_text } else { '平台未返回可识别状态文字' }
-                if ([string]$refundObservation.state -eq 'pending') {
+                if (Get-RefundRejectionNoticeKey $refundObservation) {
+                    $replyHint = if ($Silent) { '直接回复「处理好了，没有退款」' } else { '带上完整订单号回复「处理好了，没有退款」' }
+                    $syncWarnings.Add("退款驳回待确认：$dailyLabel（$($refundObservation.order_no)）平台显示商家已驳回，未发现已完成退款，账上不扣。如果已经和客户协商好、确实未退款，$replyHint。")
+                } elseif ([string]$refundObservation.state -eq 'pending') {
                     $syncWarnings.Add("退款状态观察：$dailyLabel（$($refundObservation.order_no)）还在处理中，账上未改；暂不用操作，系统会继续复查。平台状态：$statusText。")
                 } else {
                     $operationalDegraded = $true
@@ -1607,8 +1611,12 @@ try {
                     $nightRecoveryRequired = $true
                     $operationalDegraded = $true
                     $syncWarnings.Add("库存导出未取得新文件，已使用最近一次有效文件；补货清单可能不是零点实时库存。")
+            $refundNoticeAcknowledgements = @()
+            try { $refundNoticeAcknowledgements = @(Read-RefundNoticeAcknowledgements $stateRoot) }
+            catch { $syncWarnings.Add('退款提醒回执暂时读取失败；平台退款继续复查，未按回执隐藏任何提醒。') }
                 }
             } catch {
+                if (Test-AcknowledgedRefundRejection $refundObservation $refundNoticeAcknowledgements) { continue }
                 # 无法证明失败发生在任何写入之前，因此禁止带着可能的半成品继续提交日结。
                 # 准确性优先于“勉强发出一份旧库存日结”。外层事务会恢复全部已写范围。
                 throw
@@ -1813,7 +1821,7 @@ try {
         $giftAlertResult = $alertStage.value
     }
     $refundAlertResult = $null
-    $refundAlerts = @($syncWarnings | Where-Object { $_ -match '^退款(?:状态观察|识别待核对|待确认)：' })
+    $refundAlerts = @($syncWarnings | Where-Object { $_ -match '^退款(?:驳回待确认|状态观察|识别待核对|待确认)：' })
     if ($Silent -and $refundAlerts.Count -gt 0) {
         $refundAlertText = "↩️ 退款/退货状态需要关注`n" + ($refundAlerts -join "`n")
         $refundAlertKey = "petstar-refund-alert-$($Date.ToString('yyyyMMdd'))-$(Get-TextFingerprint ($refundAlerts -join '|'))"
@@ -1839,6 +1847,9 @@ try {
         $alertStage = Invoke-WithRetry 'delivery_fee_alert' { Send-FeishuMessage $deliveryAlertText $null $deliveryAlertKey } 2
         $deliveryAlertResult = $alertStage.value
         if ($deliveryConflictsToSend.Count -gt 0) {
+        if ($refundAlerts.Count -gt 1 -and @($refundAlerts | Where-Object { $_ -match '^退款驳回待确认：' }).Count) {
+            $refundAlertText += "`n如果要确认其中一单未退款，请先写完整订单号，再写「处理好了，没有退款」。"
+        }
             try { Save-DeliveryAlertReceipts $deliveryAlertReceiptsPath $deliveryReceipts $deliveryConflictsToSend $deliveryAlertResult }
             catch { $deliveryReceiptsError = '配送费提醒已发送，但未保存去重记录；未影响账目' }
         }

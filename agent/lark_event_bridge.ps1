@@ -29,6 +29,7 @@ $script:codexFirstRouting = $true
 $larkCli = Join-Path $ProjectRoot 'agent\lark_cli_noexit.ps1'
 . (Join-Path $ProjectRoot 'agent\finance_transaction.ps1')
 . (Join-Path $ProjectRoot 'agent\runtime_paths.ps1')
+. (Join-Path $ProjectRoot 'agent\refund_notice_followup.ps1')
 $pythonExe = Get-PetstarPython
 # npm 原生 lark-cli.ps1 末尾会执行 exit，长驻监听器直接调用时会结束父进程。
 # 本地薄包装调用同一个官方 Node 入口，不会结束父进程，同时保留多行文本参数。
@@ -2073,6 +2074,30 @@ function Process-Event([string]$Line, [string]$AuthorizedOpenId, [switch]$Bypass
     if ($event.sender_type -ne 'user' -or $event.sender_id -ne $AuthorizedOpenId) { return $false }
     if ($event.message_type -ne 'text' -or $event.chat_type -ne 'p2p') { return $false }
 
+function Invoke-RefundNoticeReply($Event, [string]$AuthorizedOpenId, [string]$MessageText) {
+    $intent = Get-RefundNoticeAcknowledgementIntent $MessageText
+    if (-not $intent) { return $false }
+    $eventTime = [datetimeoffset]::Now
+    $epochMilliseconds = 0L
+    if ([long]::TryParse([string]$Event.create_time,[ref]$epochMilliseconds) -and $epochMilliseconds -gt 0) {
+        $eventTime = [datetimeoffset]::FromUnixTimeMilliseconds($epochMilliseconds)
+    }
+    $context = Find-RecentRefundRejectionNotice $stateRoot ([string]$intent.order_no) $eventTime
+    if ($context.observation) {
+        $record = Register-RefundRejectionNoRefund $stateRoot $context.observation
+        $reply = "已记下：美团订单 $($record.order_no) 协商处理完成、未退款。收入、商品成本和库存不变；同一条驳回不再提醒。若平台出现新申请或实际退款，仍会复查。"
+    } elseif (-not $intent.order_no -and @($context.order_numbers).Count -gt 1) {
+        $choices = @($context.order_numbers | Select-Object -First 5) -join '、'
+        $reply = "最近的退款提醒涉及多笔订单：$choices。请把要确认的完整订单号加在「处理好了，没有退款」前面；这次没改账。"
+    } elseif ($intent.order_no) {
+        $reply = "订单 $($intent.order_no) 没有可唯一对应的近期零退款驳回提醒，或者平台状态已经变化。这次没关闭提醒，也没改账；有退款时仍会按平台证据复查。"
+    } else {
+        $reply = '暂时没有可唯一对应的近期零退款驳回提醒。请发订单号和「处理好了，没有退款」；这次没改账。'
+    }
+    $null = Send-Acknowledgement $AuthorizedOpenId $reply ([string]$Event.message_id) 'refund-notice'
+    return $true
+}
+
     $messageText = [string]$event.content
     if (-not $BypassConfirmation -and -not $script:previewMode -and -not $script:confirmedExecution) {
         $confirmationResult = Invoke-ConfirmationFlow $event $AuthorizedOpenId $messageText
@@ -2085,6 +2110,7 @@ function Process-Event([string]$Line, [string]$AuthorizedOpenId, [switch]$Bypass
         return (Invoke-CodexAndReply $event $AuthorizedOpenId $messageText)
     }
 
+        if (Invoke-RefundNoticeReply $event $AuthorizedOpenId $messageText) { return $true }
     $orderSegments = @(Get-OrderSegments $messageText)
     $orderNumbers = @($orderSegments | ForEach-Object { $_.order_no })
     $isIntervention = $messageText -match '补单|干预(?:订)?单|刷单'
